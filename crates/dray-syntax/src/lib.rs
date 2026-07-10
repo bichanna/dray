@@ -8,11 +8,16 @@
 //! recursive-descent + Pratt parser
 
 pub mod cst;
+pub mod debug;
 pub mod lexer;
 pub mod parser;
 pub mod token;
 
 pub use cst::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, debug_tree};
+pub use debug::{
+    DumpOptions, dump_cst, dump_cst_with, dump_tokens, dump_tokens_no_trivia, kind_name,
+    token_kind_name,
+};
 pub use lexer::{Lexer, tokenize};
 pub use parser::{Parse, ParseError, parse};
 pub use token::{LexError, Span, Token, TokenKind};

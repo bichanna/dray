@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 [package]
 name = "dray"
 version.workspace = true
@@ -9,4 +11,4 @@ name = "dray"
 path = "src/main.rs"
 
 [dependencies]
-dray-driver = { path = "../dray-driver" }
+dray-syntax = { path = "../dray-syntax" }

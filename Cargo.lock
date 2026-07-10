@@ -6,7 +6,7 @@ version = 4
 name = "dray"
 version = "0.1.0"
 dependencies = [
- "dray-driver",
+ "dray-syntax",
 ]
 
 [[package]]
