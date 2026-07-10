@@ -2,7 +2,7 @@
 
 //! Lexer tests for Dray.
 
-use dray_syntax::{tokenize, LexError, TokenKind};
+use dray_syntax::{LexError, TokenKind, tokenize};
 
 fn kinds(src: &str) -> Vec<TokenKind> {
     tokenize(src)

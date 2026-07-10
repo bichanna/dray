@@ -2,7 +2,7 @@
 
 //! Hand-written lexer for Dray
 
-use crate::token::{keyword_kind, LexError, Span, Token, TokenKind};
+use crate::token::{LexError, Span, Token, TokenKind, keyword_kind};
 
 pub fn tokenize(src: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(src);
