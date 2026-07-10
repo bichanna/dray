@@ -1,0 +1,11 @@
+[package]
+name = "dray-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dray-syntax = { path = "../dray-syntax" }
+dray-hir = { path = "../dray-hir" }
+dray-ir = { path = "../dray-ir" }
+dray-codegen = { path = "../dray-codegen" }

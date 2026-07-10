@@ -1,0 +1,9 @@
+[package]
+name = "dray-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dray-syntax = { path = "../dray-syntax" }
+dray-hir = { path = "../dray-hir" }

@@ -1,0 +1,13 @@
+[package]
+name = "dray-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dray-lsp"
+path = "src/main.rs"
+
+[dependencies]
+dray-syntax = { path = "../../crates/dray-syntax" }
+dray-hir    = { path = "../../crates/dray-hir" }

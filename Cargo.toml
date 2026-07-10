@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dray-syntax",
+    "crates/dray-hir",
+    "crates/dray-ir",
+    "crates/dray-codegen",
+    "crates/dray-driver",
+    "crates/dray-cli",
+    "tools/dray-fmt",
+    "tools/dray-lsp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tamago = { git = "https://github.com/bichanna/tamago", rev = "9cebf40c841e223d4916c3a3bcd3337091617079" }

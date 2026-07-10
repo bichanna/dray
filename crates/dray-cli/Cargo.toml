@@ -1,0 +1,12 @@
+[package]
+name = "dray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dray"
+path = "src/main.rs"
+
+[dependencies]
+dray-driver = { path = "../dray-driver" }
