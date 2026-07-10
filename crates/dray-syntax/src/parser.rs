@@ -255,24 +255,24 @@ impl<'a> Parser<'a> {
     /// `[ "pub" ] identifier "::" ConstExpr`. Only the ProcDef form of
     /// `ConstExpr` is implemented; other forms degrade to an Error node.
     fn named_decl(&mut self) {
-        let is_proc = {
-            let base = if self.peek() == TokenKind::KwPub {
-                1
-            } else {
-                0
-            };
-            self.peek_nth(base) == TokenKind::Ident
-                && self.peek_nth(base + 1) == TokenKind::ColonColon
-                && self.peek_nth(base + 2) == TokenKind::KwProc
+        let base = if self.peek() == TokenKind::KwPub {
+            1
+        } else {
+            0
         };
+        let head_ok = self.peek_nth(base) == TokenKind::Ident
+            && self.peek_nth(base + 1) == TokenKind::ColonColon;
+        let after_head = self.peek_nth(base + 2);
 
-        if is_proc {
+        if head_ok && after_head == TokenKind::KwProc {
             self.proc_def();
+        } else if head_ok && after_head == TokenKind::KwExtern {
+            self.extern_proc_decl();
         } else {
             self.start(SyntaxKind::Error);
             self.error_at(
                 self.cur_span(),
-                "only `name :: proc(...) { }` top-level decls are implemented so far",
+                "only `name :: proc(...)` and `name :: extern \"…\" proc(...)` top-level decls are implemented so far",
             );
             self.eat(TokenKind::KwPub);
             self.eat(TokenKind::Ident);
@@ -283,6 +283,24 @@ impl<'a> Parser<'a> {
             self.recover_to_top_level();
             self.finish_node();
         }
+    }
+
+    /// `[ "pub" ] identifier "::" "extern" string_lit "proc" "(" ParamList ")"
+    /// [ "->" Type ] ";"`. No receiver, no body — an external C function.
+    fn extern_proc_decl(&mut self) {
+        self.start(SyntaxKind::ExternProcDecl);
+        self.eat(TokenKind::KwPub);
+        self.expect(TokenKind::Ident, "the binding name");
+        self.expect(TokenKind::ColonColon, "'::'");
+        self.expect(TokenKind::KwExtern, "'extern'");
+        self.expect(TokenKind::StringLit, "the C symbol name string");
+        self.expect(TokenKind::KwProc, "'proc'");
+        self.param_list();
+        if self.at(TokenKind::Arrow) {
+            self.ret_type();
+        }
+        self.expect(TokenKind::Semi, "';' after an extern declaration");
+        self.finish_node();
     }
 
     /// Skip tokens until something that plausibly starts a new top-level decl,
@@ -436,17 +454,28 @@ impl<'a> Parser<'a> {
             TokenKind::KwReturn => self.return_stmt(),
             TokenKind::KwBreak => self.simple_kw_stmt(SyntaxKind::BreakStmt),
             TokenKind::KwContinue => self.simple_kw_stmt(SyntaxKind::ContinueStmt),
+            TokenKind::KwIf => self.if_stmt(),
+            TokenKind::KwFor => self.for_stmt(),
             TokenKind::LBrace => self.block(),
-            // `identifier ( "::" | ":=" | "::=" ) Expression` — the bare VarDecl.
+            _ => self.simple_stmt(true),
+        }
+    }
+
+    fn simple_stmt(&mut self, want_semi: bool) {
+        match self.peek() {
+            // `identifier ( "::" | ":=" | "::=" ) ...` — bare VarDecl
             TokenKind::Ident
                 if matches!(
                     self.peek_nth(1),
                     TokenKind::ColonColon | TokenKind::ColonEq | TokenKind::ColonColonEq
                 ) =>
             {
-                self.var_decl()
+                self.var_decl_bare(want_semi)
             }
-            _ => self.expr_stmt(),
+            TokenKind::Ident if self.peek_nth(1) == TokenKind::Colon => {
+                self.var_decl_typed(want_semi)
+            }
+            _ => self.assign_or_expr_stmt(want_semi),
         }
     }
 
@@ -469,23 +498,179 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `identifier ( "::" | ":=" | "::=" ) Expression ;`
-    fn var_decl(&mut self) {
+    /// Bare VarDecl: `identifier ( "::" | ":=" | "::=" ) Expression [ ";" ]`.
+    fn var_decl_bare(&mut self, want_semi: bool) {
         self.start(SyntaxKind::VarDecl);
         self.bump(); // name
-        // one of the three bare binding operators
         self.bump(); // :: | := | ::=
         self.expr();
-        self.expect(TokenKind::Semi, "';' after declaration");
+        if want_semi {
+            self.expect(TokenKind::Semi, "';' after declaration");
+        }
         self.finish_node();
     }
 
-    /// `Expression ;`
-    fn expr_stmt(&mut self) {
-        self.start(SyntaxKind::ExprStmt);
+    /// Explicit-type VarDecl:
+    /// `identifier ":" Type ( ":" | "=" | ":=" ) Expression [ ";" ]`.
+    fn var_decl_typed(&mut self, want_semi: bool) {
+        self.start(SyntaxKind::VarDecl);
+        self.bump(); // name
+        self.bump(); // ':'
+        self.type_ref();
+        match self.peek() {
+            TokenKind::Colon | TokenKind::Eq | TokenKind::ColonEq => self.bump(),
+            _ => self.error_at(
+                self.cur_span(),
+                "expected ':' , '=' , or ':=' after the type annotation",
+            ),
+        }
         self.expr();
-        self.expect(TokenKind::Semi, "';' after expression");
+        if want_semi {
+            self.expect(TokenKind::Semi, "';' after declaration");
+        }
         self.finish_node();
+    }
+
+    /// Parse an expression; if an `AssignOp` follows, fold into an `AssignStmt`,
+    /// otherwise it's an `ExprStmt`. `[ ";" ]` per `want_semi`.
+    fn assign_or_expr_stmt(&mut self, want_semi: bool) {
+        let cp = self.checkpoint();
+        self.expr();
+        if is_assign_op(self.peek()) {
+            self.wrap_at(cp, SyntaxKind::AssignStmt);
+            self.bump(); // the assignment operator
+            self.expr(); // right-hand side
+            if want_semi {
+                self.expect(TokenKind::Semi, "';' after assignment");
+            }
+            self.finish_node();
+        } else {
+            self.wrap_at(cp, SyntaxKind::ExprStmt);
+            if want_semi {
+                self.expect(TokenKind::Semi, "';' after expression");
+            }
+            self.finish_node();
+        }
+    }
+
+    /// `if [ SimpleStmt ";" ] Expression Block [ "else" ( Block | IfStmt ) ]`.
+    fn if_stmt(&mut self) {
+        self.start(SyntaxKind::IfStmt);
+        self.bump(); // if
+        // optional init clause: present iff a top-level `;` precedes the block
+        if self.header_has_semi_before_brace() {
+            self.simple_stmt(false);
+            self.expect(TokenKind::Semi, "';' after the if-init statement");
+        }
+        self.condition();
+        if self.at(TokenKind::LBrace) {
+            self.block();
+        } else {
+            self.error_at(self.cur_span(), "expected '{' after the if condition");
+        }
+        if self.at(TokenKind::KwElse) {
+            self.else_clause();
+        }
+        self.finish_node();
+    }
+
+    /// `"else" ( IfStmt | Block )` — chains as else-if via the `IfStmt` branch.
+    fn else_clause(&mut self) {
+        self.start(SyntaxKind::ElseClause);
+        self.bump(); // else
+        match self.peek() {
+            TokenKind::KwIf => self.if_stmt(),
+            TokenKind::LBrace => self.block(),
+            _ => self.error_at(self.cur_span(), "expected 'if' or '{' after else"),
+        }
+        self.finish_node();
+    }
+
+    /// A `for` loop, disambiguated across its four grammar forms.
+    fn for_stmt(&mut self) {
+        self.start(SyntaxKind::ForStmt);
+        self.bump(); // for
+
+        if self.at(TokenKind::LBrace) {
+            // form 1: infinite loop — `for { ... }`
+            self.block();
+            self.finish_node();
+            return;
+        }
+
+        if self.at(TokenKind::Ident)
+            && matches!(self.peek_nth(1), TokenKind::KwIn | TokenKind::Comma)
+        {
+            self.bump(); // element identifier
+            if self.at(TokenKind::Comma) {
+                self.bump(); // ,
+                self.expect(TokenKind::LBracket, "'[' before the index variable");
+                self.expect(TokenKind::Ident, "the index variable name");
+                self.expect(TokenKind::RBracket, "']' after the index variable");
+            }
+            self.expect(TokenKind::KwIn, "'in'");
+            self.condition(); // the iterable expression
+            if self.at(TokenKind::LBrace) {
+                self.block();
+            } else {
+                self.error_at(self.cur_span(), "expected '{' for the loop body");
+            }
+            self.finish_node();
+            return;
+        }
+
+        if self.header_has_semi_before_brace() {
+            if !self.at(TokenKind::Semi) {
+                self.simple_stmt(false); // init
+            }
+            self.expect(TokenKind::Semi, "';' after the for-init");
+            if !self.at(TokenKind::Semi) {
+                self.condition(); // condition (lenient: may be empty)
+            }
+            self.expect(TokenKind::Semi, "';' after the for-condition");
+            if !self.at(TokenKind::LBrace) {
+                self.simple_stmt(false); // post
+            }
+        } else {
+            self.condition();
+        }
+
+        if self.at(TokenKind::LBrace) {
+            self.block();
+        } else {
+            self.error_at(self.cur_span(), "expected '{' for the loop body");
+        }
+        self.finish_node();
+    }
+
+    fn condition(&mut self) {
+        self.start(SyntaxKind::Condition);
+        self.expr();
+        self.finish_node();
+    }
+
+    fn header_has_semi_before_brace(&self) -> bool {
+        let mut i = self.pos;
+        let mut paren = 0i32;
+        let mut brack = 0i32;
+        while let Some(tok) = self.tokens.get(i) {
+            if tok.is_trivia() || matches!(tok.kind, TokenKind::Error(_)) {
+                i += 1;
+                continue;
+            }
+            match tok.kind {
+                TokenKind::LParen => paren += 1,
+                TokenKind::RParen => paren -= 1,
+                TokenKind::LBracket => brack += 1,
+                TokenKind::RBracket => brack -= 1,
+                TokenKind::Semi if paren <= 0 && brack <= 0 => return true,
+                TokenKind::LBrace if paren <= 0 && brack <= 0 => return false,
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     // ── grammar: expressions (Pratt) ─────────────────────────────────────────
@@ -645,6 +830,24 @@ impl<'a> Parser<'a> {
 
 fn lex_error_message(e: LexError) -> String {
     e.to_string()
+}
+
+/// True for any of the grammar's `AssignOp` tokens (`=`, `+=`, …, `>>=`).
+fn is_assign_op(kind: TokenKind) -> bool {
+    use TokenKind::*;
+    matches!(
+        kind,
+        Eq | PlusEq
+            | MinusEq
+            | StarEq
+            | SlashEq
+            | PercentEq
+            | AmpEq
+            | PipeEq
+            | CaretEq
+            | ShlEq
+            | ShrEq
+    )
 }
 
 fn infix_bp(kind: TokenKind) -> Option<(u8, u8)> {

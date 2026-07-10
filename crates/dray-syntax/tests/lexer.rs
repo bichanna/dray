@@ -2,7 +2,7 @@
 
 //! Lexer tests for Dray.
 
-use dray_syntax::{LexError, TokenKind, tokenize};
+use dray_syntax::{tokenize, LexError, TokenKind};
 
 fn kinds(src: &str) -> Vec<TokenKind> {
     tokenize(src)
@@ -263,6 +263,31 @@ fn arithmetic_and_compound_assign() {
             TokenKind::PercentEq,
         ]
     );
+}
+
+#[test]
+fn all_compound_assignment_operators() {
+    assert_eq!(
+        kinds("&= |= ^="),
+        vec![TokenKind::AmpEq, TokenKind::PipeEq, TokenKind::CaretEq]
+    );
+    assert_eq!(kinds("<<="), vec![TokenKind::ShlEq]);
+    assert_eq!(kinds(">>="), vec![TokenKind::ShrEq]);
+}
+
+#[test]
+fn shift_assign_maximal_munch() {
+    assert_eq!(kinds("<<="), vec![TokenKind::ShlEq]);
+    assert_eq!(kinds(">>="), vec![TokenKind::ShrEq]);
+    assert_eq!(kinds("<< ="), vec![TokenKind::Shl, TokenKind::Eq]);
+    assert_eq!(kinds("<<=="), vec![TokenKind::ShlEq, TokenKind::Eq]);
+    assert_eq!(kinds("&="), vec![TokenKind::AmpEq]);
+    assert_eq!(kinds("&&"), vec![TokenKind::AmpAmp]);
+}
+
+#[test]
+fn shift_assign_lossless() {
+    assert_lossless("x <<= 2; y >>= 1; z &= 7;");
 }
 
 #[test]

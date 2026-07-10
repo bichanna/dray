@@ -3,8 +3,8 @@
 //! Tests for the debug pretty-printers
 
 use dray_syntax::{
-    DumpOptions, SyntaxKind, TokenKind, dump_cst, dump_cst_with, dump_tokens,
-    dump_tokens_no_trivia, kind_name, parse, token_kind_name,
+    dump_cst, dump_cst_with, dump_tokens, dump_tokens_no_trivia, kind_name, parse, token_kind_name,
+    DumpOptions, SyntaxKind, TokenKind,
 };
 
 // ── token dumps ──────────────────────────────────────────────────────────────
@@ -149,6 +149,8 @@ fn token_kind_names_are_glyphs_for_operators() {
     assert_eq!(token_kind_name(TokenKind::ColonColonEq), "::=");
     assert_eq!(token_kind_name(TokenKind::Arrow), "->");
     assert_eq!(token_kind_name(TokenKind::Shl), "<<");
+    assert_eq!(token_kind_name(TokenKind::ShlEq), "<<=");
+    assert_eq!(token_kind_name(TokenKind::AmpEq), "&=");
     assert_eq!(token_kind_name(TokenKind::KwTryAlloc), "try_alloc");
     assert_eq!(token_kind_name(TokenKind::Ident), "Ident");
 }
@@ -159,6 +161,22 @@ fn syntax_kind_names_cover_nodes_and_leaves() {
     assert_eq!(kind_name(SyntaxKind::Plus), "+");
     assert_eq!(kind_name(SyntaxKind::ProcDef), "ProcDef");
     assert_eq!(kind_name(SyntaxKind::LexError), "LexError");
+    assert_eq!(kind_name(SyntaxKind::AssignStmt), "AssignStmt");
+    assert_eq!(kind_name(SyntaxKind::IfStmt), "IfStmt");
+    assert_eq!(kind_name(SyntaxKind::ForStmt), "ForStmt");
+    assert_eq!(kind_name(SyntaxKind::ExternProcDecl), "ExternProcDecl");
+    assert_eq!(kind_name(SyntaxKind::Condition), "Condition");
+    assert_eq!(kind_name(SyntaxKind::ShrEq), ">>=");
+}
+
+#[test]
+fn cst_dump_renders_control_flow_readably() {
+    let src = "f :: proc() {\n    for i := 0; i < 3; i += 1 {\n        x += i;\n    }\n}\n";
+    let p = parse(src);
+    let dump = dump_cst_with(&p.root, DumpOptions::shape_only());
+    for expected in ["ForStmt", "Condition", "AssignStmt", "VarDecl"] {
+        assert!(dump.contains(expected), "dump missing {expected}\n{dump}");
+    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

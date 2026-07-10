@@ -50,6 +50,11 @@ pub enum SyntaxKind {
     StarEq,
     SlashEq,
     PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
     // Arithmetic / bitwise
     Plus,
     Minus,
@@ -99,6 +104,9 @@ pub enum SyntaxKind {
     ProcDef,
     /// `c_header ( string_lit ) ;`
     CHeaderDecl,
+    /// `[ "pub" ] identifier "::" "extern" string_lit "proc" "(" ParamList ")"
+    /// [ "->" Type ] ";"` — an externally-linked C function (spec §16).
+    ExternProcDecl,
     /// `( ParamList )`
     ParamList,
     /// `[ "comptime" ] identifier ":" Type`
@@ -109,8 +117,22 @@ pub enum SyntaxKind {
     Block,
 
     // statements
-    /// `identifier ( "::" | ":=" | "::=" ) Expression ;` (bare form only, so far)
+    /// A variable declaration, either bare
+    /// (`identifier ( "::" | ":=" | "::=" ) Expression`) or explicit-type
+    /// (`identifier ":" Type ( ":" | "=" | ":=" ) Expression`), plus `;`.
     VarDecl,
+    /// `Expression AssignOp Expression ;` — a single-target assignment.
+    AssignStmt,
+    /// `if [ SimpleStmt ";" ] Expression Block [ "else" ( Block | IfStmt ) ]`
+    IfStmt,
+    /// The `else ( Block | IfStmt )` tail of an `if`.
+    ElseClause,
+    /// A `for` loop in any of its four forms (infinite / while / C-style / range).
+    ForStmt,
+    /// A wrapper around the condition expression of an `if`/`for`/while, so it's
+    /// distinguishable from a C-style loop's init/post statements. Not a grammar
+    /// nonterminal — a CST grouping node.
+    Condition,
     /// `return [ Expression ] ;`
     ReturnStmt,
     /// `break ;`
@@ -205,6 +227,11 @@ impl SyntaxKind {
             TokenKind::StarEq => SyntaxKind::StarEq,
             TokenKind::SlashEq => SyntaxKind::SlashEq,
             TokenKind::PercentEq => SyntaxKind::PercentEq,
+            TokenKind::AmpEq => SyntaxKind::AmpEq,
+            TokenKind::PipeEq => SyntaxKind::PipeEq,
+            TokenKind::CaretEq => SyntaxKind::CaretEq,
+            TokenKind::ShlEq => SyntaxKind::ShlEq,
+            TokenKind::ShrEq => SyntaxKind::ShrEq,
             TokenKind::Plus => SyntaxKind::Plus,
             TokenKind::Minus => SyntaxKind::Minus,
             TokenKind::Star => SyntaxKind::Star,

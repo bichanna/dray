@@ -2,7 +2,7 @@
 
 //! Parser / CST tests for Dray.
 
-use dray_syntax::{SyntaxKind, SyntaxNode, debug_tree, parse};
+use dray_syntax::{debug_tree, parse, SyntaxKind, SyntaxNode};
 
 fn assert_lossless(src: &str) {
     let p = parse(src);
@@ -432,4 +432,273 @@ fn does_not_infinite_loop_on_lone_operators() {
         let p = parse(src);
         assert_eq!(p.root.text(), src, "failed round-trip on {src:?}");
     }
+}
+
+#[test]
+fn extern_proc_decl() {
+    let src = "puts :: extern \"puts\" proc(s: *int8) -> int32;\n";
+    let root = parse_ok(src);
+    let ext = root
+        .child_of_kind(SyntaxKind::ExternProcDecl)
+        .expect("an ExternProcDecl");
+    assert!(ext.child_of_kind(SyntaxKind::ParamList).is_some());
+    assert!(ext.child_of_kind(SyntaxKind::RetType).is_some());
+    assert_lossless(src);
+}
+
+#[test]
+fn extern_proc_decl_pub_and_no_return() {
+    let src = "pub exit :: extern \"exit\" proc(code: int32);\n";
+    let root = parse_ok(src);
+    assert!(root.child_of_kind(SyntaxKind::ExternProcDecl).is_some());
+    assert_lossless(src);
+}
+
+#[test]
+fn extern_requires_trailing_semicolon() {
+    let src = "puts :: extern \"puts\" proc(s: *int8) -> int32\n";
+    let p = parse(src);
+    assert!(!p.errors.is_empty(), "missing ';' should be reported");
+    assert_eq!(p.root.text(), src);
+}
+
+#[test]
+fn assignment_all_operators() {
+    let ops = [
+        "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+    ];
+    for op in ops {
+        let src = format!("f :: proc() {{\n    x {op} 1;\n}}\n");
+        let root = parse_ok(&src);
+        assert!(
+            has_node(&root, SyntaxKind::AssignStmt),
+            "op {op} should yield an AssignStmt"
+        );
+        assert_eq!(root.text(), src, "lossless for op {op}");
+    }
+}
+
+#[test]
+fn assignment_to_field_and_index() {
+    let src = "f :: proc() {\n    h.prev = n;\n    arr[i] = 0;\n}\n";
+    let root = parse_ok(src);
+    let assigns: Vec<_> = node_kinds(&root)
+        .into_iter()
+        .filter(|k| *k == SyntaxKind::AssignStmt)
+        .collect();
+    assert_eq!(assigns.len(), 2);
+    assert!(has_node(&root, SyntaxKind::FieldExpr));
+    assert!(has_node(&root, SyntaxKind::IndexExpr));
+    assert_lossless(src);
+}
+
+#[test]
+fn expression_statement_is_not_mistaken_for_assignment() {
+    let src = "f :: proc() {\n    doThing(1);\n}\n";
+    let root = parse_ok(src);
+    assert!(has_node(&root, SyntaxKind::ExprStmt));
+    assert!(!has_node(&root, SyntaxKind::AssignStmt));
+    assert_lossless(src);
+}
+
+#[test]
+fn explicit_type_var_decls() {
+    // all three post-annotation binders: `=`, `:=`, `:`
+    let src = "f :: proc() {\n    a: int32 = 5;\n    b: @Node := n;\n    c: int32 : 3;\n}\n";
+    let root = parse_ok(src);
+    let decls: Vec<_> = node_kinds(&root)
+        .into_iter()
+        .filter(|k| *k == SyntaxKind::VarDecl)
+        .collect();
+    assert_eq!(decls.len(), 3);
+    assert!(has_node(&root, SyntaxKind::NameType));
+    assert!(has_node(&root, SyntaxKind::RcPointerType));
+    assert_lossless(src);
+}
+
+#[test]
+fn bare_and_typed_var_decls_coexist() {
+    let src = "f :: proc() {\n    a := 1;\n    b: int32 = 2;\n}\n";
+    let root = parse_ok(src);
+    assert_eq!(
+        node_kinds(&root)
+            .into_iter()
+            .filter(|k| *k == SyntaxKind::VarDecl)
+            .count(),
+        2
+    );
+    assert_lossless(src);
+}
+
+#[test]
+fn if_statement_simple() {
+    let src = "f :: proc() {\n    if x > 0 {\n        return;\n    }\n}\n";
+    let root = parse_ok(src);
+    let if_stmt = node_first(&root, SyntaxKind::IfStmt).expect("an IfStmt");
+    assert!(if_stmt.child_of_kind(SyntaxKind::Condition).is_some());
+    assert!(if_stmt.child_of_kind(SyntaxKind::Block).is_some());
+    assert_lossless(src);
+}
+
+#[test]
+fn if_else_chain() {
+    let src = "f :: proc() {\n    if a {\n        return;\n    } else if b {\n        break;\n    } else {\n        continue;\n    }\n}\n";
+    let root = parse_ok(src);
+    assert!(has_node(&root, SyntaxKind::ElseClause));
+    let ifs: Vec<_> = node_kinds(&root)
+        .into_iter()
+        .filter(|k| *k == SyntaxKind::IfStmt)
+        .collect();
+    assert_eq!(ifs.len(), 2, "outer if + else-if");
+    assert_lossless(src);
+}
+
+#[test]
+fn if_with_init_clause() {
+    let src = "f :: proc() {\n    if y := compute(); y > 0 {\n        return;\n    }\n}\n";
+    let root = parse_ok(src);
+    let if_stmt = node_first(&root, SyntaxKind::IfStmt).unwrap();
+    assert!(
+        if_stmt.child_of_kind(SyntaxKind::VarDecl).is_some(),
+        "init clause"
+    );
+    assert!(if_stmt.child_of_kind(SyntaxKind::Condition).is_some());
+    assert_lossless(src);
+}
+
+#[test]
+fn for_infinite() {
+    let src = "f :: proc() {\n    for {\n        break;\n    }\n}\n";
+    let root = parse_ok(src);
+    let for_stmt = node_first(&root, SyntaxKind::ForStmt).unwrap();
+    assert!(for_stmt.child_of_kind(SyntaxKind::Condition).is_none());
+    assert!(for_stmt.child_of_kind(SyntaxKind::Block).is_some());
+    assert_lossless(src);
+}
+
+#[test]
+fn for_while_style() {
+    let src = "f :: proc() {\n    for x < 100 {\n        x *= 2;\n    }\n}\n";
+    let root = parse_ok(src);
+    let for_stmt = node_first(&root, SyntaxKind::ForStmt).unwrap();
+    assert!(for_stmt.child_of_kind(SyntaxKind::Condition).is_some());
+    assert!(for_stmt.child_of_kind(SyntaxKind::VarDecl).is_none());
+    assert_lossless(src);
+}
+
+#[test]
+fn for_c_style() {
+    let src = "f :: proc() {\n    for i := 0; i < 10; i += 1 {\n        sum += i;\n    }\n}\n";
+    let root = parse_ok(src);
+    let for_stmt = node_first(&root, SyntaxKind::ForStmt).unwrap();
+    assert!(
+        for_stmt.child_of_kind(SyntaxKind::VarDecl).is_some(),
+        "init"
+    );
+    assert!(
+        for_stmt.child_of_kind(SyntaxKind::Condition).is_some(),
+        "cond"
+    );
+    assert!(
+        for_stmt.child_of_kind(SyntaxKind::AssignStmt).is_some(),
+        "post"
+    );
+    assert_lossless(src);
+}
+
+#[test]
+fn for_c_style_empty_init() {
+    let src = "f :: proc() {\n    for ; i < 10; i += 1 {\n        x += 1;\n    }\n}\n";
+    let p = parse(src);
+    assert!(
+        p.errors.is_empty(),
+        "errors: {:?}\n{}",
+        p.errors,
+        debug_tree(&p.root)
+    );
+    assert_eq!(p.root.text(), src);
+}
+
+#[test]
+fn for_range_style() {
+    let src = "f :: proc() {\n    for c in items {\n        use(c);\n    }\n}\n";
+    let root = parse_ok(src);
+    assert!(has_node(&root, SyntaxKind::ForStmt));
+    assert_lossless(src);
+}
+
+#[test]
+fn for_range_with_index() {
+    let src = "f :: proc() {\n    for c, [i] in items {\n        use(c);\n    }\n}\n";
+    let root = parse_ok(src);
+    assert!(has_node(&root, SyntaxKind::ForStmt));
+    assert_lossless(src);
+}
+
+#[test]
+fn nested_control_flow() {
+    let src = "\
+f :: proc() {\n\
+    for i := 0; i < n; i += 1 {\n\
+        if i > 5 {\n\
+            total += i;\n\
+        } else {\n\
+            total -= i;\n\
+        }\n\
+    }\n\
+}\n";
+    let p = parse(src);
+    assert!(
+        p.errors.is_empty(),
+        "errors: {:?}\n{}",
+        p.errors,
+        debug_tree(&p.root)
+    );
+    assert_eq!(p.root.text(), src);
+}
+
+#[test]
+fn functional_program_end_to_end() {
+    // The milestone target: a whole program mixing extern C interop, control
+    // flow, assignment, and returns parses with zero errors and round-trips
+    let src = "\
+c_header(\"stdio.h\");\n\
+\n\
+puts :: extern \"puts\" proc(s: *int8) -> int32;\n\
+\n\
+main :: proc() -> int32 {\n\
+    sum := 0;\n\
+    for i := 0; i < 10; i += 1 {\n\
+        sum += i;\n\
+    }\n\
+    if sum > 20 {\n\
+        puts(\"big\");\n\
+        return 1;\n\
+    }\n\
+    return 0;\n\
+}\n";
+    let p = parse(src);
+    assert!(
+        p.errors.is_empty(),
+        "functional program should parse cleanly, errors: {:?}\n{}",
+        p.errors,
+        debug_tree(&p.root)
+    );
+    assert_eq!(p.root.text(), src, "must be lossless");
+    assert!(p.root.child_of_kind(SyntaxKind::CHeaderDecl).is_some());
+    assert!(p.root.child_of_kind(SyntaxKind::ExternProcDecl).is_some());
+    assert!(p.root.child_of_kind(SyntaxKind::ProcDef).is_some());
+}
+
+/// Depth-first: the first node of `kind` anywhere in the subtree.
+fn node_first(node: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxNode> {
+    if node.kind() == kind {
+        return Some(node.clone());
+    }
+    for child in node.children() {
+        if let Some(found) = node_first(&child, kind) {
+            return Some(found);
+        }
+    }
+    None
 }

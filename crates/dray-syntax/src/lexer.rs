@@ -2,7 +2,7 @@
 
 //! Hand-written lexer for Dray
 
-use crate::token::{LexError, Span, Token, TokenKind, keyword_kind};
+use crate::token::{keyword_kind, LexError, Span, Token, TokenKind};
 
 pub fn tokenize(src: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(src);
@@ -335,13 +335,22 @@ impl<'a> Lexer<'a> {
                 return self.tok($k, start);
             }};
         }
+        macro_rules! three {
+            ($k:expr) => {{
+                self.pos += 3;
+                return self.tok($k, start);
+            }};
+        }
+        let b3 = self.bytes.get(self.pos + 2).copied();
 
         match (b, b2) {
-            // three-char: `...`
-            (b'.', Some(b'.')) if self.bytes.get(self.pos + 2) == Some(&b'.') => {
+            // three-char: `...`, `<<=`, `>>=`
+            (b'.', Some(b'.')) if b3 == Some(b'.') => {
                 self.pos += 3;
                 self.tok(TokenKind::DotDotDot, start)
             }
+            (b'<', Some(b'<')) if b3 == Some(b'=') => three!(TokenKind::ShlEq),
+            (b'>', Some(b'>')) if b3 == Some(b'=') => three!(TokenKind::ShrEq),
 
             // two-char operators
             (b'-', Some(b'>')) => two!(TokenKind::Arrow),
@@ -357,6 +366,9 @@ impl<'a> Lexer<'a> {
             (b'-', Some(b'=')) => two!(TokenKind::MinusEq),
             (b'*', Some(b'=')) => two!(TokenKind::StarEq),
             (b'%', Some(b'=')) => two!(TokenKind::PercentEq),
+            (b'&', Some(b'=')) => two!(TokenKind::AmpEq),
+            (b'|', Some(b'=')) => two!(TokenKind::PipeEq),
+            (b'^', Some(b'=')) => two!(TokenKind::CaretEq),
 
             // one-char operators & delimiters
             (b'+', _) => one!(TokenKind::Plus),

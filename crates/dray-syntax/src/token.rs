@@ -105,6 +105,11 @@ pub enum TokenKind {
     StarEq,    // *=
     SlashEq,   // /=
     PercentEq, // %=
+    AmpEq,     // &=
+    PipeEq,    // |=
+    CaretEq,   // ^=
+    ShlEq,     // <<=
+    ShrEq,     // >>=
 
     // ── arithmetic / bitwise (grammar precedence chain) ─────────────────────
     Plus,    // +
