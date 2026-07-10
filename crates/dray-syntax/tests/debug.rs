@@ -3,8 +3,8 @@
 //! Tests for the debug pretty-printers
 
 use dray_syntax::{
-    dump_cst, dump_cst_with, dump_tokens, dump_tokens_no_trivia, kind_name, parse, token_kind_name,
-    DumpOptions, SyntaxKind, TokenKind,
+    DumpOptions, SyntaxKind, TokenKind, dump_cst, dump_cst_with, dump_tokens,
+    dump_tokens_no_trivia, kind_name, parse, token_kind_name,
 };
 
 // ── token dumps ──────────────────────────────────────────────────────────────

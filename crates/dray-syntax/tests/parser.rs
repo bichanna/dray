@@ -2,7 +2,7 @@
 
 //! Parser / CST tests for Dray.
 
-use dray_syntax::{debug_tree, parse, SyntaxKind, SyntaxNode};
+use dray_syntax::{SyntaxKind, SyntaxNode, debug_tree, parse};
 
 fn assert_lossless(src: &str) {
     let p = parse(src);
