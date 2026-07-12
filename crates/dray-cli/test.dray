@@ -1,0 +1,40 @@
+my_abs :: extern "abs" proc(x: int32) -> int32;
+
+gcd :: proc(a: int32, b: int32) -> int32 {
+    x := my_abs(a);
+    y := my_abs(b);
+    for y != 0 {
+        t := y;
+        y = x % y;
+        x = t;
+    }
+    return x;
+}
+
+factorial :: proc(n: int32) -> int32 {
+    acc := 1;
+    for i := 2; i <= n; i += 1 {
+        acc *= i;
+    }
+    return acc;
+}
+
+digit_sum :: proc(n: int32) -> int32 {
+    m := my_abs(n);
+    sum := 0;
+    for {
+        sum += m % 10;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    return sum;
+}
+
+main :: proc() -> int32 {
+    g := gcd(48, -36);        // 12
+    f := factorial(5);        // 120
+    d := digit_sum(9876);     // 30
+    return g + f + d;         // 162
+}

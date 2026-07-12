@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build orchestration for the Dray walking skeleton
+//! Build orchestration for Dray
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use dray_hir::lower;
 use dray_syntax::parse;
 
+/// Anything that can go wrong building a Dray program.
 #[derive(Debug)]
 pub enum BuildError {
     /// The source failed to parse. Carries rendered diagnostics.
     Parse(Vec<String>),
-    /// Lowering the CST to C failed.
+    /// Name resolution / HIR lowering failed.
+    Resolve(Vec<String>),
+    /// Lowering the HIR to C failed.
     Codegen(String),
     /// An I/O error reading source or writing outputs.
     Io(std::io::Error),
@@ -22,18 +26,21 @@ pub enum BuildError {
 impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuildError::Parse(errs) => {
-                writeln!(f, "parse failed with {} error(s):", errs.len())?;
-                for e in errs {
-                    writeln!(f, "  {e}")?;
-                }
-                Ok(())
-            }
+            BuildError::Parse(errs) => render_list(f, "parse", errs),
+            BuildError::Resolve(errs) => render_list(f, "name resolution", errs),
             BuildError::Codegen(m) => write!(f, "{m}"),
             BuildError::Io(e) => write!(f, "io error: {e}"),
             BuildError::CC(m) => write!(f, "C compiler error: {m}"),
         }
     }
+}
+
+fn render_list(f: &mut std::fmt::Formatter<'_>, stage: &str, errs: &[String]) -> std::fmt::Result {
+    writeln!(f, "{stage} failed with {} error(s):", errs.len())?;
+    for e in errs {
+        writeln!(f, "  {e}")?;
+    }
+    Ok(())
 }
 
 impl std::error::Error for BuildError {}
@@ -47,7 +54,7 @@ impl From<std::io::Error> for BuildError {
 pub struct BuildOptions {
     /// The C compiler to invoke (default `cc`, overridable via `$CC`).
     pub cc: String,
-    /// Keep the generated `.c` file next to the output instead of a temp path.
+    /// Keep the generated `.c` file next to the output instead of removing it.
     pub emit_c: bool,
 }
 
@@ -63,19 +70,30 @@ impl Default for BuildOptions {
 pub fn source_to_c(src: &str) -> Result<String, BuildError> {
     let parsed = parse(src);
     if !parsed.errors.is_empty() {
-        let rendered = parsed
-            .errors
-            .iter()
-            .map(|e| format!("{}..{}: {}", e.span.start, e.span.end, e.message))
-            .collect();
-        return Err(BuildError::Parse(rendered));
+        return Err(BuildError::Parse(
+            parsed
+                .errors
+                .iter()
+                .map(|e| format!("{}..{}: {}", e.span.start, e.span.end, e.message))
+                .collect(),
+        ));
     }
-    let scope = dray_codegen::lower_source_file(&parsed.root)
-        .map_err(|e| BuildError::Codegen(e.to_string()))?;
-    Ok(format!("{scope}"))
+
+    let (hir, resolve_errors) = lower(&parsed.root);
+    if !resolve_errors.is_empty() {
+        return Err(BuildError::Resolve(
+            resolve_errors
+                .iter()
+                .map(|e| format!("{}..{}: {}", e.span.start, e.span.end, e.message))
+                .collect(),
+        ));
+    }
+
+    dray_codegen::hir_to_c(&hir).map_err(|e| BuildError::Codegen(e.to_string()))
 }
 
-/// Build a Dray source file into an executable at `out_path`.
+/// Build a Dray source file into an executable at `out_path`. Returns the path
+/// to the generated C file.
 pub fn build_file(
     src_path: &Path,
     out_path: &Path,
@@ -84,7 +102,6 @@ pub fn build_file(
     let src = std::fs::read_to_string(src_path)?;
     let c_code = source_to_c(&src)?;
 
-    // Write the C next to the requested output (e.g. `a.out` -> `a.out.c`)
     let c_path = c_output_path(out_path);
     std::fs::write(&c_path, &c_code)?;
 
@@ -110,10 +127,8 @@ pub fn build_file(
     }
 
     if !opts.emit_c {
-        // Best-effort cleanup of the intermediate C unless the caller wants it.
         let _ = std::fs::remove_file(&c_path);
     }
-
     Ok(c_path)
 }
 

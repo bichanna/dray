@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 dray-syntax = { path = "../dray-syntax" }
+dray-hir = { path = "../dray-hir" }
 dray-codegen = { path = "../dray-codegen" }

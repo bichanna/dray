@@ -6,6 +6,7 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use dray_driver::{BuildOptions, build_file, source_to_c};
+use dray_hir::{dump_hir, lower};
 use dray_syntax::{DumpOptions, dump_cst_with, dump_tokens, dump_tokens_no_trivia, parse};
 
 fn main() -> ExitCode {
@@ -25,6 +26,7 @@ const USAGE: &str = "\
 usage:
   dray dump-tokens [--no-trivia] <file>
   dray dump-cst    [--trivia] [--no-spans] [--shape] <file>
+  dray dump-hir    <file>              resolve + type, print the HIR
   dray emit-c      <file>              generate C and print it (use - for stdin)
   dray build       [-o <out>] [--emit-c] <file>   compile to an executable
 
@@ -44,6 +46,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match cmd.as_str() {
         "dump-tokens" => dump_tokens_cmd(&args[1..]),
         "dump-cst" => dump_cst_cmd(&args[1..]),
+        "dump-hir" => dump_hir_cmd(&args[1..]),
         "emit-c" => emit_c_cmd(&args[1..]),
         "build" => build_cmd(&args[1..]),
         "-h" | "--help" | "help" => {
@@ -185,6 +188,45 @@ fn build_cmd(args: &[String]) -> Result<(), String> {
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn dump_hir_cmd(args: &[String]) -> Result<(), String> {
+    let mut path: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            flag if flag.starts_with("--") => {
+                return Err(format!("unknown flag `{flag}` for dump-hir"));
+            }
+            positional => {
+                if path.replace(positional).is_some() {
+                    return Err("more than one input given".into());
+                }
+            }
+        }
+    }
+    let src = read_source(path.ok_or("no input file given")?)?;
+    let parsed = parse(&src);
+    if !parsed.errors.is_empty() {
+        for e in &parsed.errors {
+            eprintln!(
+                "parse error {}..{}: {}",
+                e.span.start, e.span.end, e.message
+            );
+        }
+        return Err(format!(
+            "{} parse error(s); cannot build HIR",
+            parsed.errors.len()
+        ));
+    }
+    let (hir, errors) = lower(&parsed.root);
+    print!("{}", dump_hir(&hir));
+    if !errors.is_empty() {
+        eprintln!("\n{} resolution error(s):", errors.len());
+        for e in &errors {
+            eprintln!("  {}..{}: {}", e.span.start, e.span.end, e.message);
+        }
+    }
+    Ok(())
 }
 
 fn read_source(path: &str) -> Result<String, String> {

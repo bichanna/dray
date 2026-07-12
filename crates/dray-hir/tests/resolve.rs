@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! HIR lowering tests: name resolution, type inference, and the errors both raise
+
+use dray_hir::{dump_hir, lower, DefKind, ExprKind, Item, Stmt, Ty};
+use dray_syntax::parse;
+
+/// Parse + lower, asserting no resolution errors, returning the HIR
+fn hir(src: &str) -> dray_hir::Hir {
+    let parsed = parse(src);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
+    let (hir, errs) = lower(&parsed.root);
+    assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
+    hir
+}
+
+fn resolve_errors(src: &str) -> Vec<String> {
+    let parsed = parse(src);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
+    let (_, errs) = lower(&parsed.root);
+    errs.into_iter().map(|e| e.message).collect()
+}
+
+// ── resolution ───────────────────────────────────────────────────────────────
+
+#[test]
+fn resolves_a_local_reference() {
+    let h = hir("f :: proc() -> int32 {\n    x := 5;\n    return x;\n}\n");
+    let Item::Proc(p) = &h.items[0] else { panic!() };
+    // return x -> x resolves to the local's DefId
+    let Stmt::Return(Some(e)) = &p.body[1] else {
+        panic!("expected return")
+    };
+    match &e.kind {
+        ExprKind::Name { def, .. } => {
+            assert_eq!(h.def(*def).kind, DefKind::Local);
+        }
+        other => panic!("expected resolved name, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolves_forward_function_reference() {
+    // main calls helper which is defined *after* main
+    let h = hir("main :: proc() -> int32 {\n    return helper();\n}\n\nhelper :: proc() -> int32 {\n    return 3;\n}\n");
+    let dump = dump_hir(&h);
+    // helper resolves to a proc def id, referenced from main
+    assert!(dump.contains("helper#"), "helper should resolve:\n{dump}");
+}
+
+#[test]
+fn resolves_parameters() {
+    let h = hir("add :: proc(a: int32, b: int32) -> int32 {\n    return a + b;\n}\n");
+    let Item::Proc(p) = &h.items[0] else { panic!() };
+    assert_eq!(p.params.len(), 2);
+    assert!(p
+        .params
+        .iter()
+        .all(|pp| h.def(pp.def).kind == DefKind::Param));
+}
+
+#[test]
+fn undefined_variable_is_an_error() {
+    let errs = resolve_errors("f :: proc() -> int32 {\n    return nope;\n}\n");
+    assert!(errs.iter().any(|m| m.contains("nope")), "{errs:?}");
+}
+
+#[test]
+fn undefined_function_is_an_error() {
+    let errs = resolve_errors("f :: proc() {\n    ghost();\n}\n");
+    assert!(errs.iter().any(|m| m.contains("ghost")), "{errs:?}");
+}
+
+#[test]
+fn block_scoping_is_respected() {
+    let errs = resolve_errors(
+        "f :: proc() -> int32 {\n    if 1 == 1 {\n        inner := 5;\n    }\n    return inner;\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("inner")), "{errs:?}");
+}
+
+#[test]
+fn for_init_binding_visible_in_body_and_post() {
+    let src = "f :: proc() -> int32 {\n    total := 0;\n    for i := 0; i < 5; i += 1 {\n        total += i;\n    }\n    return total;\n}\n";
+    let errs = resolve_errors(src);
+    assert!(
+        errs.is_empty(),
+        "for-init should resolve everywhere: {errs:?}"
+    );
+}
+
+// ── type inference ───────────────────────────────────────────────────────────
+
+fn let_ty(h: &dray_hir::Hir, proc_idx: usize, stmt_idx: usize) -> Ty {
+    let Item::Proc(p) = &h.items[proc_idx] else {
+        panic!()
+    };
+    match &p.body[stmt_idx] {
+        Stmt::Let { ty, .. } => ty.clone(),
+        other => panic!("expected a let, got {other:?}"),
+    }
+}
+
+#[test]
+fn infers_int_literal_as_int32() {
+    let h = hir("f :: proc() {\n    x := 5;\n}\n");
+    assert_eq!(let_ty(&h, 0, 0), Ty::i32());
+}
+
+#[test]
+fn infers_float_literal_as_float64() {
+    let h = hir("f :: proc() {\n    x := 1.5;\n}\n");
+    assert_eq!(let_ty(&h, 0, 0), Ty::f64());
+}
+
+#[test]
+fn infers_bool_literal() {
+    let h = hir("f :: proc() {\n    x := true;\n}\n");
+    assert_eq!(let_ty(&h, 0, 0), Ty::Bool);
+}
+
+#[test]
+fn explicit_type_overrides_inference() {
+    let h = hir("f :: proc() {\n    x: int64 = 5;\n}\n");
+    assert_eq!(let_ty(&h, 0, 0), Ty::i64());
+}
+
+#[test]
+fn infers_from_call_return_type() {
+    // y := helper() where helper -> int32
+    let h = hir(
+        "helper :: proc() -> int32 {\n    return 1;\n}\n\nf :: proc() {\n    y := helper();\n}\n",
+    );
+    // f is items[1]; its first stmt is the let
+    assert_eq!(let_ty(&h, 1, 0), Ty::i32());
+}
+
+#[test]
+fn comparison_infers_bool() {
+    let h = hir("f :: proc() {\n    b := 3 < 4;\n}\n");
+    assert_eq!(let_ty(&h, 0, 0), Ty::Bool);
+}
+
+// ── extern symbol aliasing ───────────────────────────────────────────────────
+
+#[test]
+fn extern_carries_linked_symbol() {
+    let h = hir("my_abs :: extern \"abs\" proc(x: int32) -> int32;\n");
+    let Item::ExternProc(e) = &h.items[0] else {
+        panic!()
+    };
+    assert_eq!(e.name, "my_abs");
+    assert_eq!(e.symbol, "abs");
+    assert_eq!(
+        h.def(e.def).kind,
+        DefKind::ExternProc {
+            symbol: "abs".to_string()
+        }
+    );
+}
+
+// ── deferred constructs are clean errors ─────────────────────────────────────
+
+#[test]
+fn alloc_is_a_clean_error() {
+    let errs = resolve_errors("f :: proc() {\n    x := alloc Node;\n}\n");
+    assert!(errs.iter().any(|m| m.contains("alloc")), "{errs:?}");
+}
+
+#[test]
+fn range_for_is_a_clean_error() {
+    let errs = resolve_errors("f :: proc() {\n    for c in items {\n        use(c);\n    }\n}\n");
+    assert!(errs.iter().any(|m| m.contains("range")), "{errs:?}");
+}
