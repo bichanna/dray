@@ -180,3 +180,23 @@ fn range_for_is_a_clean_error() {
     let errs = resolve_errors("f :: proc() {\n    for c in items {\n        use(c);\n    }\n}\n");
     assert!(errs.iter().any(|m| m.contains("range")), "{errs:?}");
 }
+
+#[test]
+fn comments_are_not_folded_into_names() {
+    let src = "f :: proc() -> int32 {\n    acc := 1;\n    for i := 2; i <= 3; i += 1 {\n        // a comment on its own line\n        acc *= i;\n    }\n    return acc;\n}\n";
+    let errs = resolve_errors(src);
+    assert!(
+        errs.is_empty(),
+        "comments must not break name resolution: {errs:?}"
+    );
+}
+
+#[test]
+fn comment_before_a_type_name_is_ignored() {
+    let src = "f :: proc() {\n    x: // trailing comment\n       int32 = 5;\n}\n";
+    let errs = resolve_errors(src);
+    assert!(
+        errs.is_empty(),
+        "comment before a type must not break lowering: {errs:?}"
+    );
+}

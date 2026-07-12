@@ -11,9 +11,10 @@ gcd :: proc(a: int32, b: int32) -> int32 {
     return x;
 }
 
+// some comment
 factorial :: proc(n: int32) -> int32 {
-    acc := 1;
-    for i := 2; i <= n; i += 1 {
+    acc := 1; // another comment
+    for i := 2; i <= n; i += 1 { // C-style for
         acc *= i;
     }
     return acc;
@@ -22,7 +23,7 @@ factorial :: proc(n: int32) -> int32 {
 digit_sum :: proc(n: int32) -> int32 {
     m := my_abs(n);
     sum := 0;
-    for {
+    for { // another here
         sum += m % 10;
         m /= 10;
         if m == 0 {

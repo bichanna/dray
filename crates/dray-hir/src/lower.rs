@@ -393,9 +393,7 @@ impl Lowerer {
             .into_iter()
             .filter(|c| matches!(c.kind(), SyntaxKind::AssignStmt | SyntaxKind::ExprStmt))
             .collect();
-        let post = if has_decl_init {
-            stmts.into_iter().next_back()
-        } else if stmts.len() >= 2 {
+        let post = if has_decl_init || stmts.len() >= 2 {
             stmts.into_iter().next_back()
         } else {
             None
@@ -484,7 +482,7 @@ impl Lowerer {
     }
 
     fn lower_name(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
-        let name = node.text().trim().to_string();
+        let name = ident_text(node);
         match self.resolve(&name) {
             Some(def) => {
                 let ty = self.defs[def.0 as usize].ty.clone();
@@ -736,6 +734,12 @@ fn is_expr(kind: SyntaxKind) -> bool {
 fn first_ident(node: &SyntaxNode) -> Option<String> {
     node.token_of_kind(SyntaxKind::Ident)
         .map(|t| t.text().to_string())
+}
+
+fn ident_text(node: &SyntaxNode) -> String {
+    node.token_of_kind(SyntaxKind::Ident)
+        .map(|t| t.text().to_string())
+        .unwrap_or_else(|| node.text().trim().to_string())
 }
 
 fn leading_op(node: &SyntaxNode) -> Option<String> {

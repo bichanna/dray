@@ -10,12 +10,12 @@ use crate::hir::*;
 pub fn dump_hir(hir: &Hir) -> String {
     let mut out = String::new();
     for item in &hir.items {
-        dump_item(hir, item, &mut out);
+        dump_item(item, &mut out);
     }
     out
 }
 
-fn dump_item(hir: &Hir, item: &Item, out: &mut String) {
+fn dump_item(item: &Item, out: &mut String) {
     match item {
         Item::Include(h) => {
             let _ = writeln!(out, "include <{h}>");
@@ -41,13 +41,13 @@ fn dump_item(hir: &Hir, item: &Item, out: &mut String) {
                 p.def.0
             );
             for s in &p.body {
-                dump_stmt(hir, s, 1, out);
+                dump_stmt(s, 1, out);
             }
         }
     }
 }
 
-fn dump_stmt(hir: &Hir, s: &Stmt, depth: usize, out: &mut String) {
+fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
     let pad = "  ".repeat(depth);
     match s {
         Stmt::Let {
@@ -89,19 +89,19 @@ fn dump_stmt(hir: &Hir, s: &Stmt, depth: usize, out: &mut String) {
         } => {
             let _ = writeln!(out, "{pad}if {}", expr(cond));
             for st in then_branch {
-                dump_stmt(hir, st, depth + 1, out);
+                dump_stmt(st, depth + 1, out);
             }
             if let Some(eb) = else_branch {
                 let _ = writeln!(out, "{pad}else");
                 for st in eb {
-                    dump_stmt(hir, st, depth + 1, out);
+                    dump_stmt(st, depth + 1, out);
                 }
             }
         }
         Stmt::While { cond, body } => {
             let _ = writeln!(out, "{pad}while {}", expr(cond));
             for st in body {
-                dump_stmt(hir, st, depth + 1, out);
+                dump_stmt(st, depth + 1, out);
             }
         }
         Stmt::CFor {
@@ -114,20 +114,20 @@ fn dump_stmt(hir: &Hir, s: &Stmt, depth: usize, out: &mut String) {
             let _ = writeln!(out, "{pad}cfor (init; {c}; post)");
             if let Some(i) = init {
                 let _ = write!(out, "{pad}  init: ");
-                dump_stmt(hir, i, 0, out);
+                dump_stmt(i, 0, out);
             }
             if let Some(p) = post {
                 let _ = write!(out, "{pad}  post: ");
-                dump_stmt(hir, p, 0, out);
+                dump_stmt(p, 0, out);
             }
             for st in body {
-                dump_stmt(hir, st, depth + 1, out);
+                dump_stmt(st, depth + 1, out);
             }
         }
         Stmt::Loop { body } => {
             let _ = writeln!(out, "{pad}loop");
             for st in body {
-                dump_stmt(hir, st, depth + 1, out);
+                dump_stmt(st, depth + 1, out);
             }
         }
     }

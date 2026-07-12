@@ -8,7 +8,13 @@ use crate::hir::{IntWidth, Ty};
 
 pub(crate) fn lower_type(node: &SyntaxNode) -> Option<Ty> {
     match node.kind() {
-        SyntaxKind::NameType => Some(name_to_ty(node.text().trim())),
+        SyntaxKind::NameType => {
+            let name = node
+                .token_of_kind(SyntaxKind::Ident)
+                .map(|t| t.text().to_string())
+                .unwrap_or_else(|| node.text().trim().to_string());
+            Some(name_to_ty(&name))
+        }
         SyntaxKind::PointerType | SyntaxKind::RcPointerType => {
             let inner = node.children().into_iter().find(|c| is_type(c.kind()))?;
             Some(Ty::Ptr(Box::new(lower_type(&inner)?)))

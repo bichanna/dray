@@ -13,12 +13,38 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(msg) => {
+        Err(CliError::Usage(msg)) => {
             eprintln!("dray: {msg}");
             eprintln!();
             eprintln!("{USAGE}");
             ExitCode::FAILURE
         }
+        Err(CliError::Failed(msg)) => {
+            if !msg.is_empty() {
+                eprintln!("{msg}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+enum CliError {
+    /// The command was used incorrectly — show the usage block.
+    Usage(String),
+    /// The input was read fine but failed to compile — the diagnostics are
+    /// already rendered in the message (or already printed), so no usage block.
+    Failed(String),
+}
+
+impl From<String> for CliError {
+    fn from(msg: String) -> CliError {
+        CliError::Usage(msg)
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(msg: &str) -> CliError {
+        CliError::Usage(msg.to_string())
     }
 }
 
@@ -41,7 +67,7 @@ build options:
   -o <out>     output executable path (default: a.out)
   --emit-c     keep the generated .c file next to the executable";
 
-fn run(args: &[String]) -> Result<(), String> {
+fn run(args: &[String]) -> Result<(), CliError> {
     let cmd = args.first().ok_or("expected a subcommand")?;
     match cmd.as_str() {
         "dump-tokens" => dump_tokens_cmd(&args[1..]),
@@ -53,18 +79,18 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{USAGE}");
             Ok(())
         }
-        other => Err(format!("unknown subcommand `{other}`")),
+        other => Err(format!("unknown subcommand `{other}`").into()),
     }
 }
 
-fn dump_tokens_cmd(args: &[String]) -> Result<(), String> {
+fn dump_tokens_cmd(args: &[String]) -> Result<(), CliError> {
     let mut no_trivia = false;
     let mut path: Option<&str> = None;
     for a in args {
         match a.as_str() {
             "--no-trivia" => no_trivia = true,
             flag if flag.starts_with("--") => {
-                return Err(format!("unknown flag `{flag}` for dump-tokens"));
+                return Err(format!("unknown flag `{flag}` for dump-tokens").into());
             }
             positional => {
                 if path.replace(positional).is_some() {
@@ -83,7 +109,7 @@ fn dump_tokens_cmd(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn dump_cst_cmd(args: &[String]) -> Result<(), String> {
+fn dump_cst_cmd(args: &[String]) -> Result<(), CliError> {
     let mut opts = DumpOptions::default();
     let mut shape = false;
     let mut path: Option<&str> = None;
@@ -93,7 +119,7 @@ fn dump_cst_cmd(args: &[String]) -> Result<(), String> {
             "--no-spans" => opts = opts.with_spans(false),
             "--shape" => shape = true,
             flag if flag.starts_with("--") => {
-                return Err(format!("unknown flag `{flag}` for dump-cst"));
+                return Err(format!("unknown flag `{flag}` for dump-cst").into());
             }
             positional => {
                 if path.replace(positional).is_some() {
@@ -119,12 +145,12 @@ fn dump_cst_cmd(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn emit_c_cmd(args: &[String]) -> Result<(), String> {
+fn emit_c_cmd(args: &[String]) -> Result<(), CliError> {
     let mut path: Option<&str> = None;
     for a in args {
         match a.as_str() {
             flag if flag.starts_with("--") => {
-                return Err(format!("unknown flag `{flag}` for emit-c"));
+                return Err(format!("unknown flag `{flag}` for emit-c").into());
             }
             positional => {
                 if path.replace(positional).is_some() {
@@ -140,11 +166,11 @@ fn emit_c_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         // Build errors already render their own diagnostics.
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(CliError::Failed(e.to_string())),
     }
 }
 
-fn build_cmd(args: &[String]) -> Result<(), String> {
+fn build_cmd(args: &[String]) -> Result<(), CliError> {
     let mut out = "a.out".to_string();
     let mut emit_c = false;
     let mut path: Option<&str> = None;
@@ -156,7 +182,7 @@ fn build_cmd(args: &[String]) -> Result<(), String> {
             }
             "--emit-c" => emit_c = true,
             flag if flag.starts_with("--") || flag == "-o" => {
-                return Err(format!("unknown flag `{flag}` for build"));
+                return Err(format!("unknown flag `{flag}` for build").into());
             }
             positional => {
                 if path.replace(positional).is_some() {
@@ -186,16 +212,16 @@ fn build_cmd(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(CliError::Failed(e.to_string())),
     }
 }
 
-fn dump_hir_cmd(args: &[String]) -> Result<(), String> {
+fn dump_hir_cmd(args: &[String]) -> Result<(), CliError> {
     let mut path: Option<&str> = None;
     for a in args {
         match a.as_str() {
             flag if flag.starts_with("--") => {
-                return Err(format!("unknown flag `{flag}` for dump-hir"));
+                return Err(format!("unknown flag `{flag}` for dump-hir").into());
             }
             positional => {
                 if path.replace(positional).is_some() {
@@ -213,10 +239,10 @@ fn dump_hir_cmd(args: &[String]) -> Result<(), String> {
                 e.span.start, e.span.end, e.message
             );
         }
-        return Err(format!(
+        return Err(CliError::Failed(format!(
             "{} parse error(s); cannot build HIR",
             parsed.errors.len()
-        ));
+        )));
     }
     let (hir, errors) = lower(&parsed.root);
     print!("{}", dump_hir(&hir));
