@@ -133,7 +133,7 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
     }
 }
 
-fn expr(e: &Expr) -> String {
+pub fn expr(e: &Expr) -> String {
     let inner = match &e.kind {
         ExprKind::Int(v) => v.to_string(),
         ExprKind::Float(v) => v.to_string(),
@@ -153,6 +153,7 @@ fn expr(e: &Expr) -> String {
         ExprKind::Field { recv, member } => format!("{}.{member}", expr(recv)),
         ExprKind::Index { base, index } => format!("{}[{}]", expr(base), expr(index)),
         ExprKind::Cast { ty: t, operand } => format!("cast({}) {}", ty(t), expr(operand)),
+        ExprKind::Alloc { ty: t } => format!("alloc {}", ty(t)),
         ExprKind::Paren(inner) => format!("({})", expr(inner)),
     };
     format!("{inner}:{}", ty(&e.ty))
@@ -166,7 +167,7 @@ fn params(ps: &[Param]) -> String {
     format!("({})", inner.join(", "))
 }
 
-fn ty(t: &Ty) -> String {
+pub fn ty(t: &Ty) -> String {
     match t {
         Ty::Void => "void".into(),
         Ty::Bool => "bool".into(),
@@ -182,6 +183,7 @@ fn ty(t: &Ty) -> String {
         }
         Ty::Float { bits } => format!("float{bits}"),
         Ty::Ptr(inner) => format!("*{}", ty(inner)),
+        Ty::Rc(inner) => format!("@{}", ty(inner)),
         Ty::Named(n) => n.clone(),
         Ty::Infer => "?".into(),
     }

@@ -8,5 +8,6 @@ mod lower;
 mod types;
 
 pub use debug::dump_hir;
+pub use dray_syntax::Span;
 pub use hir::*;
-pub use lower::{lower, ResolveError};
+pub use lower::{ResolveError, lower};

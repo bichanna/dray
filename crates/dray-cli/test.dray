@@ -1,41 +1,30 @@
-my_abs :: extern "abs" proc(x: int32) -> int32;
-
-gcd :: proc(a: int32, b: int32) -> int32 {
-    x := my_abs(a);
-    y := my_abs(b);
-    for y != 0 {
-        t := y;
-        y = x % y;
-        x = t;
-    }
-    return x;
-}
-
-// some comment
-factorial :: proc(n: int32) -> int32 {
-    acc := 1; // another comment
-    for i := 2; i <= n; i += 1 { // C-style for
-        acc *= i;
-    }
-    return acc;
-}
-
-digit_sum :: proc(n: int32) -> int32 {
-    m := my_abs(n);
-    sum := 0;
-    for { // another here
-        sum += m % 10;
-        m /= 10;
-        if m == 0 {
-            break;
-        }
-    }
-    return sum;
-}
+putchar :: extern "putchar" proc(c: int32) -> int32;
 
 main :: proc() -> int32 {
-    g := gcd(48, -36);        // 12
-    f := factorial(5);        // 120
-    d := digit_sum(9876);     // 30
-    return g + f + d;         // 162
+    shades := " .-:;+=xX$& ";
+
+    for ypixel := 0; ypixel < 24; ypixel += 1 {
+        y := cast(float32) ypixel / 12.0 - 1.0;
+
+        for xpixel := 0; xpixel < 80; xpixel += 1 {
+            x := cast(float32) xpixel / 30.0 - 2.0;
+
+            x0 := x;
+            y0 := y;
+            iter := 0;
+
+            for iter < 11 && x0 * x0 + y0 * y0 <= 4.0 {
+                x1 := x0 * x0 - y0 * y0 + x;
+                y1 := 2.0 * x0 * y0 + y;
+                x0 = x1;
+                y0 = y1;
+                iter += 1;
+            }
+
+            putchar(cast(int32) shades[iter]);
+        }
+        putchar(10);
+    }
+
+    return 0;
 }

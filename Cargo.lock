@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "dray-driver",
  "dray-hir",
+ "dray-ir",
  "dray-syntax",
 ]
 
@@ -16,6 +17,7 @@ name = "dray-codegen"
 version = "0.1.0"
 dependencies = [
  "dray-hir",
+ "dray-ir",
  "dray-syntax",
  "tamago",
 ]
@@ -26,6 +28,7 @@ version = "0.1.0"
 dependencies = [
  "dray-codegen",
  "dray-hir",
+ "dray-ir",
  "dray-syntax",
 ]
 

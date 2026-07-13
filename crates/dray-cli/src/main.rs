@@ -5,8 +5,9 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use dray_driver::{BuildOptions, build_file, source_to_c};
+use dray_driver::{BuildOptions, build_file, source_to_c, source_to_ir};
 use dray_hir::{dump_hir, lower};
+use dray_ir::dump_ir;
 use dray_syntax::{DumpOptions, dump_cst_with, dump_tokens, dump_tokens_no_trivia, parse};
 
 fn main() -> ExitCode {
@@ -53,6 +54,7 @@ usage:
   dray dump-tokens [--no-trivia] <file>
   dray dump-cst    [--trivia] [--no-spans] [--shape] <file>
   dray dump-hir    <file>              resolve + type, print the HIR
+  dray dump-ir     <file>              lower to IR, print it (retain/release shown)
   dray emit-c      <file>              generate C and print it (use - for stdin)
   dray build       [-o <out>] [--emit-c] <file>   compile to an executable
 
@@ -73,6 +75,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "dump-tokens" => dump_tokens_cmd(&args[1..]),
         "dump-cst" => dump_cst_cmd(&args[1..]),
         "dump-hir" => dump_hir_cmd(&args[1..]),
+        "dump-ir" => dump_ir_cmd(&args[1..]),
         "emit-c" => emit_c_cmd(&args[1..]),
         "build" => build_cmd(&args[1..]),
         "-h" | "--help" | "help" => {
@@ -253,6 +256,30 @@ fn dump_hir_cmd(args: &[String]) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn dump_ir_cmd(args: &[String]) -> Result<(), CliError> {
+    let mut path: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            flag if flag.starts_with("--") => {
+                return Err(format!("unknown flag `{flag}` for dump-ir").into());
+            }
+            positional => {
+                if path.replace(positional).is_some() {
+                    return Err("more than one input given".into());
+                }
+            }
+        }
+    }
+    let src = read_source(path.ok_or("no input file given")?)?;
+    match source_to_ir(&src) {
+        Ok(ir) => {
+            print!("{}", dump_ir(&ir));
+            Ok(())
+        }
+        Err(e) => Err(CliError::Failed(e.to_string())),
+    }
 }
 
 fn read_source(path: &str) -> Result<String, String> {

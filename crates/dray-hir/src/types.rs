@@ -15,9 +15,13 @@ pub(crate) fn lower_type(node: &SyntaxNode) -> Option<Ty> {
                 .unwrap_or_else(|| node.text().trim().to_string());
             Some(name_to_ty(&name))
         }
-        SyntaxKind::PointerType | SyntaxKind::RcPointerType => {
+        SyntaxKind::PointerType => {
             let inner = node.children().into_iter().find(|c| is_type(c.kind()))?;
             Some(Ty::Ptr(Box::new(lower_type(&inner)?)))
+        }
+        SyntaxKind::RcPointerType => {
+            let inner = node.children().into_iter().find(|c| is_type(c.kind()))?;
+            Some(Ty::Rc(Box::new(lower_type(&inner)?)))
         }
         // Not modeled yet.
         SyntaxKind::SliceType | SyntaxKind::ArrayType | SyntaxKind::GenericType => None,

@@ -67,7 +67,7 @@ impl Default for BuildOptions {
     }
 }
 
-pub fn source_to_c(src: &str) -> Result<String, BuildError> {
+fn source_to_hir(src: &str) -> Result<dray_hir::Hir, BuildError> {
     let parsed = parse(src);
     if !parsed.errors.is_empty() {
         return Err(BuildError::Parse(
@@ -88,8 +88,18 @@ pub fn source_to_c(src: &str) -> Result<String, BuildError> {
                 .collect(),
         ));
     }
+    Ok(hir)
+}
 
-    dray_codegen::hir_to_c(&hir).map_err(|e| BuildError::Codegen(e.to_string()))
+/// Parse → HIR → IR (the RC-annotated mid-level form). Used by `dump-ir`.
+pub fn source_to_ir(src: &str) -> Result<dray_ir::Ir, BuildError> {
+    Ok(dray_ir::lower(&source_to_hir(src)?))
+}
+
+/// The full front end: parse → HIR → IR → C source.
+pub fn source_to_c(src: &str) -> Result<String, BuildError> {
+    let ir = source_to_ir(src)?;
+    dray_codegen::ir_to_c(&ir).map_err(|e| BuildError::Codegen(e.to_string()))
 }
 
 /// Build a Dray source file into an executable at `out_path`. Returns the path

@@ -13,4 +13,5 @@ path = "src/main.rs"
 [dependencies]
 dray-syntax = { path = "../dray-syntax" }
 dray-hir = { path = "../dray-hir" }
+dray-ir = { path = "../dray-ir" }
 dray-driver = { path = "../dray-driver" }

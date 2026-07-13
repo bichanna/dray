@@ -425,13 +425,7 @@ impl Lowerer {
             SyntaxKind::FieldExpr => self.lower_field(node),
             SyntaxKind::IndexExpr => self.lower_index(node),
             SyntaxKind::CastExpr => self.lower_cast(node),
-            SyntaxKind::AllocExpr => {
-                self.err(
-                    span,
-                    "alloc/try_alloc needs RC lowering (IR stage), not in HIR yet",
-                );
-                (ExprKind::Unresolved("alloc".into()), Ty::Infer)
-            }
+            SyntaxKind::AllocExpr => self.lower_alloc(node),
             other => {
                 self.err(span, format!("unsupported expression {other:?}"));
                 (ExprKind::Unresolved(format!("{other:?}")), Ty::Infer)
@@ -504,7 +498,7 @@ impl Lowerer {
                     UnOp::LogicNot => Ty::Bool,
                     UnOp::AddrOf => Ty::Ptr(Box::new(operand.ty.clone())),
                     UnOp::Deref => match &operand.ty {
-                        Ty::Ptr(inner) => (**inner).clone(),
+                        Ty::Ptr(inner) | Ty::Rc(inner) => (**inner).clone(),
                         _ => Ty::Infer,
                     },
                     UnOp::Neg | UnOp::BitNot => operand.ty.clone(),
@@ -638,8 +632,24 @@ impl Lowerer {
 
     // ── small helpers ────────────────────────────────────────────────────────
 
-    /// Lower a type node, reporting an error (and returning None) for the ones
-    /// HIR doesn't model.
+    fn lower_alloc(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
+        if node.token_of_kind(SyntaxKind::KwTryAlloc).is_some() {
+            self.err(node.span(), "try_alloc is not lowered yet; use `alloc`");
+            return (ExprKind::Unresolved("try_alloc".into()), Ty::Infer);
+        }
+        let ty_node = node.children().into_iter().find(|c| is_type(c.kind()));
+        match ty_node.and_then(|t| self.checked_type(&t)) {
+            Some(inner) => (
+                ExprKind::Alloc { ty: inner.clone() },
+                Ty::Rc(Box::new(inner)),
+            ),
+            None => {
+                self.err(node.span(), "alloc needs a type");
+                (ExprKind::Unresolved("alloc".into()), Ty::Infer)
+            }
+        }
+    }
+
     fn checked_type(&mut self, node: &SyntaxNode) -> Option<Ty> {
         match lower_type(node) {
             Some(t) => Some(t),
@@ -754,9 +764,10 @@ fn leading_op(node: &SyntaxNode) -> Option<String> {
 fn middle_op(node: &SyntaxNode) -> Option<String> {
     for el in node.children_with_tokens() {
         if let SyntaxElement::Token(t) = el
-            && !t.kind().is_trivia() {
-                return Some(t.text().to_string());
-            }
+            && !t.kind().is_trivia()
+        {
+            return Some(t.text().to_string());
+        }
     }
     None
 }
@@ -820,10 +831,46 @@ fn assign_op(node: &SyntaxNode) -> Option<AssignOp> {
 }
 
 fn unquote(text: &str) -> String {
-    text.strip_prefix('"')
+    let inner = text
+        .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(text)
-        .to_string()
+        .unwrap_or(text);
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some('x') => {
+                let hi = chars.next();
+                let lo = chars.next();
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        if let Ok(byte) = u8::from_str_radix(&format!("{h}{l}"), 16) {
+                            out.push(byte as char);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Unknown escape: keep it verbatim rather than dropping the backslash.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn decode_rune(text: &str) -> std::result::Result<char, String> {

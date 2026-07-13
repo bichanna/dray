@@ -2,7 +2,7 @@
 
 //! HIR lowering tests: name resolution, type inference, and the errors both raise
 
-use dray_hir::{dump_hir, lower, DefKind, ExprKind, Item, Stmt, Ty};
+use dray_hir::{DefKind, ExprKind, Item, Stmt, Ty, dump_hir, lower};
 use dray_syntax::parse;
 
 /// Parse + lower, asserting no resolution errors, returning the HIR
@@ -50,7 +50,9 @@ fn resolves_a_local_reference() {
 #[test]
 fn resolves_forward_function_reference() {
     // main calls helper which is defined *after* main
-    let h = hir("main :: proc() -> int32 {\n    return helper();\n}\n\nhelper :: proc() -> int32 {\n    return 3;\n}\n");
+    let h = hir(
+        "main :: proc() -> int32 {\n    return helper();\n}\n\nhelper :: proc() -> int32 {\n    return 3;\n}\n",
+    );
     let dump = dump_hir(&h);
     // helper resolves to a proc def id, referenced from main
     assert!(dump.contains("helper#"), "helper should resolve:\n{dump}");
@@ -61,10 +63,11 @@ fn resolves_parameters() {
     let h = hir("add :: proc(a: int32, b: int32) -> int32 {\n    return a + b;\n}\n");
     let Item::Proc(p) = &h.items[0] else { panic!() };
     assert_eq!(p.params.len(), 2);
-    assert!(p
-        .params
-        .iter()
-        .all(|pp| h.def(pp.def).kind == DefKind::Param));
+    assert!(
+        p.params
+            .iter()
+            .all(|pp| h.def(pp.def).kind == DefKind::Param)
+    );
 }
 
 #[test]
@@ -170,9 +173,15 @@ fn extern_carries_linked_symbol() {
 // ── deferred constructs are clean errors ─────────────────────────────────────
 
 #[test]
-fn alloc_is_a_clean_error() {
-    let errs = resolve_errors("f :: proc() {\n    x := alloc Node;\n}\n");
-    assert!(errs.iter().any(|m| m.contains("alloc")), "{errs:?}");
+fn alloc_lowers_cleanly() {
+    let errs = resolve_errors("f :: proc() {\n    x := alloc int32;\n    *x = 1;\n}\n");
+    assert!(errs.is_empty(), "alloc should lower cleanly: {errs:?}");
+}
+
+#[test]
+fn try_alloc_is_still_a_clean_error() {
+    let errs = resolve_errors("f :: proc() {\n    x := try_alloc int32;\n}\n");
+    assert!(errs.iter().any(|m| m.contains("try_alloc")), "{errs:?}");
 }
 
 #[test]
@@ -199,4 +208,10 @@ fn comment_before_a_type_name_is_ignored() {
         errs.is_empty(),
         "comment before a type must not break lowering: {errs:?}"
     );
+}
+
+#[test]
+fn escapes_are_decoded() {
+    let errs = resolve_errors("f :: proc() {\n    s := \"a\\nb\";\n}\n");
+    assert!(errs.is_empty(), "{errs:?}");
 }

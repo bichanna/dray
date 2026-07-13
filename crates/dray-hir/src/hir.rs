@@ -167,6 +167,9 @@ pub enum ExprKind {
         ty: Ty,
         operand: Box<Expr>,
     },
+    Alloc {
+        ty: Ty,
+    },
     Paren(Box<Expr>),
 }
 
@@ -253,6 +256,7 @@ pub enum Ty {
         bits: u8,
     },
     Ptr(Box<Ty>),
+    Rc(Box<Ty>),
     Named(String),
     Infer,
 }
