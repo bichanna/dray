@@ -39,14 +39,18 @@ const RC_RUNTIME: &str = "\
 #include <stdint.h>
 #include <stdlib.h>
 
-typedef struct { uint32_t strong; uint32_t weak; } DrayRcHeader;
+// Each allocation carries a drop function: for a struct with @T fields it releases
+// those fields (so freeing a node frees what it owns, recursively) and NULL otherwise.
+typedef void (*DrayDropFn)(void *);
+typedef struct { uint32_t strong; uint32_t weak; DrayDropFn drop; } DrayRcHeader;
 
 int64_t dray_rc_live_count = 0;
 
-void *dray_rc_alloc(unsigned long payload) {
+void *dray_rc_alloc(unsigned long payload, DrayDropFn drop) {
     DrayRcHeader *h = (DrayRcHeader *)calloc(1, sizeof(DrayRcHeader) + payload);
     h->strong = 1;
     h->weak = 0;
+    h->drop = drop;
     dray_rc_live_count++;
     return (void *)(h + 1);
 }
@@ -60,6 +64,7 @@ void dray_rc_release(void *p) {
     if (!p) return;
     DrayRcHeader *h = (DrayRcHeader *)p - 1;
     if (--h->strong == 0) {
+        if (h->drop) h->drop(p);   // release owned @T fields first
         dray_rc_live_count--;
         if (h->weak == 0) free(h);
     }
@@ -72,9 +77,7 @@ int64_t dray_rc_live(void) { return dray_rc_live_count; }
 pub fn ir_to_c(ir: &Ir) -> Result<String> {
     let scope = lower_ir(ir)?;
     let program = format!("{scope}");
-    if ir.uses_rc {
-        Ok(format!("{RC_RUNTIME}\n{program}"))
-    } else {
-        Ok(program)
-    }
+    let structs = lower::structs_c(ir);
+    let runtime = if ir.uses_rc { RC_RUNTIME } else { "" };
+    Ok(format!("{runtime}{structs}\n{program}"))
 }

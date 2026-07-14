@@ -107,6 +107,11 @@ pub enum SyntaxKind {
     /// `[ "pub" ] identifier "::" "extern" string_lit "proc" "(" ParamList ")"
     /// [ "->" Type ] ";"` — an externally-linked C function (spec §16).
     ExternProcDecl,
+    /// `[ \"pub\" ] identifier \"::\" \"struct\" \"{\" { FieldDecl } \"}\"` — a struct
+    /// type declaration. (The generic-parameter receiver form is deferred.)
+    StructDef,
+    /// `identifier \":\" Type` — one field inside a `StructDef`.
+    FieldDecl,
     /// `( ParamList )`
     ParamList,
     /// `[ "comptime" ] identifier ":" Type`
@@ -169,8 +174,13 @@ pub enum SyntaxKind {
     PrefixExpr,
     /// `cast ( Type ) UnaryExpr`
     CastExpr,
-    /// `( "alloc" | "try_alloc" ) Type` (the `{...}` composite form is deferred).
+    /// `( "alloc" | "try_alloc" ) ( CompositeLit | Type )`.
     AllocExpr,
+    /// `[ Type ] "{" [ ElementList ] "}"` — a composite (struct) literal, e.g.
+    /// `Node{ value: 1, next: n }`.
+    CompositeLit,
+    /// `[ identifier ":" ] Expression` — one initializer inside a `CompositeLit`.
+    Element,
     /// A postfix call: `callee ( ArgumentList )`.
     CallExpr,
     /// A field selector: `receiver . identifier`.

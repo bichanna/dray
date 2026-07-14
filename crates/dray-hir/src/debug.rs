@@ -44,6 +44,13 @@ fn dump_item(item: &Item, out: &mut String) {
                 dump_stmt(s, 1, out);
             }
         }
+        Item::Struct(sd) => {
+            let _ = writeln!(out, "struct {} [#{}] {{", sd.name, sd.def.0);
+            for f in &sd.fields {
+                let _ = writeln!(out, "  {}: {}", f.name, ty(&f.ty));
+            }
+            let _ = writeln!(out, "}}");
+        }
     }
 }
 
@@ -153,7 +160,17 @@ pub fn expr(e: &Expr) -> String {
         ExprKind::Field { recv, member } => format!("{}.{member}", expr(recv)),
         ExprKind::Index { base, index } => format!("{}[{}]", expr(base), expr(index)),
         ExprKind::Cast { ty: t, operand } => format!("cast({}) {}", ty(t), expr(operand)),
-        ExprKind::Alloc { ty: t } => format!("alloc {}", ty(t)),
+        ExprKind::Alloc { ty: t, fields } => {
+            if fields.is_empty() {
+                format!("alloc {}", ty(t))
+            } else {
+                let fs: Vec<String> = fields
+                    .iter()
+                    .map(|(n, e)| format!("{n}: {}", expr(e)))
+                    .collect();
+                format!("alloc {}{{ {} }}", ty(t), fs.join(", "))
+            }
+        }
         ExprKind::Paren(inner) => format!("({})", expr(inner)),
     };
     format!("{inner}:{}", ty(&e.ty))

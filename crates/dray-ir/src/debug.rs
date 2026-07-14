@@ -12,6 +12,22 @@ pub fn dump_ir(ir: &Ir) -> String {
     if ir.uses_rc {
         out.push_str("// uses_rc: RC runtime will be emitted\n");
     }
+    for sd in &ir.structs {
+        let has_rc = sd
+            .fields
+            .iter()
+            .any(|f| matches!(f.ty, dray_hir::Ty::Rc(_)));
+        let note = if has_rc {
+            "  // has @T fields -> gets drop glue"
+        } else {
+            ""
+        };
+        out.push_str(&format!("struct {} {{{}\n", sd.name, note));
+        for f in &sd.fields {
+            out.push_str(&format!("  {}: {}\n", f.name, ty_str(&f.ty)));
+        }
+        out.push_str("}\n");
+    }
     for item in &ir.items {
         dump_item(item, &mut out);
     }

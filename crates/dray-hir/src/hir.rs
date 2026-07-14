@@ -40,6 +40,8 @@ pub enum DefKind {
     Param,
     /// A local variable (`:=` / `: T =` / …).
     Local,
+    /// A struct type. Used to resolve `Ty::Named` and to type field access.
+    Struct,
 }
 
 /// A top-level item.
@@ -48,6 +50,21 @@ pub enum Item {
     Include(String),
     Proc(Proc),
     ExternProc(ExternProc),
+    Struct(StructDef),
+}
+
+/// A struct type declaration: an ordered list of typed fields
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDef {
+    pub def: DefId,
+    pub name: String,
+    pub fields: Vec<Field>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Field {
+    pub name: String,
+    pub ty: Ty,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +186,7 @@ pub enum ExprKind {
     },
     Alloc {
         ty: Ty,
+        fields: Vec<(String, Expr)>,
     },
     Paren(Box<Expr>),
 }

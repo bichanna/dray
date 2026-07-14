@@ -198,22 +198,44 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             T::new_fn_call(lower_expr(ir, callee)?, a)
         }
         ExprKind::Field { recv, member } => {
-            T::new_mem_access(lower_expr(ir, recv)?, member.clone())
+            let base = lower_expr(ir, recv)?;
+            let base = if matches!(recv.ty, Ty::Rc(_) | Ty::Ptr(_)) {
+                T::new_parenthesized(T::new_unary(base, tamago::UnaryOp::Deref))
+            } else {
+                base
+            };
+            T::new_mem_access(base, member.clone())
         }
         ExprKind::Index { base, index } => {
             T::new_arr_index(lower_expr(ir, base)?, lower_expr(ir, index)?)
         }
         ExprKind::Cast { ty, operand } => T::new_cast(lower_ty(ty)?, lower_expr(ir, operand)?),
-        // `alloc T` → (T*)dray_rc_alloc(sizeof(T)). The RC pass has already
-        // decided the surrounding retain/release
-        ExprKind::Alloc { ty } => {
-            let size = T::new_fn_call(
-                T::new_ident("sizeof".to_string()),
-                vec![T::new_ident(c_type_name(ty))],
-            );
-            let raw = T::new_fn_call(T::new_ident("dray_rc_alloc".to_string()), vec![size]);
-            T::new_cast(Type::ptr(lower_ty(ty)?), raw)
-        }
+        ExprKind::Alloc { ty, fields } => match ty {
+            Ty::Named(name) => {
+                let sd = ir.structs.iter().find(|s| &s.name == name);
+                let mut args = Vec::new();
+                if let Some(sd) = sd {
+                    for f in &sd.fields {
+                        match fields.iter().find(|(n, _)| n == &f.name) {
+                            Some((_, e)) => args.push(lower_expr(ir, e)?),
+                            None => args.push(T::Int(0)), // zero/NULL default
+                        }
+                    }
+                }
+                T::new_fn_call(T::new_ident(format!("dray_new_{name}")), args)
+            }
+            _ => {
+                let size = T::new_fn_call(
+                    T::new_ident("sizeof".to_string()),
+                    vec![T::new_ident(c_type_name(ty))],
+                );
+                let raw = T::new_fn_call(
+                    T::new_ident("dray_rc_alloc".to_string()),
+                    vec![size, T::Int(0)],
+                );
+                T::new_cast(Type::ptr(lower_ty(ty)?), raw)
+            }
+        },
         ExprKind::Paren(inner) => T::new_parenthesized(lower_expr(ir, inner)?),
     })
 }
@@ -327,4 +349,66 @@ fn assign_op(op: AssignOp) -> tamago::AssignOp {
         AssignOp::Shl => A::LShiftAssign,
         AssignOp::Shr => A::RShiftAssign,
     }
+}
+
+pub(crate) fn structs_c(ir: &Ir) -> String {
+    if ir.structs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n");
+
+    for sd in &ir.structs {
+        out.push_str(&format!("typedef struct {n} {n};\n", n = sd.name));
+    }
+    // Definitions
+    for sd in &ir.structs {
+        out.push_str(&format!("struct {} {{\n", sd.name));
+        for f in &sd.fields {
+            out.push_str(&format!("    {} {};\n", c_type_name(&f.ty), f.name));
+        }
+        out.push_str("};\n");
+    }
+
+    for sd in &ir.structs {
+        if !has_rc_field(sd) {
+            continue;
+        }
+        out.push_str(&format!(
+            "void dray_drop_{n}(void *p) {{\n    {n} *self = ({n} *)p;\n",
+            n = sd.name
+        ));
+        for f in &sd.fields {
+            if matches!(f.ty, Ty::Rc(_)) {
+                out.push_str(&format!("    dray_rc_release(self->{});\n", f.name));
+            }
+        }
+        out.push_str("}\n");
+    }
+    // Constructors
+    for sd in &ir.structs {
+        let params: Vec<String> = sd
+            .fields
+            .iter()
+            .map(|f| format!("{} {}", c_type_name(&f.ty), f.name))
+            .collect();
+        let drop = if has_rc_field(sd) {
+            format!("dray_drop_{}", sd.name)
+        } else {
+            "0".to_string()
+        };
+        out.push_str(&format!(
+            "{n} *dray_new_{n}({params}) {{\n    {n} *self = ({n} *)dray_rc_alloc(sizeof({n}), {drop});\n",
+            n = sd.name,
+            params = params.join(", ")
+        ));
+        for f in &sd.fields {
+            out.push_str(&format!("    self->{name} = {name};\n", name = f.name));
+        }
+        out.push_str("    return self;\n}\n");
+    }
+    out
+}
+
+fn has_rc_field(sd: &dray_ir::StructDef) -> bool {
+    sd.fields.iter().any(|f| matches!(f.ty, Ty::Rc(_)))
 }

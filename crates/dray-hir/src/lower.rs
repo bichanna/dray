@@ -44,6 +44,7 @@ struct Lowerer {
     scopes: Vec<Scope>,
     items: Vec<Item>,
     errors: Vec<ResolveError>,
+    structs: HashMap<String, Vec<Field>>,
 }
 
 impl Lowerer {
@@ -53,6 +54,7 @@ impl Lowerer {
             scopes: vec![Scope::new()], // scopes[0] = module scope
             items: Vec::new(),
             errors: Vec::new(),
+            structs: HashMap::new(),
         }
     }
 
@@ -81,6 +83,15 @@ impl Lowerer {
                         self.bind_module(name, id);
                     }
                 }
+                SyntaxKind::StructDef => {
+                    if let Some(name) = first_ident(decl) {
+                        let fields = self.struct_fields(decl);
+                        let id =
+                            self.add_def(name.clone(), DefKind::Struct, Ty::Named(name.clone()));
+                        self.bind_module(name.clone(), id);
+                        self.structs.insert(name, fields);
+                    }
+                }
                 _ => {}
             }
         }
@@ -95,6 +106,7 @@ impl Lowerer {
                 }
                 SyntaxKind::ProcDef => self.lower_proc(decl),
                 SyntaxKind::ExternProcDecl => self.lower_extern(decl),
+                SyntaxKind::StructDef => self.lower_struct(decl),
                 SyntaxKind::Error => {
                     self.err(
                         decl.span(),
@@ -577,12 +589,21 @@ impl Lowerer {
             .token_of_kind(SyntaxKind::Ident)
             .map(|t| t.text().to_string())
             .unwrap_or_default();
+        let ty = match struct_name_of(&recv.ty) {
+            Some(sname) => self
+                .structs
+                .get(&sname)
+                .and_then(|fs| fs.iter().find(|f| f.name == member))
+                .map(|f| f.ty.clone())
+                .unwrap_or(Ty::Infer),
+            None => Ty::Infer,
+        };
         (
             ExprKind::Field {
                 recv: Box::new(recv),
                 member,
             },
-            Ty::Infer, // no struct field types yet
+            ty,
         )
     }
 
@@ -632,15 +653,57 @@ impl Lowerer {
 
     // ── small helpers ────────────────────────────────────────────────────────
 
+    /// Resolve the fields of a `StructDef` CST node to `(name, Ty)` pairs.
+    fn struct_fields(&mut self, node: &SyntaxNode) -> Vec<Field> {
+        let mut fields = Vec::new();
+        for fd in node.children() {
+            if fd.kind() != SyntaxKind::FieldDecl {
+                continue;
+            }
+            let name = ident_text(&fd);
+            let ty = fd
+                .children()
+                .into_iter()
+                .find(|c| is_type(c.kind()))
+                .and_then(|t| lower_type(&t))
+                .unwrap_or(Ty::Infer);
+            fields.push(Field { name, ty });
+        }
+        fields
+    }
+
+    fn lower_struct(&mut self, node: &SyntaxNode) {
+        let name = match first_ident(node) {
+            Some(n) => n,
+            None => return,
+        };
+        let def = self.resolve(&name).unwrap_or(DefId(0));
+        let fields = self.structs.get(&name).cloned().unwrap_or_default();
+        self.items
+            .push(Item::Struct(StructDef { def, name, fields }));
+    }
+
+    /// Lower `alloc T` or `alloc T{ field: value, ... }`. The composite form
+    /// carries per-field initializers.
     fn lower_alloc(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         if node.token_of_kind(SyntaxKind::KwTryAlloc).is_some() {
             self.err(node.span(), "try_alloc is not lowered yet; use `alloc`");
             return (ExprKind::Unresolved("try_alloc".into()), Ty::Infer);
         }
+
+        // Composite form: the child is a CompositeLit wrapping the type + fields.
+        if let Some(lit) = node.child_of_kind(SyntaxKind::CompositeLit) {
+            return self.lower_composite_alloc(&lit);
+        }
+
+        // Bare form: `alloc T`, zero-initialized.
         let ty_node = node.children().into_iter().find(|c| is_type(c.kind()));
         match ty_node.and_then(|t| self.checked_type(&t)) {
             Some(inner) => (
-                ExprKind::Alloc { ty: inner.clone() },
+                ExprKind::Alloc {
+                    ty: inner.clone(),
+                    fields: Vec::new(),
+                },
                 Ty::Rc(Box::new(inner)),
             ),
             None => {
@@ -648,6 +711,54 @@ impl Lowerer {
                 (ExprKind::Unresolved("alloc".into()), Ty::Infer)
             }
         }
+    }
+
+    /// Lower a `CompositeLit` sitting under an `alloc`: resolve the struct type,
+    /// then each `field: value` element (checking the field exists).
+    fn lower_composite_alloc(&mut self, lit: &SyntaxNode) -> (ExprKind, Ty) {
+        let ty_node = lit.children().into_iter().find(|c| is_type(c.kind()));
+        let ty = match ty_node.and_then(|t| self.checked_type(&t)) {
+            Some(t) => t,
+            None => {
+                self.err(lit.span(), "composite literal needs a type");
+                return (ExprKind::Unresolved("composite".into()), Ty::Infer);
+            }
+        };
+        let struct_name = match &ty {
+            Ty::Named(n) => n.clone(),
+            _ => {
+                self.err(lit.span(), "only structs can be built with `{ ... }`");
+                return (ExprKind::Unresolved("composite".into()), Ty::Infer);
+            }
+        };
+        let known: Vec<String> = self
+            .structs
+            .get(&struct_name)
+            .map(|fs| fs.iter().map(|f| f.name.clone()).collect())
+            .unwrap_or_default();
+
+        let mut fields = Vec::new();
+        for el in lit.children() {
+            if el.kind() != SyntaxKind::Element {
+                continue;
+            }
+            let fname = ident_text(&el);
+            if !known.is_empty() && !known.contains(&fname) {
+                self.err(el.span(), format!("`{struct_name}` has no field `{fname}`"));
+            }
+            let value = match self.first_expr(&el) {
+                Some(e) => self.lower_expr(&e),
+                None => continue,
+            };
+            fields.push((fname, value));
+        }
+        (
+            ExprKind::Alloc {
+                ty: ty.clone(),
+                fields,
+            },
+            Ty::Rc(Box::new(ty)),
+        )
     }
 
     fn checked_type(&mut self, node: &SyntaxNode) -> Option<Ty> {
@@ -744,6 +855,17 @@ fn is_expr(kind: SyntaxKind) -> bool {
 fn first_ident(node: &SyntaxNode) -> Option<String> {
     node.token_of_kind(SyntaxKind::Ident)
         .map(|t| t.text().to_string())
+}
+
+fn struct_name_of(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Named(n) => Some(n.clone()),
+        Ty::Rc(inner) | Ty::Ptr(inner) => match &**inner {
+            Ty::Named(n) => Some(n.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn ident_text(node: &SyntaxNode) -> String {

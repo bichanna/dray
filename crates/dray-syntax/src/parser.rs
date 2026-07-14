@@ -268,6 +268,8 @@ impl<'a> Parser<'a> {
             self.proc_def();
         } else if head_ok && after_head == TokenKind::KwExtern {
             self.extern_proc_decl();
+        } else if head_ok && after_head == TokenKind::KwStruct {
+            self.struct_def();
         } else {
             self.start(SyntaxKind::Error);
             self.error_at(
@@ -283,6 +285,34 @@ impl<'a> Parser<'a> {
             self.recover_to_top_level();
             self.finish_node();
         }
+    }
+
+    /// `[ "pub" ] identifier "::" "struct" "{" { FieldDecl [ "," ] } "}"`.
+    /// The generic-parameter receiver form (`struct ( ... ) { ... }`) is deferred
+    fn struct_def(&mut self) {
+        self.start(SyntaxKind::StructDef);
+        self.eat(TokenKind::KwPub);
+        self.expect(TokenKind::Ident, "the struct name");
+        self.expect(TokenKind::ColonColon, "'::'");
+        self.expect(TokenKind::KwStruct, "'struct'");
+        self.expect(TokenKind::LBrace, "'{' to open the struct body");
+        while !self.at(TokenKind::RBrace) && !self.at_eof() {
+            self.field_decl();
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace, "'}' to close the struct body");
+        self.finish_node();
+    }
+
+    /// `identifier ":" Type` — one field of a struct.
+    fn field_decl(&mut self) {
+        self.start(SyntaxKind::FieldDecl);
+        self.expect(TokenKind::Ident, "a field name");
+        self.expect(TokenKind::Colon, "':' before the field type");
+        self.type_ref();
+        self.finish_node();
     }
 
     /// `[ "pub" ] identifier "::" "extern" string_lit "proc" "(" ParamList ")"
@@ -806,7 +836,37 @@ impl<'a> Parser<'a> {
     fn alloc_expr(&mut self) {
         self.start(SyntaxKind::AllocExpr);
         self.bump(); // alloc | try_alloc
+        let cp = self.checkpoint();
         self.type_ref();
+        if self.at(TokenKind::LBrace) {
+            self.wrap_at(cp, SyntaxKind::CompositeLit);
+            self.composite_body();
+            self.finish_node(); // CompositeLit
+        }
+        self.finish_node(); // AllocExpr
+    }
+
+    /// `"{" [ Element { "," Element } [ "," ] ] "}"` — the body of a composite
+    /// literal, parsed into the currently-open `CompositeLit` node.
+    fn composite_body(&mut self) {
+        self.expect(TokenKind::LBrace, "'{' to open the composite literal");
+        while !self.at(TokenKind::RBrace) && !self.at_eof() {
+            self.element();
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace, "'}' to close the composite literal");
+    }
+
+    /// `[ identifier ":" ] Expression`
+    fn element(&mut self) {
+        self.start(SyntaxKind::Element);
+        if self.peek() == TokenKind::Ident && self.peek_nth(1) == TokenKind::Colon {
+            self.bump(); // field name
+            self.bump(); // ':'
+        }
+        self.expr();
         self.finish_node();
     }
 

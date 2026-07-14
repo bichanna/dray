@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use dray_codegen::hir_to_c;
+use dray_codegen::ir_to_c;
 use dray_hir::lower;
 use dray_syntax::parse;
 
@@ -13,7 +13,8 @@ fn c(src: &str) -> String {
     );
     let (hir, errs) = lower(&parsed.root);
     assert!(errs.is_empty(), "resolve errors: {errs:?}");
-    hir_to_c(&hir).unwrap_or_else(|e| panic!("codegen failed: {e}"))
+    let ir = dray_ir::lower(&hir);
+    ir_to_c(&ir).unwrap_or_else(|e| panic!("codegen failed: {e}"))
 }
 
 #[test]
@@ -69,7 +70,9 @@ fn extern_prototype_uses_linked_symbol_not_binding_name() {
 
 #[test]
 fn call_to_aliased_extern_uses_symbol() {
-    let out = c("my_abs :: extern \"abs\" proc(x: int32) -> int32;\n\nmain :: proc() -> int32 {\n    return my_abs(-3);\n}\n");
+    let out = c(
+        "my_abs :: extern \"abs\" proc(x: int32) -> int32;\n\nmain :: proc() -> int32 {\n    return my_abs(-3);\n}\n",
+    );
     assert!(
         out.contains("return abs("),
         "call should use the symbol:\n{out}"
@@ -98,7 +101,9 @@ fn for_infinite_lowers_to_forever() {
 
 #[test]
 fn if_else_lowers() {
-    let out = c("f :: proc() -> int32 {\n    x := 1;\n    if x == 1 {\n        return 1;\n    } else {\n        return 2;\n    }\n}\n");
+    let out = c(
+        "f :: proc() -> int32 {\n    x := 1;\n    if x == 1 {\n        return 1;\n    } else {\n        return 2;\n    }\n}\n",
+    );
     assert!(out.contains("if (x == 1)") && out.contains("else"), "{out}");
 }
 
@@ -168,5 +173,117 @@ fn e2e_prime_count() {
     let src = "is_prime :: proc(n: int32) -> int32 {\n    if n < 2 {\n        return 0;\n    }\n    for d := 2; d * d <= n; d += 1 {\n        if n % d == 0 {\n            return 0;\n        }\n    }\n    return 1;\n}\n\nmain :: proc() -> int32 {\n    count := 0;\n    for i := 2; i < 50; i += 1 {\n        if is_prime(i) == 1 {\n            count += 1;\n        }\n    }\n    return count;\n}\n";
     if let Some(code) = compile_and_run(&c(src)) {
         assert_eq!(code, 15);
+    }
+}
+
+#[test]
+fn struct_emits_typedef_constructor_and_drop() {
+    let out = c(
+        "Node :: struct {\n    value: int32,\n    next: @Node,\n}\n\nmain :: proc() -> int32 {\n    n := alloc Node{ value: 1 };\n    return n.value;\n}\n",
+    );
+    assert!(out.contains("typedef struct Node Node;"), "{out}");
+    assert!(out.contains("Node *dray_new_Node("), "constructor: {out}");
+    // Node has an @Node field, so it needs drop glue that releases it.
+    assert!(out.contains("void dray_drop_Node"), "drop glue: {out}");
+    assert!(
+        out.contains("dray_rc_release(self->next)"),
+        "field release: {out}"
+    );
+}
+
+#[test]
+fn composite_alloc_calls_constructor_in_field_order() {
+    let out = c(
+        "P :: struct {\n    a: int32,\n    b: int32,\n}\n\nmain :: proc() -> int32 {\n    p := alloc P{ b: 2, a: 1 };\n    return p.a;\n}\n",
+    );
+    // Fields are reordered to declaration order (a, b) at the call site.
+    assert!(out.contains("dray_new_P(1, 2)"), "field order: {out}");
+    // P has no @T fields, so no drop function and a NULL drop pointer.
+    assert!(
+        !out.contains("dray_drop_P"),
+        "no drop for scalar-only struct: {out}"
+    );
+}
+
+#[test]
+fn field_access_through_pointer_uses_deref() {
+    let out = c(
+        "N :: struct {\n    v: int32,\n}\n\nmain :: proc() -> int32 {\n    n := alloc N{ v: 7 };\n    return n.v;\n}\n",
+    );
+    assert!(out.contains("(*n).v"), "pointer field access: {out}");
+}
+
+#[test]
+fn e2e_return_of_fresh_rc_transfers_ownership() {
+    let src = "\
+Box :: struct { value: int32 }\n\
+rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+\n\
+mk :: proc() -> @Box {\n\
+    b := alloc Box{ value: 42 };\n\
+    return b;\n\
+}\n\
+\n\
+inner :: proc() -> int32 {\n\
+    b := mk();\n\
+    return b.value;\n\
+}\n\
+\n\
+main :: proc() -> int32 {\n\
+    v := inner();\n\
+    return v + cast(int32)(rc_live());\n\
+}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(
+            code, 42,
+            "returned-fresh-@T ownership must transfer without a stray release; got {code}"
+        );
+    }
+}
+
+#[test]
+fn e2e_composite_lit_field_retains_source() {
+    let src = "\
+Node :: struct { value: int32, next: @Node }\n\
+rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+\n\
+build :: proc() {\n\
+    a := alloc Node{ value: 1 };\n\
+    b := alloc Node{ value: 2, next: a };\n\
+}\n\
+\n\
+main :: proc() -> int32 {\n\
+    build();\n\
+    return cast(int32)(rc_live());\n\
+}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(
+            code, 0,
+            "storing an @T into a fresh composite field must retain the source; got live={code}"
+        );
+    }
+}
+
+#[test]
+fn e2e_reassigning_rc_local_releases_old() {
+    let src = "\
+Box :: struct { value: int32 }\n\
+rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+\n\
+churn :: proc() {\n\
+    a := alloc Box{ value: 1 };\n\
+    a = alloc Box{ value: 2 };\n\
+    a = alloc Box{ value: 3 };\n\
+}\n\
+\n\
+main :: proc() -> int32 {\n\
+    churn();\n\
+    return cast(int32)(rc_live());\n\
+}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(
+            code, 0,
+            "reassigning an @T local must release the old value; got live={code}"
+        );
     }
 }

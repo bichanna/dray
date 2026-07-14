@@ -407,23 +407,21 @@ fn lex_error_is_carried_into_tree_and_reported() {
 }
 
 #[test]
-fn deferred_struct_decl_degrades_gracefully() {
+fn struct_decl_parses() {
     let src = "Node :: struct {\n    value: int32,\n}\n\nmain :: proc() {\n}\n";
     let p = parse(src);
     assert!(
-        !p.errors.is_empty(),
-        "struct is unimplemented, expect an error"
+        p.errors.is_empty(),
+        "struct should parse cleanly: {:?}",
+        p.errors
     );
-    assert_eq!(
-        p.root.text(),
-        src,
-        "lossless despite the deferred construct"
-    );
+    assert_eq!(p.root.text(), src, "lossless");
     assert!(
-        p.root.child_of_kind(SyntaxKind::ProcDef).is_some(),
-        "should recover to parse main after the deferred struct\n{}",
+        p.root.child_of_kind(SyntaxKind::StructDef).is_some(),
+        "should have a StructDef\n{}",
         debug_tree(&p.root)
     );
+    assert!(p.root.child_of_kind(SyntaxKind::ProcDef).is_some());
 }
 
 #[test]

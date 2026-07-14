@@ -215,3 +215,19 @@ fn escapes_are_decoded() {
     let errs = resolve_errors("f :: proc() {\n    s := \"a\\nb\";\n}\n");
     assert!(errs.is_empty(), "{errs:?}");
 }
+
+#[test]
+fn struct_defines_a_type_and_fields() {
+    let errs = resolve_errors(
+        "Node :: struct {\n    value: int32,\n    next: @Node,\n}\n\nmain :: proc() -> int32 {\n    n := alloc Node{ value: 1 };\n    return n.value;\n}\n",
+    );
+    assert!(errs.is_empty(), "struct program should resolve: {errs:?}");
+}
+
+#[test]
+fn unknown_field_is_an_error() {
+    let errs = resolve_errors(
+        "Node :: struct {\n    value: int32,\n}\n\nmain :: proc() {\n    n := alloc Node{ nope: 1 };\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("no field")), "{errs:?}");
+}

@@ -1,0 +1,42 @@
+putchar :: extern "putchar" proc(c: int32) -> int32;
+
+Node :: struct {
+    value: int32,
+    next:  @Node,
+}
+
+prepend :: proc(head: @Node, value: int32) -> @Node {
+    n := alloc Node{ value: value, next: head };
+    return n;
+}
+
+sum_first_four :: proc(head: @Node) -> int32 {
+    total := 0;
+    n := head;
+    for i := 0; i < 4; i += 1 {
+        total += n.value;
+        n = n.next;
+    }
+    return total;
+}
+
+print_int :: proc(n: int32) {
+    if n >= 10 { print_int(n / 10); }
+    putchar(48 + n % 10);
+}
+
+run :: proc() -> int32 {
+    seed := alloc Node{ value: 0 };
+    head := seed;
+    head = prepend(head, 10);
+    head = prepend(head, 10);
+    head = prepend(head, 10);
+    head = prepend(head, 10);
+    return sum_first_four(head);
+}
+
+main :: proc() -> int32 {
+    total := run();
+    print_int(total);
+    return 0;
+}

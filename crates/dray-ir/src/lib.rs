@@ -4,7 +4,7 @@
 
 use dray_hir::{DefId, DefInfo, DefKind, Expr, ExprKind, Hir, Ty};
 
-pub use dray_hir::{AssignOp, BinOp, UnOp};
+pub use dray_hir::{AssignOp, BinOp, Field, StructDef, UnOp};
 
 mod debug;
 pub use debug::dump_ir;
@@ -12,6 +12,7 @@ pub use debug::dump_ir;
 #[derive(Debug, Clone)]
 pub struct Ir {
     pub items: Vec<Item>,
+    pub structs: Vec<StructDef>,
     /// The definition arena, carried over from HIR plus any temporaries this pass
     /// introduces (see [`Lowerer::fresh_temp`]).
     pub defs: Vec<DefInfo>,
@@ -102,9 +103,18 @@ pub fn lower(hir: &Hir) -> Ir {
         uses_rc: false,
         temp: 0,
     };
-    let items = hir.items.iter().map(|it| lw.item(it)).collect();
+    let items = hir.items.iter().filter_map(|it| lw.item(it)).collect();
+    let structs = hir
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            dray_hir::Item::Struct(sd) => Some(sd.clone()),
+            _ => None,
+        })
+        .collect();
     Ir {
         items,
+        structs,
         defs: lw.defs,
         uses_rc: lw.uses_rc,
     }
@@ -122,15 +132,16 @@ struct Lowerer {
 type Scopes = Vec<Vec<String>>;
 
 impl Lowerer {
-    fn item(&mut self, item: &dray_hir::Item) -> Item {
+    fn item(&mut self, item: &dray_hir::Item) -> Option<Item> {
         match item {
-            dray_hir::Item::Include(h) => Item::Include(h.clone()),
-            dray_hir::Item::ExternProc(e) => Item::ExternProc(ExternProc {
+            dray_hir::Item::Struct(_) => None, // collected into Ir.structs directly
+            dray_hir::Item::Include(h) => Some(Item::Include(h.clone())),
+            dray_hir::Item::ExternProc(e) => Some(Item::ExternProc(ExternProc {
                 name: e.name.clone(),
                 symbol: e.symbol.clone(),
                 params: e.params.iter().map(param).collect(),
                 ret: e.ret.clone(),
-            }),
+            })),
             dray_hir::Item::Proc(p) => {
                 let mut scopes: Scopes = vec![Vec::new()];
                 let mut body = Vec::new();
@@ -143,12 +154,12 @@ impl Lowerer {
                     let top = scopes.last().unwrap().clone();
                     self.release(&top, &mut body);
                 }
-                Item::Proc(Proc {
+                Some(Item::Proc(Proc {
                     name: p.name.clone(),
                     params: p.params.iter().map(param).collect(),
                     ret: p.ret.clone(),
                     body,
-                })
+                }))
             }
         }
     }
@@ -159,6 +170,12 @@ impl Lowerer {
         use dray_hir::Stmt as H;
         match s {
             H::Let { name, ty, init, .. } => {
+                // Composite `alloc T{...}` initializers with @T fields whose values
+                // are Names of live @T locals need those sources retained: the new
+                // allocation is about to hold the same pointer, so the source
+                // binding's implicit +1 must be duplicated
+                self.emit_field_retains(init, scopes, out);
+
                 out.push(Stmt::Let {
                     name: name.clone(),
                     ty: ty.clone(),
@@ -166,22 +183,23 @@ impl Lowerer {
                 });
                 if matches!(ty, Ty::Rc(_)) {
                     scopes.last_mut().unwrap().push(name.clone());
-                    if is_rc_copy(init) {
-                        // rule 2: a copy of an existing @T → retain.
+                    if is_rc_borrow(init) {
+                        // rule 2: a borrowed @T (Name, Field, …) → retain the
+                        // new binding so the slot holds its own +1.
                         self.emit_retain(name.clone(), out);
                     }
-                    // rule 1: fresh from `alloc` → already owned, nothing to emit.
+                    // rule 1: fresh from `alloc` / call → already owned, nothing
+                    // to emit.
                 }
             }
-            H::Assign { target, op, value } => out.push(Stmt::Assign {
-                target: target.clone(),
-                op: *op,
-                value: value.clone(),
-            }),
+            H::Assign { target, op, value } => self.lower_assign(target, *op, value, scopes, out),
             H::Return(expr) => self.lower_return(expr.as_ref(), scopes, out),
             H::Break => out.push(Stmt::Break),
             H::Continue => out.push(Stmt::Continue),
-            H::Expr(e) => out.push(Stmt::Expr(e.clone())),
+            H::Expr(e) => {
+                self.emit_field_retains(e, scopes, out);
+                out.push(Stmt::Expr(e.clone()));
+            }
             H::If {
                 cond,
                 then_branch,
@@ -247,8 +265,19 @@ impl Lowerer {
     }
 
     fn lower_return(&mut self, expr: Option<&Expr>, scopes: &Scopes, out: &mut Vec<Stmt>) {
-        let live: Vec<String> = scopes.iter().flatten().cloned().collect();
+        let transferred = expr.and_then(|e| transferred_local(scopes, e));
+        let mut live: Vec<String> = scopes.iter().flatten().cloned().collect();
+        if let Some(t) = &transferred
+            && let Some(idx) = live.iter().rposition(|n| n == t)
+        {
+            live.remove(idx);
+        }
+
         match expr {
+            Some(e) if transferred.is_some() => {
+                self.release(&live, out);
+                out.push(Stmt::Return(Some(e.clone())));
+            }
             Some(e) if !live.is_empty() => {
                 let tmp = self.fresh_temp(e.ty.clone());
                 let name_expr = self.name_expr(&tmp, e.ty.clone(), e.span);
@@ -265,6 +294,100 @@ impl Lowerer {
                 self.release(&live, out);
                 out.push(Stmt::Return(None));
             }
+        }
+    }
+
+    fn lower_assign(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        scopes: &Scopes,
+        out: &mut Vec<Stmt>,
+    ) {
+        // Field retains apply regardless of whether the target is @T.
+        self.emit_field_retains(value, scopes, out);
+
+        let target_name = if matches!(op, AssignOp::Assign)
+            && matches!(target.ty, Ty::Rc(_))
+            && let ExprKind::Name { name, .. } = &target.kind
+            && is_live_rc_local(scopes, name)
+        {
+            Some(name.clone())
+        } else {
+            None
+        };
+
+        if let Some(target_name) = target_name {
+            // Full ARC assign sequence:
+            //   1. Save the current pointer in a synthetic local — NOT tracked
+            //      in `scopes` so there's no auto-retain and no scope-exit
+            //      release; this is a raw copy just to keep the old value
+            //      reachable through the assignment.
+            //   2. Do the assignment. The RHS is evaluated first (in C's
+            //      normal order), so patterns like `n = n.next` still read
+            //      through the *current* target before we drop it.
+            //   3. If the RHS is a borrow (any @T that isn't a fresh `alloc`
+            //      or a call return), retain the target's new pointee — the
+            //      slot needs its own +1 on top of whatever the source binding
+            //      still holds.
+            //   4. Release the saved old value.
+            let old = self.fresh_temp(target.ty.clone());
+            out.push(Stmt::Let {
+                name: old.clone(),
+                ty: target.ty.clone(),
+                init: target.clone(),
+            });
+            out.push(Stmt::Assign {
+                target: target.clone(),
+                op,
+                value: value.clone(),
+            });
+            if is_rc_borrow(value) {
+                self.emit_retain(target_name, out);
+            }
+            self.uses_rc = true;
+            out.push(Stmt::Release(old));
+        } else {
+            out.push(Stmt::Assign {
+                target: target.clone(),
+                op,
+                value: value.clone(),
+            });
+        }
+    }
+
+    fn emit_field_retains(&mut self, e: &Expr, scopes: &Scopes, out: &mut Vec<Stmt>) {
+        match &e.kind {
+            ExprKind::Alloc { fields, .. } => {
+                for (_, val) in fields {
+                    self.emit_field_retains(val, scopes, out);
+                    if matches!(val.ty, Ty::Rc(_))
+                        && let ExprKind::Name { name, .. } = &val.kind
+                    {
+                        self.emit_retain(name.clone(), out);
+                    }
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                self.emit_field_retains(callee, scopes, out);
+                for a in args {
+                    self.emit_field_retains(a, scopes, out);
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.emit_field_retains(lhs, scopes, out);
+                self.emit_field_retains(rhs, scopes, out);
+            }
+            ExprKind::Unary { operand, .. } => self.emit_field_retains(operand, scopes, out),
+            ExprKind::Paren(inner) => self.emit_field_retains(inner, scopes, out),
+            ExprKind::Cast { operand, .. } => self.emit_field_retains(operand, scopes, out),
+            ExprKind::Field { recv, .. } => self.emit_field_retains(recv, scopes, out),
+            ExprKind::Index { base, index } => {
+                self.emit_field_retains(base, scopes, out);
+                self.emit_field_retains(index, scopes, out);
+            }
+            _ => {}
         }
     }
 
@@ -315,10 +438,23 @@ fn param(p: &dray_hir::Param) -> Param {
     }
 }
 
-/// A binding's initializer is a "copy" of another `@T` when it's a bare name of
-/// RC type (`b := a`) — as opposed to a fresh `alloc` or a transfer.
-fn is_rc_copy(init: &Expr) -> bool {
-    matches!(init.kind, ExprKind::Name { .. }) && matches!(init.ty, Ty::Rc(_))
+fn is_rc_borrow(e: &Expr) -> bool {
+    matches!(e.ty, Ty::Rc(_)) && !matches!(e.kind, ExprKind::Alloc { .. } | ExprKind::Call { .. })
+}
+
+fn is_live_rc_local(scopes: &Scopes, name: &str) -> bool {
+    scopes.iter().any(|scope| scope.iter().any(|n| n == name))
+}
+
+fn transferred_local(scopes: &Scopes, e: &Expr) -> Option<String> {
+    if let ExprKind::Name { name, .. } = &e.kind
+        && matches!(e.ty, Ty::Rc(_))
+        && is_live_rc_local(scopes, name)
+    {
+        Some(name.clone())
+    } else {
+        None
+    }
 }
 
 fn ends_in_return(stmts: &[dray_hir::Stmt]) -> bool {
