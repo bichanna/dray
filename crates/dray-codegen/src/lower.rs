@@ -7,8 +7,9 @@
 use dray_hir::{AssignOp, BinOp, DefId, DefKind, Expr, ExprKind, IntWidth, Ty, UnOp};
 use dray_ir::{ExternProc, Ir, Item, Proc, Stmt};
 use tamago::{
-    self, Block, BlockBuilder, ForBuilder, ForInit, FunctionBuilder, GlobalStatement, IfBuilder,
-    IncludeBuilder, ParameterBuilder, Scope, ScopeBuilder, Type, VariableBuilder, WhileBuilder,
+    self, BaseType, Block, BlockBuilder, FieldBuilder, ForBuilder, ForInit, FunctionBuilder,
+    GlobalStatement, IfBuilder, IncludeBuilder, ParameterBuilder, Scope, ScopeBuilder,
+    StructBuilder, Type, VariableBuilder, WhileBuilder,
 };
 
 use crate::{CodegenError, Result};
@@ -23,6 +24,16 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
     scope = scope.global_statement(GlobalStatement::Include(
         IncludeBuilder::new_system_with_str("stdbool.h").build(),
     ));
+
+    if ir.uses_rc {
+        scope = scope.new_line();
+        scope = scope.global_statement(GlobalStatement::Raw(crate::RC_RUNTIME.to_string()));
+    }
+
+    for gs in struct_globals(ir)? {
+        scope = scope.new_line();
+        scope = scope.global_statement(gs);
+    }
 
     for item in &ir.items {
         scope = scope.new_line();
@@ -225,13 +236,10 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
                 T::new_fn_call(T::new_ident(format!("dray_new_{name}")), args)
             }
             _ => {
-                let size = T::new_fn_call(
-                    T::new_ident("sizeof".to_string()),
-                    vec![T::new_ident(c_type_name(ty))],
-                );
+                // A scalar `@T` allocates directly with no drop function.
                 let raw = T::new_fn_call(
                     T::new_ident("dray_rc_alloc".to_string()),
-                    vec![size, T::Int(0)],
+                    vec![T::new_sizeof(lower_ty(ty)?), T::Int(0)],
                 );
                 T::new_cast(Type::ptr(lower_ty(ty)?), raw)
             }
@@ -258,30 +266,9 @@ fn lower_ty(t: &Ty) -> Result<Type> {
         Ty::Float { bits } => Type::base(if *bits == 32 { B::Float } else { B::Double }),
         // Both raw and RC pointers are a C `T*`; the RC bookkeeping is separate.
         Ty::Ptr(inner) | Ty::Rc(inner) => Type::ptr(lower_ty(inner)?),
-        Ty::Named(n) => Type::base(B::TypeDef(n.clone())),
+        Ty::Named(n) => Type::base(B::Struct(n.clone())),
         Ty::Infer => Type::base(B::Int32),
     })
-}
-
-fn c_type_name(t: &Ty) -> String {
-    match t {
-        Ty::Void => "void".into(),
-        Ty::Bool => "bool".into(),
-        Ty::Int { bits, signed } => {
-            let w = match bits {
-                IntWidth::W8 => "8",
-                IntWidth::W16 => "16",
-                IntWidth::W32 => "32",
-                IntWidth::W64 => "64",
-                IntWidth::Size => return "size_t".into(),
-            };
-            format!("{}{}_t", if *signed { "int" } else { "uint" }, w)
-        }
-        Ty::Float { bits } => if *bits == 32 { "float" } else { "double" }.into(),
-        Ty::Ptr(inner) | Ty::Rc(inner) => format!("{}*", c_type_name(inner)),
-        Ty::Named(n) => n.clone(),
-        Ty::Infer => "int32_t".into(),
-    }
 }
 
 fn int_base(bits: IntWidth, signed: bool) -> tamago::BaseType {
@@ -351,62 +338,120 @@ fn assign_op(op: AssignOp) -> tamago::AssignOp {
     }
 }
 
-pub(crate) fn structs_c(ir: &Ir) -> String {
-    if ir.structs.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("\n");
+/// Build the C globals for every struct, entirely with Tamago's typed builders:
+/// a forward declaration, the definition, drop glue (for structs with `@T`
+/// fields), and a constructor `dray_new_T`. Emitted ahead of the user's functions.
+pub(crate) fn struct_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
+    let mut out = Vec::new();
 
+    // Forward declarations first, so self- and mutual references resolve.
     for sd in &ir.structs {
-        out.push_str(&format!("typedef struct {n} {n};\n", n = sd.name));
+        out.push(GlobalStatement::Struct(
+            StructBuilder::new_with_str(&sd.name)
+                .forward_declaration()
+                .build(),
+        ));
     }
-    // Definitions
+    // Definitions.
     for sd in &ir.structs {
-        out.push_str(&format!("struct {} {{\n", sd.name));
+        let mut sb = StructBuilder::new_with_str(&sd.name);
         for f in &sd.fields {
-            out.push_str(&format!("    {} {};\n", c_type_name(&f.ty), f.name));
+            sb = sb.field(FieldBuilder::new_with_str(&f.name, lower_ty(&f.ty)?).build());
         }
-        out.push_str("};\n");
+        out.push(GlobalStatement::Struct(sb.define().build()));
     }
+    // Drop glue: release each owned `@T` field (what makes freeing recursive).
+    for sd in &ir.structs {
+        if has_rc_field(sd) {
+            out.push(GlobalStatement::Function(drop_fn(sd)?));
+        }
+    }
+    // Constructors.
+    for sd in &ir.structs {
+        out.push(GlobalStatement::Function(constructor_fn(sd)?));
+    }
+    Ok(out)
+}
 
-    for sd in &ir.structs {
-        if !has_rc_field(sd) {
-            continue;
+/// `void dray_drop_T(void *p) { T *self = (T *)p; dray_rc_release(self->f); ... }`
+fn drop_fn(sd: &dray_ir::StructDef) -> Result<tamago::Function> {
+    let self_ty = Type::ptr(Type::base(BaseType::Struct(sd.name.clone())));
+    let mut body = BlockBuilder::new();
+    body = body.statement(tamago::Statement::Variable(
+        VariableBuilder::new_with_str("self", self_ty.clone())
+            .value(tamago::Expr::new_cast(
+                self_ty.clone(),
+                tamago::Expr::new_ident_with_str("p"),
+            ))
+            .build(),
+    ));
+    for f in &sd.fields {
+        if matches!(f.ty, Ty::Rc(_)) {
+            body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
+                tamago::Expr::new_ident_with_str("dray_rc_release"),
+                vec![self_field("self", &f.name)],
+            )));
         }
-        out.push_str(&format!(
-            "void dray_drop_{n}(void *p) {{\n    {n} *self = ({n} *)p;\n",
-            n = sd.name
-        ));
-        for f in &sd.fields {
-            if matches!(f.ty, Ty::Rc(_)) {
-                out.push_str(&format!("    dray_rc_release(self->{});\n", f.name));
-            }
-        }
-        out.push_str("}\n");
     }
-    // Constructors
-    for sd in &ir.structs {
-        let params: Vec<String> = sd
-            .fields
-            .iter()
-            .map(|f| format!("{} {}", c_type_name(&f.ty), f.name))
-            .collect();
-        let drop = if has_rc_field(sd) {
-            format!("dray_drop_{}", sd.name)
-        } else {
-            "0".to_string()
-        };
-        out.push_str(&format!(
-            "{n} *dray_new_{n}({params}) {{\n    {n} *self = ({n} *)dray_rc_alloc(sizeof({n}), {drop});\n",
-            n = sd.name,
-            params = params.join(", ")
-        ));
-        for f in &sd.fields {
-            out.push_str(&format!("    self->{name} = {name};\n", name = f.name));
-        }
-        out.push_str("    return self;\n}\n");
+    Ok(FunctionBuilder::new_with_str(
+        &format!("dray_drop_{}", sd.name),
+        Type::base(BaseType::Void),
+    )
+    .param(ParameterBuilder::new_with_str("p", Type::ptr(Type::base(BaseType::Void))).build())
+    .body(body.build())
+    .build())
+}
+
+/// `T *dray_new_T(f0 t0, ...) { T *self = (T *)dray_rc_alloc(sizeof(T), drop);
+///  self->f0 = t0; ...; return self; }`
+fn constructor_fn(sd: &dray_ir::StructDef) -> Result<tamago::Function> {
+    let struct_ty = Type::base(BaseType::Struct(sd.name.clone()));
+    let self_ty = Type::ptr(struct_ty.clone());
+    let drop_arg = if has_rc_field(sd) {
+        tamago::Expr::new_ident(format!("dray_drop_{}", sd.name))
+    } else {
+        tamago::Expr::Int(0)
+    };
+    let alloc = tamago::Expr::new_cast(
+        self_ty.clone(),
+        tamago::Expr::new_fn_call(
+            tamago::Expr::new_ident_with_str("dray_rc_alloc"),
+            vec![tamago::Expr::new_sizeof(struct_ty), drop_arg],
+        ),
+    );
+    let mut body = BlockBuilder::new();
+    body = body.statement(tamago::Statement::Variable(
+        VariableBuilder::new_with_str("self", self_ty.clone())
+            .value(alloc)
+            .build(),
+    ));
+    for f in &sd.fields {
+        body = body.statement(tamago::Statement::Expr(tamago::Expr::new_assign(
+            self_field("self", &f.name),
+            tamago::AssignOp::Assign,
+            tamago::Expr::new_ident(f.name.clone()),
+        )));
     }
-    out
+    body = body.statement(tamago::Statement::Return(Some(
+        tamago::Expr::new_ident_with_str("self"),
+    )));
+
+    let mut fb = FunctionBuilder::new_with_str(&format!("dray_new_{}", sd.name), self_ty);
+    for f in &sd.fields {
+        fb = fb.param(ParameterBuilder::new_with_str(&f.name, lower_ty(&f.ty)?).build());
+    }
+    Ok(fb.body(body.build()).build())
+}
+
+/// `(*base).field` — field access through a struct pointer.
+fn self_field(base: &str, field: &str) -> tamago::Expr {
+    tamago::Expr::new_mem_access(
+        tamago::Expr::new_parenthesized(tamago::Expr::new_unary(
+            tamago::Expr::new_ident_with_str(base),
+            tamago::UnaryOp::Deref,
+        )),
+        field.to_string(),
+    )
 }
 
 fn has_rc_field(sd: &dray_ir::StructDef) -> bool {

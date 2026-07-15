@@ -112,6 +112,19 @@ pub enum SyntaxKind {
     StructDef,
     /// `identifier \":\" Type` — one field inside a `StructDef`.
     FieldDecl,
+    /// `[ \"pub\" ] identifier \"::\" \"enum\" \"{\" { EnumVariant } \"}\"` — an
+    /// algebraic enum declaration (the generic-parameter form is deferred).
+    EnumDef,
+    /// `identifier [ \"(\" TypeList \")\" ]` — one variant of an `EnumDef`.
+    EnumVariant,
+    /// `Type { \",\" Type }` — the payload type list of an `EnumVariant`.
+    TypeList,
+    /// `\"switch\" [ Expression ] \"{\" { CaseClause } \"}\"`.
+    SwitchStmt,
+    /// `\"case\" PatternList \":\" { Statement }`.
+    CaseClause,
+    /// `TypeName \".\" identifier [ \"(\" IdentifierList \")\" ]` — an enum pattern.
+    EnumPattern,
     /// `( ParamList )`
     ParamList,
     /// `[ "comptime" ] identifier ":" Type`

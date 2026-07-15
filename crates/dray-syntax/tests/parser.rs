@@ -700,3 +700,20 @@ fn node_first(node: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxNode> {
     }
     None
 }
+
+#[test]
+fn enum_and_switch_parse() {
+    let src = "Shape :: enum {\n    Circle(int32),\n    Rectangle(int32, int32),\n}\n\nmain :: proc() -> int32 {\n    c := Shape.Circle(4);\n    switch c {\n    case Shape.Circle(r):\n        return r;\n    case Shape.Rectangle(w, h):\n        return w + h;\n    }\n}\n";
+    let p = parse(src);
+    assert!(
+        p.errors.is_empty(),
+        "enum/switch should parse cleanly: {:?}",
+        p.errors
+    );
+    assert_eq!(p.root.text(), src, "lossless");
+    assert!(
+        p.root.child_of_kind(SyntaxKind::EnumDef).is_some(),
+        "should have an EnumDef\n{}",
+        debug_tree(&p.root)
+    );
+}

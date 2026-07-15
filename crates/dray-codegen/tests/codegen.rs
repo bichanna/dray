@@ -177,16 +177,16 @@ fn e2e_prime_count() {
 }
 
 #[test]
-fn struct_emits_typedef_constructor_and_drop() {
+fn struct_emits_definition_constructor_and_drop() {
     let out = c(
         "Node :: struct {\n    value: int32,\n    next: @Node,\n}\n\nmain :: proc() -> int32 {\n    n := alloc Node{ value: 1 };\n    return n.value;\n}\n",
     );
-    assert!(out.contains("typedef struct Node Node;"), "{out}");
+    assert!(out.contains("struct Node;"), "forward decl: {out}");
     assert!(out.contains("Node *dray_new_Node("), "constructor: {out}");
     // Node has an @Node field, so it needs drop glue that releases it.
     assert!(out.contains("void dray_drop_Node"), "drop glue: {out}");
     assert!(
-        out.contains("dray_rc_release(self->next)"),
+        out.contains("dray_rc_release((*self).next)"),
         "field release: {out}"
     );
 }

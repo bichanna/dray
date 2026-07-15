@@ -270,6 +270,8 @@ impl<'a> Parser<'a> {
             self.extern_proc_decl();
         } else if head_ok && after_head == TokenKind::KwStruct {
             self.struct_def();
+        } else if head_ok && after_head == TokenKind::KwEnum {
+            self.enum_def();
         } else {
             self.start(SyntaxKind::Error);
             self.error_at(
@@ -312,6 +314,44 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Ident, "a field name");
         self.expect(TokenKind::Colon, "':' before the field type");
         self.type_ref();
+        self.finish_node();
+    }
+
+    /// `[ "pub" ] identifier "::" "enum" "{" { EnumVariant [ "," ] } "}"`.
+    /// The generic-parameter form (`enum ( ... ) { ... }`) is deferred for now
+    fn enum_def(&mut self) {
+        self.start(SyntaxKind::EnumDef);
+        self.eat(TokenKind::KwPub);
+        self.expect(TokenKind::Ident, "the enum name");
+        self.expect(TokenKind::ColonColon, "'::'");
+        self.expect(TokenKind::KwEnum, "'enum'");
+        self.expect(TokenKind::LBrace, "'{' to open the enum body");
+        while !self.at(TokenKind::RBrace) && !self.at_eof() {
+            self.enum_variant();
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace, "'}' to close the enum body");
+        self.finish_node();
+    }
+
+    /// `identifier [ "(" Type { "," Type } ")" ]` — a variant, with an optional
+    /// tuple-style payload type list.
+    fn enum_variant(&mut self) {
+        self.start(SyntaxKind::EnumVariant);
+        self.expect(TokenKind::Ident, "a variant name");
+        if self.eat(TokenKind::LParen) {
+            self.start(SyntaxKind::TypeList);
+            while !self.at(TokenKind::RParen) && !self.at_eof() {
+                self.type_ref();
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.finish_node(); // TypeList
+            self.expect(TokenKind::RParen, "')' after the payload types");
+        }
         self.finish_node();
     }
 
@@ -486,6 +526,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwContinue => self.simple_kw_stmt(SyntaxKind::ContinueStmt),
             TokenKind::KwIf => self.if_stmt(),
             TokenKind::KwFor => self.for_stmt(),
+            TokenKind::KwSwitch => self.switch_stmt(),
             TokenKind::LBrace => self.block(),
             _ => self.simple_stmt(true),
         }
@@ -580,6 +621,66 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Semi, "';' after expression");
             }
             self.finish_node();
+        }
+    }
+
+    /// `"switch" [ Expression ] "{" { CaseClause } "}"`. The scrutinee is
+    /// optional (a bare `switch { }` matches on `true`, like Go).
+    fn switch_stmt(&mut self) {
+        self.start(SyntaxKind::SwitchStmt);
+        self.expect(TokenKind::KwSwitch, "'switch'");
+        if !self.at(TokenKind::LBrace) {
+            self.expr();
+        }
+        self.expect(TokenKind::LBrace, "'{' to open the switch body");
+        while self.at(TokenKind::KwCase) && !self.at_eof() {
+            self.case_clause();
+        }
+        self.expect(TokenKind::RBrace, "'}' to close the switch body");
+        self.finish_node();
+    }
+
+    /// `"case" PatternList ":" { Statement }`.
+    fn case_clause(&mut self) {
+        self.start(SyntaxKind::CaseClause);
+        self.expect(TokenKind::KwCase, "'case'");
+        self.pattern();
+        while self.eat(TokenKind::Comma) {
+            self.pattern();
+        }
+        self.expect(TokenKind::Colon, "':' after the case pattern");
+        // Statements until the next `case` or the closing `}`.
+        while !self.at(TokenKind::KwCase) && !self.at(TokenKind::RBrace) && !self.at_eof() {
+            self.statement();
+        }
+        self.finish_node();
+    }
+
+    /// `Pattern = EnumPattern | Expression`. An `EnumPattern` is
+    /// `TypeName "." identifier [ "(" IdentifierList ")" ]`; anything else is an
+    /// ordinary expression pattern (value match).
+    fn pattern(&mut self) {
+        // Lookahead for `Ident . Ident` — the enum-pattern shape.
+        if self.peek() == TokenKind::Ident
+            && self.peek_nth(1) == TokenKind::Dot
+            && self.peek_nth(2) == TokenKind::Ident
+        {
+            self.start(SyntaxKind::EnumPattern);
+            self.bump(); // type name
+            self.bump(); // '.'
+            self.bump(); // variant name
+            if self.eat(TokenKind::LParen) {
+                while self.at(TokenKind::Ident) {
+                    self.bump(); // binding identifier
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RParen, "')' after the pattern bindings");
+            }
+            self.finish_node();
+        } else {
+            self.expr();
         }
     }
 

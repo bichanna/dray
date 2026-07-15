@@ -35,7 +35,7 @@ pub type Result<T> = std::result::Result<T, CodegenError>;
 /// actually uses RC. The header sits immediately before each payload so a bare
 /// `@T` value is an ordinary `T*` from C's point of view. `calloc`
 /// zero-initializes the payload, giving `alloc T` its zero value.
-const RC_RUNTIME: &str = "\
+pub(crate) const RC_RUNTIME: &str = "\
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -75,9 +75,5 @@ int64_t dray_rc_live(void) { return dray_rc_live_count; }
 
 /// Lower a whole IR module to C source.
 pub fn ir_to_c(ir: &Ir) -> Result<String> {
-    let scope = lower_ir(ir)?;
-    let program = format!("{scope}");
-    let structs = lower::structs_c(ir);
-    let runtime = if ir.uses_rc { RC_RUNTIME } else { "" };
-    Ok(format!("{runtime}{structs}\n{program}"))
+    Ok(lower_ir(ir)?.to_string())
 }
