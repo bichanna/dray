@@ -7,9 +7,10 @@
 use dray_hir::{AssignOp, BinOp, DefId, DefKind, Expr, ExprKind, IntWidth, Ty, UnOp};
 use dray_ir::{ExternProc, Ir, Item, Proc, Stmt};
 use tamago::{
-    self, BaseType, Block, BlockBuilder, FieldBuilder, ForBuilder, ForInit, FunctionBuilder,
-    GlobalStatement, IfBuilder, IncludeBuilder, ParameterBuilder, Scope, ScopeBuilder,
-    StructBuilder, Type, VariableBuilder, WhileBuilder,
+    self, BaseType, Block, BlockBuilder, EnumBuilder, FieldBuilder, ForBuilder, ForInit,
+    FunctionBuilder, GlobalStatement, IfBuilder, IncludeBuilder, ParameterBuilder, Scope,
+    ScopeBuilder, StructBuilder, SwitchBuilder, Type, VariableBuilder, VariantBuilder,
+    WhileBuilder,
 };
 
 use crate::{CodegenError, Result};
@@ -31,6 +32,11 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
     }
 
     for gs in struct_globals(ir)? {
+        scope = scope.new_line();
+        scope = scope.global_statement(gs);
+    }
+
+    for gs in enum_globals(ir)? {
         scope = scope.new_line();
         scope = scope.global_statement(gs);
     }
@@ -131,7 +137,80 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
         // RC operations: plain calls into the emitted runtime.
         Stmt::Retain(name) => Statement::Expr(rc_call("dray_rc_retain", name)),
         Stmt::Release(name) | Stmt::Free(name) => Statement::Expr(rc_call("dray_rc_release", name)),
+        Stmt::Switch { scrutinee, arms } => lower_switch(ir, scrutinee, arms)?,
     })
+}
+
+fn lower_switch(
+    ir: &Ir,
+    scrutinee: &Expr,
+    arms: &[dray_ir::SwitchArm],
+) -> Result<tamago::Statement> {
+    use tamago::Expr as T;
+    use tamago::Statement;
+
+    let tag = T::new_mem_access(lower_expr(ir, scrutinee)?, "tag".to_string());
+    let mut sw = SwitchBuilder::new(tag);
+    for arm in arms {
+        let mut b = BlockBuilder::new();
+        match &arm.pattern {
+            dray_ir::Pattern::Enum {
+                enum_name,
+                variant,
+                bindings,
+            } => {
+                let payload = enum_payload(ir, enum_name, variant);
+                for (i, bind) in bindings.iter().enumerate() {
+                    let ty = payload.get(i).cloned().unwrap_or(Ty::Infer);
+                    let field =
+                        T::new_mem_access(lower_expr(ir, scrutinee)?, payload_field(variant, i));
+                    b = b.statement(tamago::Statement::Variable(
+                        VariableBuilder::new_with_str(bind, lower_ty(&ty)?)
+                            .value(field)
+                            .build(),
+                    ));
+                }
+                for st in &arm.body {
+                    b = b.statement(lower_stmt(ir, st)?);
+                }
+                b = b.statement(tamago::Statement::Break);
+                sw = sw.case(T::new_ident(tag_const(enum_name, variant)), b.build());
+            }
+            dray_ir::Pattern::Value(e) => {
+                for st in &arm.body {
+                    b = b.statement(lower_stmt(ir, st)?);
+                }
+                b = b.statement(tamago::Statement::Break);
+                sw = sw.case(lower_expr(ir, e)?, b.build());
+            }
+        }
+    }
+    Ok(Statement::Switch(sw.build()))
+}
+
+/// The payload types of `enum_name::variant`, looked up in the IR's enum table
+fn enum_payload(ir: &Ir, enum_name: &str, variant: &str) -> Vec<Ty> {
+    ir.enums
+        .iter()
+        .find(|e| e.name == enum_name)
+        .and_then(|e| e.variants.iter().find(|v| v.name == variant))
+        .map(|v| v.payload.clone())
+        .unwrap_or_default()
+}
+
+/// `Enum_Variant` — the C tag constant.
+fn tag_const(enum_name: &str, variant: &str) -> String {
+    format!("{enum_name}_{variant}")
+}
+
+/// `Variant_fN` — the flat payload field name for payload slot `n`.
+fn payload_field(variant: &str, i: usize) -> String {
+    format!("{variant}_f{i}")
+}
+
+/// `dray_new_Enum_Variant` — the per-variant constructor name.
+fn enum_ctor_name(enum_name: &str, variant: &str) -> String {
+    format!("dray_new_{enum_name}_{variant}")
 }
 
 fn rc_call(func: &str, arg: &str) -> tamago::Expr {
@@ -221,6 +300,17 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             T::new_arr_index(lower_expr(ir, base)?, lower_expr(ir, index)?)
         }
         ExprKind::Cast { ty, operand } => T::new_cast(lower_ty(ty)?, lower_expr(ir, operand)?),
+        ExprKind::EnumInit {
+            enum_name,
+            variant,
+            args,
+        } => {
+            let mut a = Vec::new();
+            for arg in args {
+                a.push(lower_expr(ir, arg)?);
+            }
+            T::new_fn_call(T::new_ident(enum_ctor_name(enum_name, variant)), a)
+        }
         ExprKind::Alloc { ty, fields } => match ty {
             Ty::Named(name) => {
                 let sd = ir.structs.iter().find(|s| &s.name == name);
@@ -456,4 +546,82 @@ fn self_field(base: &str, field: &str) -> tamago::Expr {
 
 fn has_rc_field(sd: &dray_ir::StructDef) -> bool {
     sd.fields.iter().any(|f| matches!(f.ty, Ty::Rc(_)))
+}
+
+/// Build the C globals for every enum with Tamago's typed builders: a tag `enum`,
+/// a wrapper `struct` (the tag plus a flat set of payload fields, one per payload
+/// slot of each variant), and a constructor `dray_new_Enum_Variant` per variant.
+///
+/// The layout is deliberately flat (payloads side-by-side, not overlapped in a
+/// union) — simple and correct; a union to reclaim the space is a later
+/// refinement. Only the active variant's fields are ever read, guarded by `tag`.
+pub(crate) fn enum_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
+    let mut out = Vec::new();
+    for ed in &ir.enums {
+        // Tag enum: `enum Name_Tag { Name_V0, Name_V1, ... };`
+        let mut eb = EnumBuilder::new_with_str(&format!("{}_Tag", ed.name));
+        for v in &ed.variants {
+            eb = eb.variant(VariantBuilder::new_with_str(&tag_const(&ed.name, &v.name)).build());
+        }
+        out.push(GlobalStatement::Enum(eb.build()));
+
+        // Wrapper struct: `struct Name { enum Name_Tag tag; <payload fields> };`
+        let mut sb = StructBuilder::new_with_str(&ed.name);
+        sb = sb.field(
+            FieldBuilder::new_with_str(
+                "tag",
+                Type::base(BaseType::Enum(format!("{}_Tag", ed.name))),
+            )
+            .build(),
+        );
+        for v in &ed.variants {
+            for (i, ty) in v.payload.iter().enumerate() {
+                sb = sb.field(
+                    FieldBuilder::new_with_str(&payload_field(&v.name, i), lower_ty(ty)?).build(),
+                );
+            }
+        }
+        out.push(GlobalStatement::Struct(sb.define().build()));
+
+        // Constructor per variant.
+        for v in &ed.variants {
+            out.push(GlobalStatement::Function(enum_ctor(ed, v)?));
+        }
+    }
+    Ok(out)
+}
+
+/// `Name dray_new_Name_V(t0 f0, ...) { Name self; self.tag = Name_V;
+///  self.V_f0 = f0; ...; return self; }`
+fn enum_ctor(ed: &dray_ir::EnumDef, v: &dray_ir::Variant) -> Result<tamago::Function> {
+    use tamago::Expr as T;
+    let struct_ty = Type::base(BaseType::Struct(ed.name.clone()));
+    let mut body = BlockBuilder::new();
+    // `Name self;`
+    body = body.statement(tamago::Statement::Variable(
+        VariableBuilder::new_with_str("self", struct_ty.clone()).build(),
+    ));
+    // `self.tag = Name_V;`
+    body = body.statement(tamago::Statement::Expr(T::new_assign(
+        T::new_mem_access(T::new_ident_with_str("self"), "tag".to_string()),
+        tamago::AssignOp::Assign,
+        T::new_ident(tag_const(&ed.name, &v.name)),
+    )));
+    // `self.V_fi = fi;`
+    for (i, _) in v.payload.iter().enumerate() {
+        body = body.statement(tamago::Statement::Expr(T::new_assign(
+            T::new_mem_access(T::new_ident_with_str("self"), payload_field(&v.name, i)),
+            tamago::AssignOp::Assign,
+            T::new_ident(format!("f{i}")),
+        )));
+    }
+    body = body.statement(tamago::Statement::Return(Some(T::new_ident_with_str(
+        "self",
+    ))));
+
+    let mut fb = FunctionBuilder::new_with_str(&enum_ctor_name(&ed.name, &v.name), struct_ty);
+    for (i, ty) in v.payload.iter().enumerate() {
+        fb = fb.param(ParameterBuilder::new_with_str(&format!("f{i}"), lower_ty(ty)?).build());
+    }
+    Ok(fb.body(body.build()).build())
 }

@@ -109,6 +109,32 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
             }
             out.push_str(&format!("{pad}}}\n"));
         }
+        Stmt::Switch { scrutinee, arms } => {
+            out.push_str(&format!("{pad}switch {} {{\n", expr_str(scrutinee)));
+            for arm in arms {
+                match &arm.pattern {
+                    dray_hir::Pattern::Enum {
+                        enum_name,
+                        variant,
+                        bindings,
+                    } => {
+                        let b = if bindings.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({})", bindings.join(", "))
+                        };
+                        out.push_str(&format!("{pad}  case {enum_name}.{variant}{b}:\n"));
+                    }
+                    dray_hir::Pattern::Value(e) => {
+                        out.push_str(&format!("{pad}  case {}:\n", expr_str(e)));
+                    }
+                }
+                for st in &arm.body {
+                    dump_stmt(st, depth + 2, out);
+                }
+            }
+            out.push_str(&format!("{pad}}}\n"));
+        }
         Stmt::CFor {
             init,
             cond,

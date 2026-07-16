@@ -44,6 +44,18 @@ fn dump_item(item: &Item, out: &mut String) {
                 dump_stmt(s, 1, out);
             }
         }
+        Item::Enum(ed) => {
+            let _ = writeln!(out, "enum {} [#{}] {{", ed.name, ed.def.0);
+            for v in &ed.variants {
+                let ps: Vec<String> = v.payload.iter().map(ty).collect();
+                if ps.is_empty() {
+                    let _ = writeln!(out, "  {}", v.name);
+                } else {
+                    let _ = writeln!(out, "  {}({})", v.name, ps.join(", "));
+                }
+            }
+            let _ = writeln!(out, "}}");
+        }
         Item::Struct(sd) => {
             let _ = writeln!(out, "struct {} [#{}] {{", sd.name, sd.def.0);
             for f in &sd.fields {
@@ -137,6 +149,31 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
                 dump_stmt(st, depth + 1, out);
             }
         }
+        Stmt::Switch { scrutinee, arms } => {
+            let _ = writeln!(out, "{pad}switch {}", expr(scrutinee));
+            for arm in arms {
+                match &arm.pattern {
+                    Pattern::Enum {
+                        enum_name,
+                        variant,
+                        bindings,
+                    } => {
+                        let b = if bindings.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({})", bindings.join(", "))
+                        };
+                        let _ = writeln!(out, "{pad}  case {enum_name}.{variant}{b}:");
+                    }
+                    Pattern::Value(e) => {
+                        let _ = writeln!(out, "{pad}  case {}:", expr(e));
+                    }
+                }
+                for st in &arm.body {
+                    dump_stmt(st, depth + 2, out);
+                }
+            }
+        }
     }
 }
 
@@ -160,6 +197,18 @@ pub fn expr(e: &Expr) -> String {
         ExprKind::Field { recv, member } => format!("{}.{member}", expr(recv)),
         ExprKind::Index { base, index } => format!("{}[{}]", expr(base), expr(index)),
         ExprKind::Cast { ty: t, operand } => format!("cast({}) {}", ty(t), expr(operand)),
+        ExprKind::EnumInit {
+            enum_name,
+            variant,
+            args,
+        } => {
+            if args.is_empty() {
+                format!("{enum_name}.{variant}")
+            } else {
+                let a: Vec<String> = args.iter().map(expr).collect();
+                format!("{enum_name}.{variant}({})", a.join(", "))
+            }
+        }
         ExprKind::Alloc { ty: t, fields } => {
             if fields.is_empty() {
                 format!("alloc {}", ty(t))

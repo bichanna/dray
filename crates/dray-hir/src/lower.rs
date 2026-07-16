@@ -45,6 +45,7 @@ struct Lowerer {
     items: Vec<Item>,
     errors: Vec<ResolveError>,
     structs: HashMap<String, Vec<Field>>,
+    enums: HashMap<String, Vec<Variant>>,
 }
 
 impl Lowerer {
@@ -55,6 +56,7 @@ impl Lowerer {
             items: Vec::new(),
             errors: Vec::new(),
             structs: HashMap::new(),
+            enums: HashMap::new(),
         }
     }
 
@@ -92,6 +94,14 @@ impl Lowerer {
                         self.structs.insert(name, fields);
                     }
                 }
+                SyntaxKind::EnumDef => {
+                    if let Some(name) = first_ident(decl) {
+                        let variants = self.enum_variants(decl);
+                        let id = self.add_def(name.clone(), DefKind::Enum, Ty::Named(name.clone()));
+                        self.bind_module(name.clone(), id);
+                        self.enums.insert(name, variants);
+                    }
+                }
                 _ => {}
             }
         }
@@ -107,6 +117,7 @@ impl Lowerer {
                 SyntaxKind::ProcDef => self.lower_proc(decl),
                 SyntaxKind::ExternProcDecl => self.lower_extern(decl),
                 SyntaxKind::StructDef => self.lower_struct(decl),
+                SyntaxKind::EnumDef => self.lower_enum(decl),
                 SyntaxKind::Error => {
                     self.err(
                         decl.span(),
@@ -269,6 +280,7 @@ impl Lowerer {
             }
             SyntaxKind::IfStmt => self.lower_if(node),
             SyntaxKind::ForStmt => self.lower_for(node),
+            SyntaxKind::SwitchStmt => self.lower_switch(node),
             SyntaxKind::Block => {
                 self.err(node.span(), "nested bare blocks are not lowered yet");
                 None
@@ -554,23 +566,29 @@ impl Lowerer {
     }
 
     fn lower_call(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
-        let callee = match self.first_expr(node) {
+        let callee_node = self.first_expr(node);
+
+        // `Enum.Variant(args)` enum construction, not an ordinary call.
+        if let Some(cn) = &callee_node {
+            if let Some((enum_name, variant)) = self.enum_variant_ref(cn) {
+                let args = self.call_args(node);
+                return (
+                    ExprKind::EnumInit {
+                        enum_name: enum_name.clone(),
+                        variant,
+                        args,
+                    },
+                    Ty::Named(enum_name),
+                );
+            }
+        }
+
+        let callee = match callee_node {
             Some(c) => self.lower_expr(&c),
             None => return (ExprKind::Unresolved("call".into()), Ty::Infer),
         };
-
-        let args = node
-            .child_of_kind(SyntaxKind::ArgList)
-            .map(|al| {
-                self.expr_children(&al)
-                    .iter()
-                    .map(|a| self.lower_expr(a))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
+        let args = self.call_args(node);
         let ty = callee.ty.clone();
-
         (
             ExprKind::Call {
                 callee: Box::new(callee),
@@ -580,7 +598,29 @@ impl Lowerer {
         )
     }
 
+    fn call_args(&mut self, node: &SyntaxNode) -> Vec<Expr> {
+        node.child_of_kind(SyntaxKind::ArgList)
+            .map(|al| {
+                self.expr_children(&al)
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
     fn lower_field(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
+        // `Enum.Variant` with no call is a unit-variant construction.
+        if let Some((enum_name, variant)) = self.enum_variant_ref(node) {
+            return (
+                ExprKind::EnumInit {
+                    enum_name: enum_name.clone(),
+                    variant,
+                    args: Vec::new(),
+                },
+                Ty::Named(enum_name),
+            );
+        }
         let recv = match self.first_expr(node) {
             Some(r) => self.lower_expr(&r),
             None => return (ExprKind::Unresolved("field".into()), Ty::Infer),
@@ -605,6 +645,24 @@ impl Lowerer {
             },
             ty,
         )
+    }
+
+    fn enum_variant_ref(&self, node: &SyntaxNode) -> Option<(String, String)> {
+        if node.kind() != SyntaxKind::FieldExpr {
+            return None;
+        }
+        let recv = self.first_expr(node)?;
+        if recv.kind() != SyntaxKind::NameExpr {
+            return None;
+        }
+        let enum_name = ident_text(&recv);
+        let variant = node.token_of_kind(SyntaxKind::Ident)?.text().to_string();
+        let variants = self.enums.get(&enum_name)?;
+        if variants.iter().any(|v| v.name == variant) {
+            Some((enum_name, variant))
+        } else {
+            None
+        }
     }
 
     fn lower_index(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
@@ -681,6 +739,119 @@ impl Lowerer {
         let fields = self.structs.get(&name).cloned().unwrap_or_default();
         self.items
             .push(Item::Struct(StructDef { def, name, fields }));
+    }
+
+    /// Resolve an `EnumDef` CST node's variants to `(name, payload types)`
+    fn enum_variants(&mut self, node: &SyntaxNode) -> Vec<Variant> {
+        let mut variants = Vec::new();
+        for v in node.children() {
+            if v.kind() != SyntaxKind::EnumVariant {
+                continue;
+            }
+            let name = ident_text(&v);
+            let payload = v
+                .child_of_kind(SyntaxKind::TypeList)
+                .map(|tl| {
+                    tl.children()
+                        .into_iter()
+                        .filter(|c| is_type(c.kind()))
+                        .filter_map(|t| lower_type(&t))
+                        .collect()
+                })
+                .unwrap_or_default();
+            variants.push(Variant { name, payload });
+        }
+        variants
+    }
+
+    fn lower_enum(&mut self, node: &SyntaxNode) {
+        let name = match first_ident(node) {
+            Some(n) => n,
+            None => return,
+        };
+        let def = self.resolve(&name).unwrap_or(DefId(0));
+        let variants = self.enums.get(&name).cloned().unwrap_or_default();
+        self.items.push(Item::Enum(EnumDef {
+            def,
+            name,
+            variants,
+        }));
+    }
+
+    /// `switch scrutinee { case Pat: … }` → `Stmt::Switch`.
+    fn lower_switch(&mut self, node: &SyntaxNode) -> Option<Stmt> {
+        let scrutinee = self.first_expr(node).map(|e| self.lower_expr(&e))?;
+        let mut arms = Vec::new();
+        for clause in node.children() {
+            if clause.kind() != SyntaxKind::CaseClause {
+                continue;
+            }
+            arms.push(self.lower_case(&clause, &scrutinee.ty));
+        }
+        Some(Stmt::Switch { scrutinee, arms })
+    }
+
+    fn lower_case(&mut self, clause: &SyntaxNode, scrut_ty: &Ty) -> Arm {
+        // A case has one pattern (multi-pattern lists are a later refinement).
+        let pattern = if let Some(pat) = clause.child_of_kind(SyntaxKind::EnumPattern) {
+            self.lower_enum_pattern(&pat)
+        } else if let Some(e) = self.first_expr(clause) {
+            Pattern::Value(self.lower_expr(&e))
+        } else {
+            Pattern::Value(Expr {
+                kind: ExprKind::Unresolved("pattern".into()),
+                ty: Ty::Infer,
+                span: clause.span(),
+            })
+        };
+
+        // Bind the enum pattern's payload identifiers as locals typed by the
+        // matched variant's payload, so the arm body can use them
+        self.push_scope();
+        if let Pattern::Enum {
+            enum_name,
+            variant,
+            bindings,
+        } = &pattern
+        {
+            let payload = self
+                .enums
+                .get(enum_name)
+                .and_then(|vs| vs.iter().find(|v| &v.name == variant))
+                .map(|v| v.payload.clone())
+                .unwrap_or_default();
+            for (i, b) in bindings.iter().enumerate() {
+                let ty = payload.get(i).cloned().unwrap_or(Ty::Infer);
+                let id = self.add_def(b.clone(), DefKind::Local, ty);
+                self.bind_local(b.clone(), id);
+            }
+        }
+        let _ = scrut_ty;
+        let body = self.lower_block(clause);
+        self.pop_scope();
+        Arm { pattern, body }
+    }
+
+    fn lower_enum_pattern(&mut self, pat: &SyntaxNode) -> Pattern {
+        let idents: Vec<String> = pat
+            .children_with_tokens()
+            .into_iter()
+            .filter_map(|e| match e {
+                SyntaxElement::Token(t) if t.kind() == SyntaxKind::Ident => {
+                    Some(t.text().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        // `Enum . Variant ( b0, b1, ... )` — first two idents are the type + variant.
+        let enum_name = idents.first().cloned().unwrap_or_default();
+        let variant = idents.get(1).cloned().unwrap_or_default();
+        let bindings = idents.iter().skip(2).cloned().collect();
+        Pattern::Enum {
+            enum_name,
+            variant,
+            bindings,
+        }
     }
 
     /// Lower `alloc T` or `alloc T{ field: value, ... }`. The composite form

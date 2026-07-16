@@ -42,6 +42,8 @@ pub enum DefKind {
     Local,
     /// A struct type. Used to resolve `Ty::Named` and to type field access.
     Struct,
+    /// An enum type. Used to resolve `Ty::Named` and enum construction/patterns.
+    Enum,
 }
 
 /// A top-level item.
@@ -51,6 +53,23 @@ pub enum Item {
     Proc(Proc),
     ExternProc(ExternProc),
     Struct(StructDef),
+    Enum(EnumDef),
+}
+
+/// An algebraic enum: an ordered list of variants, each with a (possibly empty)
+/// tuple payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDef {
+    pub def: DefId,
+    pub name: String,
+    pub variants: Vec<Variant>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Variant {
+    pub name: String,
+    /// The payload types, in order. Empty for a unit variant (`Nothing`).
+    pub payload: Vec<Ty>,
 }
 
 /// A struct type declaration: an ordered list of typed fields
@@ -134,6 +153,30 @@ pub enum Stmt {
     Loop {
         body: Vec<Stmt>,
     },
+    /// `switch scrutinee { case Pat: … }`.
+    Switch {
+        scrutinee: Expr,
+        arms: Vec<Arm>,
+    },
+}
+
+/// One `case` of a switch: a pattern and the statements to run on a match.
+#[derive(Debug, Clone)]
+pub struct Arm {
+    pub pattern: Pattern,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// `Enum.Variant(bindings)`
+    Enum {
+        enum_name: String,
+        variant: String,
+        bindings: Vec<String>,
+    },
+    /// A value pattern (e.g. `case 3:` or `case true:`).
+    Value(Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +230,11 @@ pub enum ExprKind {
     Alloc {
         ty: Ty,
         fields: Vec<(String, Expr)>,
+    },
+    EnumInit {
+        enum_name: String,
+        variant: String,
+        args: Vec<Expr>,
     },
     Paren(Box<Expr>),
 }

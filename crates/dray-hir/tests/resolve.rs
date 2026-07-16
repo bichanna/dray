@@ -231,3 +231,11 @@ fn unknown_field_is_an_error() {
     );
     assert!(errs.iter().any(|m| m.contains("no field")), "{errs:?}");
 }
+
+#[test]
+fn enum_and_switch_resolve() {
+    let errs = resolve_errors(
+        "Shape :: enum {\n    Circle(int32),\n    Unit,\n}\n\nf :: proc(s: Shape) -> int32 {\n    switch s {\n    case Shape.Circle(r):\n        return r;\n    case Shape.Unit:\n        return 0;\n    }\n}\n",
+    );
+    assert!(errs.is_empty(), "enum program should resolve: {errs:?}");
+}

@@ -1,42 +1,23 @@
-putchar :: extern "putchar" proc(c: int32) -> int32;
-
-Node :: struct {
-    value: int32,
-    next:  @Node,
+Shape :: enum {
+    Circle(int32),
+    Rectangle(int32, int32),
+    Unit,
 }
 
-prepend :: proc(head: @Node, value: int32) -> @Node {
-    n := alloc Node{ value: value, next: head };
-    return n;
-}
-
-sum_first_four :: proc(head: @Node) -> int32 {
-    total := 0;
-    n := head;
-    for i := 0; i < 4; i += 1 {
-        total += n.value;
-        n = n.next;
+measure :: proc(s: Shape) -> int32 {
+    switch s {
+    case Shape.Circle(r):
+        return r * r * 3;
+    case Shape.Rectangle(w, h):
+        return w * h;
+    case Shape.Unit:
+        return 0;
     }
-    return total;
-}
-
-print_int :: proc(n: int32) {
-    if n >= 10 { print_int(n / 10); }
-    putchar(48 + n % 10);
-}
-
-run :: proc() -> int32 {
-    seed := alloc Node{ value: 0 };
-    head := seed;
-    head = prepend(head, 10);
-    head = prepend(head, 10);
-    head = prepend(head, 10);
-    head = prepend(head, 10);
-    return sum_first_four(head);
 }
 
 main :: proc() -> int32 {
-    total := run();
-    print_int(total);
-    return 0;
+    return measure(Shape.Circle(4))         // 48
+         + measure(Shape.Rectangle(3, 5))   // 15
+         + measure(Shape.Unit);             // 0
+    // 63 in total
 }

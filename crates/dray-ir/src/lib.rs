@@ -4,7 +4,7 @@
 
 use dray_hir::{DefId, DefInfo, DefKind, Expr, ExprKind, Hir, Ty};
 
-pub use dray_hir::{AssignOp, BinOp, Field, StructDef, UnOp};
+pub use dray_hir::{Arm, AssignOp, BinOp, EnumDef, Field, Pattern, StructDef, UnOp, Variant};
 
 mod debug;
 pub use debug::dump_ir;
@@ -13,6 +13,8 @@ pub use debug::dump_ir;
 pub struct Ir {
     pub items: Vec<Item>,
     pub structs: Vec<StructDef>,
+    /// Enum type declarations, carried straight through from HIR.
+    pub enums: Vec<EnumDef>,
     /// The definition arena, carried over from HIR plus any temporaries this pass
     /// introduces (see [`Lowerer::fresh_temp`]).
     pub defs: Vec<DefInfo>,
@@ -89,12 +91,22 @@ pub enum Stmt {
     Loop {
         body: Vec<Stmt>,
     },
+    Switch {
+        scrutinee: Expr,
+        arms: Vec<SwitchArm>,
+    },
     /// strong += 1
     Retain(String),
     /// strong -= 1, free at zero
     Release(String),
     /// manual `free` (spec §4.6); emitted like a release for now
     Free(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct SwitchArm {
+    pub pattern: Pattern,
+    pub body: Vec<Stmt>,
 }
 
 pub fn lower(hir: &Hir) -> Ir {
@@ -112,9 +124,18 @@ pub fn lower(hir: &Hir) -> Ir {
             _ => None,
         })
         .collect();
+    let enums = hir
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            dray_hir::Item::Enum(ed) => Some(ed.clone()),
+            _ => None,
+        })
+        .collect();
     Ir {
         items,
         structs,
+        enums,
         defs: lw.defs,
         uses_rc: lw.uses_rc,
     }
@@ -135,6 +156,7 @@ impl Lowerer {
     fn item(&mut self, item: &dray_hir::Item) -> Option<Item> {
         match item {
             dray_hir::Item::Struct(_) => None, // collected into Ir.structs directly
+            dray_hir::Item::Enum(_) => None,   // collected into Ir.enums directly
             dray_hir::Item::Include(h) => Some(Item::Include(h.clone())),
             dray_hir::Item::ExternProc(e) => Some(Item::ExternProc(ExternProc {
                 name: e.name.clone(),
@@ -240,6 +262,19 @@ impl Lowerer {
                     cond: cond.clone(),
                     post,
                     body,
+                });
+            }
+            H::Switch { scrutinee, arms } => {
+                let arms = arms
+                    .iter()
+                    .map(|a| SwitchArm {
+                        pattern: a.pattern.clone(),
+                        body: self.block(&a.body, scopes),
+                    })
+                    .collect();
+                out.push(Stmt::Switch {
+                    scrutinee: scrutinee.clone(),
+                    arms,
                 });
             }
         }
