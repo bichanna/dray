@@ -251,6 +251,10 @@ pub fn ty(t: &Ty) -> String {
         Ty::Ptr(inner) => format!("*{}", ty(inner)),
         Ty::Rc(inner) => format!("@{}", ty(inner)),
         Ty::Named(n) => n.clone(),
+        Ty::App(n, args) => {
+            let a: Vec<String> = args.iter().map(ty).collect();
+            format!("{n}({})", a.join(", "))
+        }
         Ty::Infer => "?".into(),
     }
 }

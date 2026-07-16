@@ -93,7 +93,8 @@ fn source_to_hir(src: &str) -> Result<dray_hir::Hir, BuildError> {
 
 /// Parse → HIR → IR (the RC-annotated mid-level form). Used by `dump-ir`.
 pub fn source_to_ir(src: &str) -> Result<dray_ir::Ir, BuildError> {
-    Ok(dray_ir::lower(&source_to_hir(src)?))
+    let hir = dray_hir::monomorphize(source_to_hir(src)?);
+    Ok(dray_ir::lower(&hir))
 }
 
 /// The full front end: parse → HIR → IR → C source.

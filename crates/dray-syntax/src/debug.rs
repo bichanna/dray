@@ -372,6 +372,7 @@ pub fn kind_name(kind: SyntaxKind) -> &'static str {
         SyntaxKind::ArrayType => "ArrayType",
         SyntaxKind::NameType => "NameType",
         SyntaxKind::GenericType => "GenericType",
+        SyntaxKind::TypeArgList => "TypeArgList",
         SyntaxKind::LiteralExpr => "LiteralExpr",
         SyntaxKind::NameExpr => "NameExpr",
         SyntaxKind::ParenExpr => "ParenExpr",

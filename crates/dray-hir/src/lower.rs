@@ -737,8 +737,24 @@ impl Lowerer {
         };
         let def = self.resolve(&name).unwrap_or(DefId(0));
         let fields = self.structs.get(&name).cloned().unwrap_or_default();
-        self.items
-            .push(Item::Struct(StructDef { def, name, fields }));
+        let type_params = comptime_type_params(node);
+        for f in &fields {
+            if type_params.contains(&f.name) {
+                self.err(
+                    node.span(),
+                    format!(
+                        "field `{}` collides with the comptime type parameter of the same name",
+                        f.name
+                    ),
+                );
+            }
+        }
+        self.items.push(Item::Struct(StructDef {
+            def,
+            name,
+            type_params,
+            fields,
+        }));
     }
 
     /// Resolve an `EnumDef` CST node's variants to `(name, payload types)`
@@ -897,6 +913,7 @@ impl Lowerer {
         };
         let struct_name = match &ty {
             Ty::Named(n) => n.clone(),
+            Ty::App(n, _) => n.clone(),
             _ => {
                 self.err(lit.span(), "only structs can be built with `{ ... }`");
                 return (ExprKind::Unresolved("composite".into()), Ty::Infer);
@@ -1026,6 +1043,25 @@ fn is_expr(kind: SyntaxKind) -> bool {
 fn first_ident(node: &SyntaxNode) -> Option<String> {
     node.token_of_kind(SyntaxKind::Ident)
         .map(|t| t.text().to_string())
+}
+
+/// (`Box(comptime T: type)` → `["T"]`). Empty when there is no clause.
+fn comptime_type_params(node: &SyntaxNode) -> Vec<String> {
+    node.child_of_kind(SyntaxKind::ParamList)
+        .map(|pl| {
+            pl.children()
+                .into_iter()
+                .filter(|p| {
+                    p.kind() == SyntaxKind::Param
+                        && p.token_of_kind(SyntaxKind::KwComptime).is_some()
+                })
+                .filter_map(|p| {
+                    p.token_of_kind(SyntaxKind::Ident)
+                        .map(|t| t.text().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn struct_name_of(ty: &Ty) -> Option<String> {

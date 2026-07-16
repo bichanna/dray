@@ -5,9 +5,11 @@
 pub mod debug;
 pub mod hir;
 mod lower;
+pub mod mono;
 mod types;
 
 pub use debug::dump_hir;
 pub use dray_syntax::Span;
 pub use hir::*;
 pub use lower::{ResolveError, lower};
+pub use mono::monomorphize;

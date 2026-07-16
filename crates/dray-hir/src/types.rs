@@ -23,8 +23,24 @@ pub(crate) fn lower_type(node: &SyntaxNode) -> Option<Ty> {
             let inner = node.children().into_iter().find(|c| is_type(c.kind()))?;
             Some(Ty::Rc(Box::new(lower_type(&inner)?)))
         }
+        SyntaxKind::GenericType => {
+            let name = node
+                .token_of_kind(SyntaxKind::Ident)
+                .map(|t| t.text().to_string())?;
+            let args = node
+                .child_of_kind(SyntaxKind::TypeArgList)
+                .map(|al| {
+                    al.children()
+                        .into_iter()
+                        .filter(|c| is_type(c.kind()))
+                        .filter_map(|t| lower_type(&t))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(Ty::App(name, args))
+        }
         // Not modeled yet.
-        SyntaxKind::SliceType | SyntaxKind::ArrayType | SyntaxKind::GenericType => None,
+        SyntaxKind::SliceType | SyntaxKind::ArrayType => None,
         _ => None,
     }
 }

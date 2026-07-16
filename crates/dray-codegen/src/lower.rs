@@ -357,6 +357,11 @@ fn lower_ty(t: &Ty) -> Result<Type> {
         // Both raw and RC pointers are a C `T*`; the RC bookkeeping is separate.
         Ty::Ptr(inner) | Ty::Rc(inner) => Type::ptr(lower_ty(inner)?),
         Ty::Named(n) => Type::base(B::Struct(n.clone())),
+        Ty::App(name, _) => {
+            return Err(CodegenError::new(format!(
+                "internal: un-monomorphized generic `{name}` reached codegen"
+            )));
+        }
         Ty::Infer => Type::base(B::Int32),
     })
 }

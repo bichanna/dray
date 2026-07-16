@@ -1,23 +1,21 @@
-Shape :: enum {
-    Circle(int32),
-    Rectangle(int32, int32),
-    Unit,
+Box :: struct(comptime T: type) {
+    value: T,
 }
 
-measure :: proc(s: Shape) -> int32 {
-    switch s {
-    case Shape.Circle(r):
-        return r * r * 3;
-    case Shape.Rectangle(w, h):
-        return w * h;
-    case Shape.Unit:
-        return 0;
-    }
+Pair :: struct(comptime A: type, comptime B: type) {
+    first: A,
+    second: B,
 }
+
+Node :: struct { value: int32, next: @Node }
 
 main :: proc() -> int32 {
-    return measure(Shape.Circle(4))         // 48
-         + measure(Shape.Rectangle(3, 5))   // 15
-         + measure(Shape.Unit);             // 0
-    // 63 in total
+    b := alloc Box(int32){ value: 40 };                    // -> Box_int32
+    p := alloc Pair(int32, int32){ first: 1, second: 1 };  // -> Pair_int32_int32
+
+    if true {
+        boxed := alloc Box(@Node){ value: alloc Node{ value: 99 } };
+    }
+
+    return b.value + p.first + p.second;   // 40 + 1 + 1 = 42
 }

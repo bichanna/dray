@@ -77,6 +77,9 @@ pub struct Variant {
 pub struct StructDef {
     pub def: DefId,
     pub name: String,
+    /// Comptime type-parameter names (`["T"]` for `Box(comptime T: type)`).
+    /// Empty for a non-generic struct.
+    pub type_params: Vec<String>,
     pub fields: Vec<Field>,
 }
 
@@ -324,6 +327,7 @@ pub enum Ty {
     Ptr(Box<Ty>),
     Rc(Box<Ty>),
     Named(String),
+    App(String, Vec<Ty>),
     Infer,
 }
 

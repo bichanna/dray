@@ -297,6 +297,9 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Ident, "the struct name");
         self.expect(TokenKind::ColonColon, "'::'");
         self.expect(TokenKind::KwStruct, "'struct'");
+        if self.at(TokenKind::LParen) {
+            self.param_list();
+        }
         self.expect(TokenKind::LBrace, "'{' to open the struct body");
         while !self.at(TokenKind::RBrace) && !self.at_eof() {
             self.field_decl();
@@ -317,14 +320,17 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `[ "pub" ] identifier "::" "enum" "{" { EnumVariant [ "," ] } "}"`.
-    /// The generic-parameter form (`enum ( ... ) { ... }`) is deferred for now
+    /// `[ "pub" ] identifier "::" "enum" [ "(" ParamList ")" ] "{" { EnumVariant [ "," ] } "}"`.
     fn enum_def(&mut self) {
         self.start(SyntaxKind::EnumDef);
         self.eat(TokenKind::KwPub);
         self.expect(TokenKind::Ident, "the enum name");
         self.expect(TokenKind::ColonColon, "'::'");
         self.expect(TokenKind::KwEnum, "'enum'");
+        // Optional generic parameter clause: `enum(comptime T: type) { ... }`.
+        if self.at(TokenKind::LParen) {
+            self.param_list();
+        }
         self.expect(TokenKind::LBrace, "'{' to open the enum body");
         while !self.at(TokenKind::RBrace) && !self.at_eof() {
             self.enum_variant();
@@ -443,6 +449,20 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `"(" Type { "," Type } ")"`
+    fn type_arg_list(&mut self) {
+        self.start(SyntaxKind::TypeArgList);
+        self.expect(TokenKind::LParen, "'('");
+        while !self.at(TokenKind::RParen) && !self.at_eof() {
+            self.type_ref();
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "')' after the type arguments");
+        self.finish_node();
+    }
+
     /// `-> Type`
     fn ret_type(&mut self) {
         self.start(SyntaxKind::RetType);
@@ -490,7 +510,7 @@ impl<'a> Parser<'a> {
                 if self.peek_nth(1) == TokenKind::LParen {
                     self.start(SyntaxKind::GenericType);
                     self.bump(); // type name
-                    self.arg_list();
+                    self.type_arg_list();
                     self.finish_node();
                 } else {
                     self.start(SyntaxKind::NameType);

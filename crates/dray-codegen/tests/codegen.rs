@@ -13,7 +13,7 @@ fn c(src: &str) -> String {
     );
     let (hir, errs) = lower(&parsed.root);
     assert!(errs.is_empty(), "resolve errors: {errs:?}");
-    let ir = dray_ir::lower(&hir);
+    let ir = dray_ir::lower(&dray_hir::monomorphize(hir));
     ir_to_c(&ir).unwrap_or_else(|e| panic!("codegen failed: {e}"))
 }
 
@@ -286,4 +286,14 @@ main :: proc() -> int32 {\n\
             "reassigning an @T local must release the old value; got live={code}"
         );
     }
+}
+
+#[test]
+fn generic_struct_monomorphizes_to_concrete_c() {
+    let out = c("Box :: struct(comptime T: type) { value: T }\n\
+                 main :: proc() -> int32 { b := alloc Box(int32){ value: 42 }; return b.value; }\n");
+    // The concrete instantiation is emitted with a mangled name; the template is not.
+    assert!(out.contains("struct Box_int32"), "concrete struct: {out}");
+    assert!(out.contains("dray_new_Box_int32"), "concrete ctor: {out}");
+    assert!(!out.contains("struct Box "), "template leaked: {out}");
 }

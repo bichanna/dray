@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Monomorphization
+
+use std::collections::{HashMap, HashSet};
+
+use crate::hir::*;
+
+/// Rewrite `hir` so every generic instantiation is a concrete, mangled type.
+pub fn monomorphize(mut hir: Hir) -> Hir {
+    // Split the generic templates out from the code that is kept as-is.
+    let mut templates: HashMap<String, StructDef> = HashMap::new();
+    let mut kept: Vec<Item> = Vec::with_capacity(hir.items.len());
+    for item in hir.items {
+        match item {
+            Item::Struct(sd) if !sd.type_params.is_empty() => {
+                templates.insert(sd.name.clone(), sd);
+            }
+            other => kept.push(other),
+        }
+    }
+
+    let mut mono = Mono {
+        templates,
+        generated: HashMap::new(),
+        done: HashSet::new(),
+    };
+
+    let mut queue: Vec<(String, Vec<Ty>)> = Vec::new();
+    for item in &mut kept {
+        each_structural_ty(item, &mut |ty| collect_apps(ty, &mut queue));
+    }
+
+    while let Some((name, args)) = queue.pop() {
+        mono.instantiate(&name, &args, &mut queue);
+    }
+
+    for item in &mut kept {
+        each_structural_ty(item, &mut rewrite_ty);
+    }
+
+    let mut generated: Vec<StructDef> = mono.generated.into_values().collect();
+    generated.sort_by(|a, b| a.name.cmp(&b.name));
+    for mut sd in generated {
+        for field in &mut sd.fields {
+            rewrite_ty(&mut field.ty);
+        }
+        kept.push(Item::Struct(sd));
+    }
+
+    hir.items = kept;
+    hir
+}
+
+struct Mono {
+    templates: HashMap<String, StructDef>,
+    /// Mangled name → concrete struct.
+    generated: HashMap<String, StructDef>,
+    /// Mangled names already generated, to avoid repeating work.
+    done: HashSet<String>,
+}
+
+impl Mono {
+    fn instantiate(&mut self, name: &str, args: &[Ty], queue: &mut Vec<(String, Vec<Ty>)>) {
+        let mangled = mangle(name, args);
+        if self.done.contains(&mangled) {
+            return;
+        }
+        let template = match self.templates.get(name) {
+            Some(t) => t,
+            None => return,
+        };
+        self.done.insert(mangled.clone());
+
+        let subst: HashMap<&str, &Ty> = template
+            .type_params
+            .iter()
+            .map(String::as_str)
+            .zip(args)
+            .collect();
+        let fields: Vec<Field> = template
+            .fields
+            .iter()
+            .map(|f| Field {
+                name: f.name.clone(),
+                ty: subst_ty(&f.ty, &subst),
+            })
+            .collect();
+
+        // A nested generic field (`value: Box(int32)`) is itself an instantiation.
+        for f in &fields {
+            collect_apps(&f.ty, queue);
+        }
+
+        self.generated.insert(
+            mangled.clone(),
+            StructDef {
+                def: template.def,
+                name: mangled,
+                type_params: Vec::new(),
+                fields,
+            },
+        );
+    }
+}
+
+/// Substitute type parameters for their concrete arguments.
+fn subst_ty(ty: &Ty, subst: &HashMap<&str, &Ty>) -> Ty {
+    match ty {
+        Ty::Named(n) => match subst.get(n.as_str()) {
+            Some(concrete) => (*concrete).clone(),
+            None => ty.clone(),
+        },
+        Ty::Ptr(inner) => Ty::Ptr(Box::new(subst_ty(inner, subst))),
+        Ty::Rc(inner) => Ty::Rc(Box::new(subst_ty(inner, subst))),
+        Ty::App(n, args) => Ty::App(n.clone(), args.iter().map(|a| subst_ty(a, subst)).collect()),
+        _ => ty.clone(),
+    }
+}
+
+fn collect_apps(ty: &Ty, out: &mut Vec<(String, Vec<Ty>)>) {
+    match ty {
+        Ty::Ptr(inner) | Ty::Rc(inner) => collect_apps(inner, out),
+        Ty::App(name, args) => {
+            for a in args {
+                collect_apps(a, out);
+            }
+            out.push((name.clone(), args.clone()));
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite `Ty::App` in place to the `Ty::Named` of its mangled concrete type
+fn rewrite_ty(ty: &mut Ty) {
+    match ty {
+        Ty::Ptr(inner) | Ty::Rc(inner) => rewrite_ty(inner),
+        Ty::App(name, args) => {
+            for a in args.iter_mut() {
+                rewrite_ty(a);
+            }
+            *ty = Ty::Named(mangle(name, args));
+        }
+        _ => {}
+    }
+}
+
+/// `Box(int32)` → `"Box_int32"`, `Box(@Node)` → `"Box_rc_Node"`.
+fn mangle(name: &str, args: &[Ty]) -> String {
+    let mut out = name.to_string();
+    for a in args {
+        out.push('_');
+        out.push_str(&mangle_ty(a));
+    }
+    out
+}
+
+fn mangle_ty(ty: &Ty) -> String {
+    match ty {
+        Ty::Void => "void".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Int { bits, signed } => {
+            format!("{}{}", if *signed { "int" } else { "uint" }, width(bits))
+        }
+        Ty::Float { bits } => format!("float{bits}"),
+        Ty::Ptr(inner) => format!("ptr_{}", mangle_ty(inner)),
+        Ty::Rc(inner) => format!("rc_{}", mangle_ty(inner)),
+        Ty::Named(n) => n.clone(),
+        Ty::App(n, args) => mangle(n, args),
+        Ty::Infer => "infer".to_string(),
+    }
+}
+
+fn width(bits: &IntWidth) -> &'static str {
+    match bits {
+        IntWidth::W8 => "8",
+        IntWidth::W16 => "16",
+        IntWidth::W32 => "32",
+        IntWidth::W64 => "64",
+        IntWidth::Size => "size",
+    }
+}
+
+fn each_structural_ty(item: &mut Item, f: &mut impl FnMut(&mut Ty)) {
+    match item {
+        Item::Struct(sd) => {
+            for field in &mut sd.fields {
+                f(&mut field.ty);
+            }
+        }
+        Item::Enum(ed) => {
+            for v in &mut ed.variants {
+                for ty in &mut v.payload {
+                    f(ty);
+                }
+            }
+        }
+        Item::Proc(p) => {
+            for param in &mut p.params {
+                f(&mut param.ty);
+            }
+            f(&mut p.ret);
+            for st in &mut p.body {
+                each_ty_in_stmt(st, f);
+            }
+        }
+        Item::Include(_) | Item::ExternProc(_) => {}
+    }
+}
+
+fn each_ty_in_stmt(s: &mut Stmt, f: &mut impl FnMut(&mut Ty)) {
+    match s {
+        Stmt::Let { ty, init, .. } => {
+            f(ty);
+            each_ty_in_expr(init, f);
+        }
+        Stmt::Assign { target, value, .. } => {
+            each_ty_in_expr(target, f);
+            each_ty_in_expr(value, f);
+        }
+        Stmt::Return(Some(e)) | Stmt::Expr(e) => each_ty_in_expr(e, f),
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            each_ty_in_expr(cond, f);
+            each_ty_in_block(then_branch, f);
+            if let Some(eb) = else_branch {
+                each_ty_in_block(eb, f);
+            }
+        }
+        Stmt::While { cond, body } => {
+            each_ty_in_expr(cond, f);
+            each_ty_in_block(body, f);
+        }
+        Stmt::CFor {
+            init,
+            cond,
+            post,
+            body,
+        } => {
+            if let Some(i) = init {
+                each_ty_in_stmt(i, f);
+            }
+            if let Some(c) = cond {
+                each_ty_in_expr(c, f);
+            }
+            if let Some(p) = post {
+                each_ty_in_stmt(p, f);
+            }
+            each_ty_in_block(body, f);
+        }
+        Stmt::Loop { body } => each_ty_in_block(body, f),
+        Stmt::Switch { scrutinee, arms } => {
+            each_ty_in_expr(scrutinee, f);
+            for arm in arms {
+                each_ty_in_block(&mut arm.body, f);
+            }
+        }
+    }
+}
+
+fn each_ty_in_block(body: &mut [Stmt], f: &mut impl FnMut(&mut Ty)) {
+    for st in body {
+        each_ty_in_stmt(st, f);
+    }
+}
+
+fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
+    f(&mut e.ty);
+    match &mut e.kind {
+        ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => each_ty_in_expr(operand, f),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            each_ty_in_expr(lhs, f);
+            each_ty_in_expr(rhs, f);
+        }
+        ExprKind::Call { callee, args } => {
+            each_ty_in_expr(callee, f);
+            for a in args {
+                each_ty_in_expr(a, f);
+            }
+        }
+        ExprKind::Field { recv, .. } => each_ty_in_expr(recv, f),
+        ExprKind::Index { base, index } => {
+            each_ty_in_expr(base, f);
+            each_ty_in_expr(index, f);
+        }
+        ExprKind::Cast { ty, operand } => {
+            f(ty);
+            each_ty_in_expr(operand, f);
+        }
+        ExprKind::Alloc { ty, fields } => {
+            f(ty);
+            for (_, fe) in fields {
+                each_ty_in_expr(fe, f);
+            }
+        }
+        ExprKind::EnumInit { args, .. } => {
+            for a in args {
+                each_ty_in_expr(a, f);
+            }
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Name { .. }
+        | ExprKind::Unresolved(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lower;
+
+    fn mono_items(src: &str) -> Vec<String> {
+        let parsed = dray_syntax::parse(src);
+        let (hir, _errs) = lower(&parsed.root);
+        monomorphize(hir)
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Struct(sd) => Some(sd.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn instantiation_generates_concrete_struct_and_consumes_template() {
+        let names = mono_items(
+            "Box :: struct(comptime T: type) { value: T }\n\
+             main :: proc() -> int32 { b := alloc Box(int32){ value: 1 }; return b.value; }\n",
+        );
+        assert!(names.contains(&"Box_int32".to_string()), "{names:?}");
+        // The generic template itself is consumed, never emitted.
+        assert!(
+            !names.contains(&"Box".to_string()),
+            "template leaked: {names:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_instantiations_are_separate_types() {
+        let names = mono_items(
+            "Pair :: struct(comptime A: type, comptime B: type) { first: A, second: B }\n\
+             main :: proc() -> int32 {\n\
+                 p := alloc Pair(int32, bool){ first: 1, second: true };\n\
+                 q := alloc Pair(int32, int32){ first: 1, second: 2 };\n\
+                 return 0;\n\
+             }\n",
+        );
+        assert!(names.contains(&"Pair_int32_bool".to_string()), "{names:?}");
+        assert!(names.contains(&"Pair_int32_int32".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn rc_type_argument_is_mangled() {
+        let names = mono_items(
+            "Node :: struct { value: int32 }\n\
+             Box :: struct(comptime T: type) { value: T }\n\
+             main :: proc() -> int32 { b := alloc Box(@Node){ value: alloc Node{ value: 1 } }; return 0; }\n",
+        );
+        assert!(names.contains(&"Box_rc_Node".to_string()), "{names:?}");
+    }
+}

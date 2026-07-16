@@ -173,6 +173,8 @@ pub enum SyntaxKind {
     NameType,
     /// `TypeName ( ArgumentList )` — e.g. `Stack(int32)`, `Maybe(@Node)`.
     GenericType,
+    /// `"(" Type { "," Type } ")"` — type arguments of a generic instantiation.
+    TypeArgList,
 
     // expressions
     /// A literal expression wrapping one literal token.
