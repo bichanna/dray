@@ -13,7 +13,7 @@ fn c(src: &str) -> String {
     );
     let (hir, errs) = lower(&parsed.root);
     assert!(errs.is_empty(), "resolve errors: {errs:?}");
-    let ir = dray_ir::lower(&dray_hir::monomorphize(hir));
+    let ir = dray_ir::lower(&dray_hir::monomorphize(hir).expect("monomorphize"));
     ir_to_c(&ir).unwrap_or_else(|e| panic!("codegen failed: {e}"))
 }
 

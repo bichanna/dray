@@ -15,6 +15,8 @@ pub enum BuildError {
     Parse(Vec<String>),
     /// Name resolution / HIR lowering failed.
     Resolve(Vec<String>),
+    /// Monomorphization failed (e.g. an infinitely recursive generic type)
+    Monomorphize(String),
     /// Lowering the HIR to C failed.
     Codegen(String),
     /// An I/O error reading source or writing outputs.
@@ -28,6 +30,7 @@ impl std::fmt::Display for BuildError {
         match self {
             BuildError::Parse(errs) => render_list(f, "parse", errs),
             BuildError::Resolve(errs) => render_list(f, "name resolution", errs),
+            BuildError::Monomorphize(m) => write!(f, "monomorphization error: {m}"),
             BuildError::Codegen(m) => write!(f, "{m}"),
             BuildError::Io(e) => write!(f, "io error: {e}"),
             BuildError::CC(m) => write!(f, "C compiler error: {m}"),
@@ -93,7 +96,8 @@ fn source_to_hir(src: &str) -> Result<dray_hir::Hir, BuildError> {
 
 /// Parse → HIR → IR (the RC-annotated mid-level form). Used by `dump-ir`.
 pub fn source_to_ir(src: &str) -> Result<dray_ir::Ir, BuildError> {
-    let hir = dray_hir::monomorphize(source_to_hir(src)?);
+    let hir = dray_hir::monomorphize(source_to_hir(src)?)
+        .map_err(|e| BuildError::Monomorphize(e.to_string()))?;
     Ok(dray_ir::lower(&hir))
 }
 

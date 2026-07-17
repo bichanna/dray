@@ -3,11 +3,34 @@
 //! Monomorphization
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crate::hir::*;
 
-/// Rewrite `hir` so every generic instantiation is a concrete, mangled type.
-pub fn monomorphize(mut hir: Hir) -> Hir {
+const INSTANTIATION_DEPTH_LIMIT: usize = 128;
+
+/// Monomorphization failed. Currently only the depth-limit case, which almost
+/// always means an unintentionally infinite generic type
+#[derive(Debug, Clone)]
+pub struct MonoError {
+    pub message: String,
+}
+
+impl fmt::Display for MonoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn app_depth(ty: &Ty) -> usize {
+    match ty {
+        Ty::Ptr(inner) | Ty::Rc(inner) => app_depth(inner),
+        Ty::App(_, args) => 1 + args.iter().map(app_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+pub fn monomorphize(mut hir: Hir) -> Result<Hir, MonoError> {
     // Split the generic templates out from the code that is kept as-is.
     let mut templates: HashMap<String, StructDef> = HashMap::new();
     let mut kept: Vec<Item> = Vec::with_capacity(hir.items.len());
@@ -32,6 +55,14 @@ pub fn monomorphize(mut hir: Hir) -> Hir {
     }
 
     while let Some((name, args)) = queue.pop() {
+        if 1 + args.iter().map(app_depth).max().unwrap_or(0) > INSTANTIATION_DEPTH_LIMIT {
+            return Err(MonoError {
+                message: format!(
+                    "generic instantiation of `{name}` nests deeper than the limit of \
+                     {INSTANTIATION_DEPTH_LIMIT} (a generic type is likely infinitely recursive)"
+                ),
+            });
+        }
         mono.instantiate(&name, &args, &mut queue);
     }
 
@@ -49,7 +80,7 @@ pub fn monomorphize(mut hir: Hir) -> Hir {
     }
 
     hir.items = kept;
-    hir
+    Ok(hir)
 }
 
 struct Mono {
@@ -321,6 +352,7 @@ mod tests {
         let parsed = dray_syntax::parse(src);
         let (hir, _errs) = lower(&parsed.root);
         monomorphize(hir)
+            .expect("monomorphization should succeed")
             .items
             .iter()
             .filter_map(|it| match it {
@@ -366,5 +398,16 @@ mod tests {
              main :: proc() -> int32 { b := alloc Box(@Node){ value: alloc Node{ value: 1 } }; return 0; }\n",
         );
         assert!(names.contains(&"Box_rc_Node".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn infinitely_recursive_generic_is_rejected_not_hung() {
+        let parsed = dray_syntax::parse(
+            "Wrap :: struct(comptime T: type) { inner: @Wrap(Wrap(T)) }\n\
+             f :: proc(w: @Wrap(int32)) -> int32 { return 0; }\n\
+             main :: proc() -> int32 { return 0; }\n",
+        );
+        let (hir, _errs) = lower(&parsed.root);
+        assert!(monomorphize(hir).is_err());
     }
 }

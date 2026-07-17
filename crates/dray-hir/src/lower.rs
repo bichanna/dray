@@ -46,6 +46,9 @@ struct Lowerer {
     errors: Vec<ResolveError>,
     structs: HashMap<String, Vec<Field>>,
     enums: HashMap<String, Vec<Variant>>,
+    /// Every declared type's comptime-parameter count, so type references can be
+    /// checked for existence and correct arity (0 = a non-generic type).
+    type_arity: HashMap<String, usize>,
 }
 
 impl Lowerer {
@@ -57,6 +60,7 @@ impl Lowerer {
             errors: Vec::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            type_arity: HashMap::new(),
         }
     }
 
@@ -91,6 +95,8 @@ impl Lowerer {
                         let id =
                             self.add_def(name.clone(), DefKind::Struct, Ty::Named(name.clone()));
                         self.bind_module(name.clone(), id);
+                        self.type_arity
+                            .insert(name.clone(), comptime_type_params(decl).len());
                         self.structs.insert(name, fields);
                     }
                 }
@@ -99,6 +105,8 @@ impl Lowerer {
                         let variants = self.enum_variants(decl);
                         let id = self.add_def(name.clone(), DefKind::Enum, Ty::Named(name.clone()));
                         self.bind_module(name.clone(), id);
+                        self.type_arity
+                            .insert(name.clone(), comptime_type_params(decl).len());
                         self.enums.insert(name, variants);
                     }
                 }
@@ -172,6 +180,8 @@ impl Lowerer {
         };
         let def = self.resolve(&name).unwrap(); // registered in pass 1
         let ret = self.return_type(node);
+
+        self.validate_decl_types(node, &[]);
 
         self.push_scope();
         let params = self.lower_params(node);
@@ -730,6 +740,74 @@ impl Lowerer {
         fields
     }
 
+    /// Validate every type reference in a declaration's signature (and, for a
+    /// proc, its body) against the declared types and the type parameters in
+    /// scope.
+    fn validate_decl_types(&mut self, node: &SyntaxNode, type_params: &[String]) {
+        for (i, p) in type_params.iter().enumerate() {
+            if type_params[..i].contains(p) {
+                self.err(node.span(), format!("duplicate type parameter `{p}`"));
+            }
+        }
+        let mut type_nodes = Vec::new();
+        collect_type_nodes(node, &mut type_nodes);
+        for tn in type_nodes {
+            if let Some(ty) = lower_type(&tn) {
+                self.check_type(&ty, type_params, tn.span());
+            }
+        }
+    }
+
+    /// Report an error for any type reference that names an undeclared type uses
+    /// a generic type with the wrong number of arguments, or applies type
+    /// arguments to something that isn't generic.
+    fn check_type(&mut self, ty: &Ty, type_params: &[String], span: Span) {
+        match ty {
+            Ty::Named(n) => {
+                if type_params.iter().any(|p| p == n) {
+                    return;
+                }
+                match self.type_arity.get(n) {
+                    Some(0) => {}
+                    Some(arity) => self.err(
+                        span,
+                        format!("`{n}` is generic; write `{n}(...)` with {arity} type argument(s)"),
+                    ),
+                    None => self.err(span, format!("unknown type `{n}`")),
+                }
+            }
+            Ty::App(name, args) => {
+                if type_params.iter().any(|p| p == name) {
+                    self.err(
+                        span,
+                        format!("type parameter `{name}` cannot take type arguments"),
+                    );
+                } else {
+                    match self.type_arity.get(name) {
+                        Some(0) => self.err(
+                            span,
+                            format!("`{name}` is not generic and takes no type arguments"),
+                        ),
+                        Some(arity) if *arity != args.len() => self.err(
+                            span,
+                            format!(
+                                "`{name}` expects {arity} type argument(s), but {} were given",
+                                args.len()
+                            ),
+                        ),
+                        Some(_) => {}
+                        None => self.err(span, format!("unknown type `{name}`")),
+                    }
+                }
+                for a in args {
+                    self.check_type(a, type_params, span);
+                }
+            }
+            Ty::Ptr(inner) | Ty::Rc(inner) => self.check_type(inner, type_params, span),
+            Ty::Void | Ty::Bool | Ty::Int { .. } | Ty::Float { .. } | Ty::Infer => {}
+        }
+    }
+
     fn lower_struct(&mut self, node: &SyntaxNode) {
         let name = match first_ident(node) {
             Some(n) => n,
@@ -738,6 +816,7 @@ impl Lowerer {
         let def = self.resolve(&name).unwrap_or(DefId(0));
         let fields = self.structs.get(&name).cloned().unwrap_or_default();
         let type_params = comptime_type_params(node);
+        self.validate_decl_types(node, &type_params);
         for f in &fields {
             if type_params.contains(&f.name) {
                 self.err(
@@ -787,6 +866,7 @@ impl Lowerer {
         };
         let def = self.resolve(&name).unwrap_or(DefId(0));
         let variants = self.enums.get(&name).cloned().unwrap_or_default();
+        self.validate_decl_types(node, &comptime_type_params(node));
         self.items.push(Item::Enum(EnumDef {
             def,
             name,
@@ -1062,6 +1142,21 @@ fn comptime_type_params(node: &SyntaxNode) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn collect_type_nodes(node: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
+    for child in node.children() {
+        if child.kind() == SyntaxKind::Param
+            && child.token_of_kind(SyntaxKind::KwComptime).is_some()
+        {
+            continue;
+        }
+        if is_type(child.kind()) {
+            out.push(child);
+        } else {
+            collect_type_nodes(&child, out);
+        }
+    }
 }
 
 fn struct_name_of(ty: &Ty) -> Option<String> {
