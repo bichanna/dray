@@ -159,7 +159,8 @@ fn lower_switch(
                 variant,
                 bindings,
             } => {
-                let payload = enum_payload(ir, enum_name, variant);
+                let concrete = enum_type_name(&scrutinee.ty, enum_name);
+                let payload = enum_payload(ir, concrete, variant);
                 for (i, bind) in bindings.iter().enumerate() {
                     let ty = payload.get(i).cloned().unwrap_or(Ty::Infer);
                     let field =
@@ -174,7 +175,7 @@ fn lower_switch(
                     b = b.statement(lower_stmt(ir, st)?);
                 }
                 b = b.statement(tamago::Statement::Break);
-                sw = sw.case(T::new_ident(tag_const(enum_name, variant)), b.build());
+                sw = sw.case(T::new_ident(tag_const(concrete, variant)), b.build());
             }
             dray_ir::Pattern::Value(e) => {
                 for st in &arm.body {
@@ -186,6 +187,13 @@ fn lower_switch(
         }
     }
     Ok(Statement::Switch(sw.build()))
+}
+
+fn enum_type_name<'a>(ty: &'a Ty, template: &'a str) -> &'a str {
+    match ty {
+        Ty::Named(n) => n,
+        _ => template,
+    }
 }
 
 /// The payload types of `enum_name::variant`, looked up in the IR's enum table
@@ -309,7 +317,8 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             for arg in args {
                 a.push(lower_expr(ir, arg)?);
             }
-            T::new_fn_call(T::new_ident(enum_ctor_name(enum_name, variant)), a)
+            let concrete = enum_type_name(&e.ty, enum_name);
+            T::new_fn_call(T::new_ident(enum_ctor_name(concrete, variant)), a)
         }
         ExprKind::Alloc { ty, fields } => match ty {
             Ty::Named(name) => {

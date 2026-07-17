@@ -33,11 +33,15 @@ fn app_depth(ty: &Ty) -> usize {
 pub fn monomorphize(mut hir: Hir) -> Result<Hir, MonoError> {
     // Split the generic templates out from the code that is kept as-is.
     let mut templates: HashMap<String, StructDef> = HashMap::new();
+    let mut enum_templates: HashMap<String, EnumDef> = HashMap::new();
     let mut kept: Vec<Item> = Vec::with_capacity(hir.items.len());
     for item in hir.items {
         match item {
             Item::Struct(sd) if !sd.type_params.is_empty() => {
                 templates.insert(sd.name.clone(), sd);
+            }
+            Item::Enum(ed) if !ed.type_params.is_empty() => {
+                enum_templates.insert(ed.name.clone(), ed);
             }
             other => kept.push(other),
         }
@@ -45,7 +49,9 @@ pub fn monomorphize(mut hir: Hir) -> Result<Hir, MonoError> {
 
     let mut mono = Mono {
         templates,
+        enum_templates,
         generated: HashMap::new(),
+        generated_enums: HashMap::new(),
         done: HashSet::new(),
     };
 
@@ -79,14 +85,28 @@ pub fn monomorphize(mut hir: Hir) -> Result<Hir, MonoError> {
         kept.push(Item::Struct(sd));
     }
 
+    let mut generated_enums: Vec<EnumDef> = mono.generated_enums.into_values().collect();
+    generated_enums.sort_by(|a, b| a.name.cmp(&b.name));
+    for mut ed in generated_enums {
+        for v in &mut ed.variants {
+            for ty in &mut v.payload {
+                rewrite_ty(ty);
+            }
+        }
+        kept.push(Item::Enum(ed));
+    }
+
     hir.items = kept;
     Ok(hir)
 }
 
 struct Mono {
     templates: HashMap<String, StructDef>,
+    enum_templates: HashMap<String, EnumDef>,
     /// Mangled name → concrete struct.
     generated: HashMap<String, StructDef>,
+    /// Mangled name → concrete enum.
+    generated_enums: HashMap<String, EnumDef>,
     /// Mangled names already generated, to avoid repeating work.
     done: HashSet<String>,
 }
@@ -97,42 +117,68 @@ impl Mono {
         if self.done.contains(&mangled) {
             return;
         }
-        let template = match self.templates.get(name) {
-            Some(t) => t,
-            None => return,
-        };
-        self.done.insert(mangled.clone());
 
-        let subst: HashMap<&str, &Ty> = template
-            .type_params
-            .iter()
-            .map(String::as_str)
-            .zip(args)
-            .collect();
-        let fields: Vec<Field> = template
-            .fields
-            .iter()
-            .map(|f| Field {
-                name: f.name.clone(),
-                ty: subst_ty(&f.ty, &subst),
-            })
-            .collect();
+        if let Some(template) = self.templates.get(name) {
+            self.done.insert(mangled.clone());
+            let subst = param_map(&template.type_params, args);
+            let fields: Vec<Field> = template
+                .fields
+                .iter()
+                .map(|f| Field {
+                    name: f.name.clone(),
+                    ty: subst_ty(&f.ty, &subst),
+                })
+                .collect();
 
-        // A nested generic field (`value: Box(int32)`) is itself an instantiation.
-        for f in &fields {
-            collect_apps(&f.ty, queue);
+            for f in &fields {
+                collect_apps(&f.ty, queue);
+            }
+
+            self.generated.insert(
+                mangled.clone(),
+                StructDef {
+                    def: template.def,
+                    name: mangled,
+                    type_params: Vec::new(),
+                    fields,
+                },
+            );
+        } else if let Some(template) = self.enum_templates.get(name) {
+            self.done.insert(mangled.clone());
+            let subst = param_map(&template.type_params, args);
+            let variants: Vec<Variant> = template
+                .variants
+                .iter()
+                .map(|v| Variant {
+                    name: v.name.clone(),
+                    payload: v.payload.iter().map(|t| subst_ty(t, &subst)).collect(),
+                })
+                .collect();
+
+            // A nested generic payload (`Some(Box(int32))`) is an instantiation too.
+            for v in &variants {
+                for ty in &v.payload {
+                    collect_apps(ty, queue);
+                }
+            }
+
+            self.generated_enums.insert(
+                mangled.clone(),
+                EnumDef {
+                    def: template.def,
+                    name: mangled,
+                    type_params: Vec::new(),
+                    variants,
+                },
+            );
         }
-
-        self.generated.insert(
-            mangled.clone(),
-            StructDef {
-                def: template.def,
-                name: mangled,
-                type_params: Vec::new(),
-                fields,
-            },
-        );
+        // Otherwise: not a generic template (an ordinary named type, or a name
+        // caught by resolution). nothing to instantiate
     }
+}
+
+fn param_map<'a>(type_params: &'a [String], args: &'a [Ty]) -> HashMap<&'a str, &'a Ty> {
+    type_params.iter().map(String::as_str).zip(args).collect()
 }
 
 /// Substitute type parameters for their concrete arguments.
@@ -398,6 +444,38 @@ mod tests {
              main :: proc() -> int32 { b := alloc Box(@Node){ value: alloc Node{ value: 1 } }; return 0; }\n",
         );
         assert!(names.contains(&"Box_rc_Node".to_string()), "{names:?}");
+    }
+
+    fn mono_enum_names(src: &str) -> Vec<String> {
+        let parsed = dray_syntax::parse(src);
+        let (hir, _errs) = lower(&parsed.root);
+        monomorphize(hir)
+            .expect("monomorphization should succeed")
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Enum(ed) => Some(ed.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generic_enum_instantiations_are_concrete_and_distinct() {
+        let names = mono_enum_names(
+            "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+             main :: proc() -> int32 {\n\
+                 a := Maybe(int32).Some(1);\n\
+                 b := Maybe(bool).None;\n\
+                 return 0;\n\
+             }\n",
+        );
+        assert!(names.contains(&"Maybe_int32".to_string()), "{names:?}");
+        assert!(names.contains(&"Maybe_bool".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"Maybe".to_string()),
+            "template leaked: {names:?}"
+        );
     }
 
     #[test]

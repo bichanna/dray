@@ -62,6 +62,7 @@ pub enum Item {
 pub struct EnumDef {
     pub def: DefId,
     pub name: String,
+    pub type_params: Vec<String>,
     pub variants: Vec<Variant>,
 }
 

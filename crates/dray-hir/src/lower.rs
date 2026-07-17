@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use dray_syntax::{Span, SyntaxElement, SyntaxKind, SyntaxNode};
 
 use crate::hir::*;
-use crate::types::{is_type, lower_type};
+use crate::types::{is_type, lower_type, name_to_ty};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveError {
@@ -580,15 +580,16 @@ impl Lowerer {
 
         // `Enum.Variant(args)` enum construction, not an ordinary call.
         if let Some(cn) = &callee_node {
-            if let Some((enum_name, variant)) = self.enum_variant_ref(cn) {
+            if let Some((enum_name, variant, type_args)) = self.enum_variant_ref(cn) {
                 let args = self.call_args(node);
+                let ty = enum_instance_ty(&enum_name, type_args);
                 return (
                     ExprKind::EnumInit {
-                        enum_name: enum_name.clone(),
+                        enum_name,
                         variant,
                         args,
                     },
-                    Ty::Named(enum_name),
+                    ty,
                 );
             }
         }
@@ -621,14 +622,15 @@ impl Lowerer {
 
     fn lower_field(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         // `Enum.Variant` with no call is a unit-variant construction.
-        if let Some((enum_name, variant)) = self.enum_variant_ref(node) {
+        if let Some((enum_name, variant, type_args)) = self.enum_variant_ref(node) {
+            let ty = enum_instance_ty(&enum_name, type_args);
             return (
                 ExprKind::EnumInit {
-                    enum_name: enum_name.clone(),
+                    enum_name,
                     variant,
                     args: Vec::new(),
                 },
-                Ty::Named(enum_name),
+                ty,
             );
         }
         let recv = match self.first_expr(node) {
@@ -657,22 +659,47 @@ impl Lowerer {
         )
     }
 
-    fn enum_variant_ref(&self, node: &SyntaxNode) -> Option<(String, String)> {
+    fn enum_variant_ref(&self, node: &SyntaxNode) -> Option<(String, String, Vec<Ty>)> {
         if node.kind() != SyntaxKind::FieldExpr {
             return None;
         }
         let recv = self.first_expr(node)?;
-        if recv.kind() != SyntaxKind::NameExpr {
-            return None;
-        }
-        let enum_name = ident_text(&recv);
         let variant = node.token_of_kind(SyntaxKind::Ident)?.text().to_string();
+
+        let (enum_name, type_args) = match recv.kind() {
+            // `Shape.Circle` — a plain enum name.
+            SyntaxKind::NameExpr => (ident_text(&recv), Vec::new()),
+            // `Maybe(int32).Some` — a generic instantiation, which parses in
+            // expression position as a call of the enum name on its type arguments.
+            SyntaxKind::CallExpr => {
+                let inner = self.first_expr(&recv)?;
+                if inner.kind() != SyntaxKind::NameExpr {
+                    return None;
+                }
+                let args = self.type_args_from_call(&recv)?;
+                (ident_text(&inner), args)
+            }
+            _ => return None,
+        };
+
         let variants = self.enums.get(&enum_name)?;
         if variants.iter().any(|v| v.name == variant) {
-            Some((enum_name, variant))
+            Some((enum_name, variant, type_args))
         } else {
             None
         }
+    }
+
+    /// Read the type arguments of a generic instantiation written in expression
+    /// position (`Maybe(int32)` → `[int32]`). Each argument must be a type
+    /// expressible as an expression (a name or a nested instantiation). anything
+    /// else yields `None` so the caller falls back to treating it as a call.
+    fn type_args_from_call(&self, call: &SyntaxNode) -> Option<Vec<Ty>> {
+        let arg_list = call.child_of_kind(SyntaxKind::ArgList)?;
+        self.expr_children(&arg_list)
+            .iter()
+            .map(|a| expr_as_type(a))
+            .collect()
     }
 
     fn lower_index(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
@@ -866,10 +893,25 @@ impl Lowerer {
         };
         let def = self.resolve(&name).unwrap_or(DefId(0));
         let variants = self.enums.get(&name).cloned().unwrap_or_default();
-        self.validate_decl_types(node, &comptime_type_params(node));
+        let type_params = comptime_type_params(node);
+        self.validate_decl_types(node, &type_params);
+
+        // A variant must not share a name with a comptime type parameter.
+        for v in &variants {
+            if type_params.contains(&v.name) {
+                self.err(
+                    node.span(),
+                    format!(
+                        "variant `{}` collides with the comptime type parameter of the same name",
+                        v.name
+                    ),
+                );
+            }
+        }
         self.items.push(Item::Enum(EnumDef {
             def,
             name,
+            type_params,
             variants,
         }));
     }
@@ -1123,6 +1165,35 @@ fn is_expr(kind: SyntaxKind) -> bool {
 fn first_ident(node: &SyntaxNode) -> Option<String> {
     node.token_of_kind(SyntaxKind::Ident)
         .map(|t| t.text().to_string())
+}
+
+fn enum_instance_ty(enum_name: &str, type_args: Vec<Ty>) -> Ty {
+    if type_args.is_empty() {
+        Ty::Named(enum_name.to_string())
+    } else {
+        Ty::App(enum_name.to_string(), type_args)
+    }
+}
+
+fn expr_as_type(node: &SyntaxNode) -> Option<Ty> {
+    match node.kind() {
+        SyntaxKind::NameExpr => {
+            let name = node.token_of_kind(SyntaxKind::Ident)?.text().to_string();
+            Some(name_to_ty(&name))
+        }
+        SyntaxKind::CallExpr => {
+            let callee = node
+                .children()
+                .into_iter()
+                .find(|c| c.kind() == SyntaxKind::NameExpr)?;
+            let name = callee.token_of_kind(SyntaxKind::Ident)?.text().to_string();
+            let arg_list = node.child_of_kind(SyntaxKind::ArgList)?;
+            let args: Option<Vec<Ty>> = arg_list.children().iter().map(expr_as_type).collect();
+            Some(Ty::App(name, args?))
+        }
+        SyntaxKind::ParenExpr => expr_as_type(&node.children().into_iter().next()?),
+        _ => None,
+    }
 }
 
 /// (`Box(comptime T: type)` → `["T"]`). Empty when there is no clause.

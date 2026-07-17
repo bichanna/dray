@@ -57,7 +57,7 @@ pub(crate) fn is_type(kind: SyntaxKind) -> bool {
     )
 }
 
-fn name_to_ty(name: &str) -> Ty {
+pub(crate) fn name_to_ty(name: &str) -> Ty {
     match name {
         "void" => Ty::Void,
         "bool" => Ty::Bool,

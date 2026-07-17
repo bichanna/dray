@@ -1,21 +1,31 @@
-Box :: struct(comptime T: type) {
-    value: T,
+Maybe :: enum(comptime T: type) {
+    Some(T),
+    None,
 }
 
-Pair :: struct(comptime A: type, comptime B: type) {
-    first: A,
-    second: B,
+Result :: enum(comptime T: type, comptime E: type) {
+    Ok(T),
+    Err(E),
 }
 
-Node :: struct { value: int32, next: @Node }
+first_or :: proc(has: bool, fallback: int32) -> int32 {
+    m := Maybe(int32).None;
+    switch m {
+    case Maybe.Some(v):
+        return v;
+    case Maybe.None:
+        return fallback;
+    }
+}
 
 main :: proc() -> int32 {
-    b := alloc Box(int32){ value: 40 };                    // -> Box_int32
-    p := alloc Pair(int32, int32){ first: 1, second: 1 };  // -> Pair_int32_int32
-
-    if true {
-        boxed := alloc Box(@Node){ value: alloc Node{ value: 99 } };
+    r := Result(int32, bool).Ok(35);
+    total := 0;
+    switch r {
+    case Result.Ok(n):
+        total = n;
+    case Result.Err(e):
+        total = 0;
     }
-
-    return b.value + p.first + p.second;   // 40 + 1 + 1 = 42
+    return total + first_or(false, 7);   // 35 + 7 = 42
 }

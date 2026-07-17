@@ -297,3 +297,22 @@ fn generic_struct_monomorphizes_to_concrete_c() {
     assert!(out.contains("dray_new_Box_int32"), "concrete ctor: {out}");
     assert!(!out.contains("struct Box "), "template leaked: {out}");
 }
+
+#[test]
+fn generic_enum_monomorphizes_to_concrete_c() {
+    let out = c("Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                 main :: proc() -> int32 {\n\
+                     m := Maybe(int32).Some(42);\n\
+                     switch m { case Maybe.Some(v): return v; case Maybe.None: return 0; }\n\
+                 }\n");
+    assert!(out.contains("enum Maybe_int32_Tag"), "tag: {out}");
+    assert!(out.contains("dray_new_Maybe_int32_Some"), "ctor: {out}");
+    assert!(
+        out.contains("case Maybe_int32_Some"),
+        "switch uses concrete tag: {out}"
+    );
+    assert!(
+        !out.contains("dray_new_Maybe_Some"),
+        "template ctor leaked: {out}"
+    );
+}
