@@ -462,3 +462,32 @@ fn recursion_through_a_pointer_is_allowed() {
     );
     assert!(errs.is_empty(), "{errs:?}");
 }
+
+#[test]
+fn a_switch_must_cover_every_variant() {
+    let errs = resolve_errors(
+        "Maybe :: enum(comptime T: type) {\n    Some(T),\n    None,\n}\n\nmain :: proc() -> int32 {\n    m := Maybe(int32).None;\n    switch m {\n    case Maybe.Some(x):\n        return x;\n    }\n}\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("does not cover every variant") && m.contains("Maybe.None")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_switch_naming_every_variant_is_accepted() {
+    let errs = resolve_errors(
+        "E :: enum {\n    A,\n    B,\n    C,\n}\n\nmain :: proc() -> int32 {\n    e := E.A;\n    switch e {\n    case E.A:\n        return 1;\n    case E.B:\n        return 2;\n    case E.C:\n        return 3;\n    }\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn a_switch_reports_all_missing_variants() {
+    let errs = resolve_errors(
+        "E :: enum {\n    A,\n    B,\n    C,\n}\n\nmain :: proc() -> int32 {\n    e := E.A;\n    switch e {\n    case E.A:\n        return 1;\n    }\n}\n",
+    );
+    let msg = errs.join(" ");
+    assert!(msg.contains("E.B") && msg.contains("E.C"), "{errs:?}");
+}

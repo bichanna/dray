@@ -78,6 +78,7 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
         Stmt::Break => out.push_str(&format!("{pad}break\n")),
         Stmt::Continue => out.push_str(&format!("{pad}continue\n")),
         Stmt::Expr(e) => out.push_str(&format!("{pad}{}\n", expr_str(e))),
+        Stmt::DropValue { name, .. } => out.push_str(&format!("{pad}drop {name}\n")),
         Stmt::StaticAssert { cond, message } => out.push_str(&format!(
             "{pad}static_assert({}, {message:?})\n",
             expr_str(cond)

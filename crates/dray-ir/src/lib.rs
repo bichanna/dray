@@ -2,6 +2,8 @@
 
 //! `dray-ir` — the mid-level IR: the HIR with reference counting spelled out.
 
+use std::collections::HashMap;
+
 use dray_hir::{DefId, DefInfo, DefKind, Expr, ExprKind, Hir, Ty};
 
 pub use dray_hir::{Arm, AssignOp, BinOp, EnumDef, Field, Pattern, StructDef, UnOp, Variant};
@@ -73,6 +75,10 @@ pub enum Stmt {
     Break,
     Continue,
     Expr(Expr),
+    DropValue {
+        name: String,
+        ty: Ty,
+    },
     StaticAssert {
         cond: Expr,
         message: String,
@@ -114,11 +120,35 @@ pub struct SwitchArm {
 }
 
 pub fn lower(hir: &Hir) -> Ir {
+    let mut struct_fields: HashMap<String, Vec<Ty>> = HashMap::new();
+    let mut enum_payloads: HashMap<String, Vec<Ty>> = HashMap::new();
+
+    for item in &hir.items {
+        match item {
+            dray_hir::Item::Struct(sd) => {
+                struct_fields.insert(
+                    sd.name.clone(),
+                    sd.fields.iter().map(|f| f.ty.clone()).collect(),
+                );
+            }
+            dray_hir::Item::Enum(ed) => {
+                enum_payloads.insert(
+                    ed.name.clone(),
+                    ed.variants.iter().flat_map(|v| v.payload.clone()).collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+
     let mut lw = Lowerer {
         defs: hir.defs.clone(),
+        struct_fields,
+        enum_payloads,
         uses_rc: false,
         temp: 0,
     };
+
     let items = hir.items.iter().filter_map(|it| lw.item(it)).collect();
     let structs: Vec<StructDef> = hir
         .items
@@ -148,14 +178,20 @@ pub fn lower(hir: &Hir) -> Ir {
 
 struct Lowerer {
     defs: Vec<DefInfo>,
+    /// Field types by struct name, and payload types by enum name
+    struct_fields: HashMap<String, Vec<Ty>>,
+    enum_payloads: HashMap<String, Vec<Ty>>,
     uses_rc: bool,
     temp: u32,
 }
 
-/// The `@T` locals currently in scope, one `Vec` per open block (innermost last).
-/// This is the entire state the RC pass needs: to release at a block's end we pop
-/// its `Vec`; to release at a `return` we flatten the whole stack.
-type Scopes = Vec<Vec<String>>;
+#[derive(Debug, Clone)]
+struct Cleanup {
+    name: String,
+    by_value: Option<Ty>,
+}
+
+type Scopes = Vec<Vec<Cleanup>>;
 
 impl Lowerer {
     fn item(&mut self, item: &dray_hir::Item) -> Option<Item> {
@@ -177,11 +213,12 @@ impl Lowerer {
                 }
                 // If control falls off the end (no trailing return), release the
                 // proc's top-level @T locals here.
-                if !ends_in_return(&p.body) {
-                    if let Some(top) = scopes.last().cloned() {
-                        self.release(&top, &mut body);
-                    }
+                if !ends_in_return(&p.body)
+                    && let Some(top) = scopes.last().cloned()
+                {
+                    self.release(&top, &mut body);
                 }
+
                 Some(Item::Proc(Proc {
                     name: p.name.clone(),
                     params: p.params.iter().map(param).collect(),
@@ -209,9 +246,26 @@ impl Lowerer {
                     ty: ty.clone(),
                     init: init.clone(),
                 });
+
+                if !matches!(ty, Ty::Rc(_)) && self.holds_rc(ty) {
+                    // A by- value struct/enum that contains `@T` fields: those
+                    // references must be dropped when the value dies
+                    if let Some(scope) = scopes.last_mut() {
+                        scope.push(Cleanup {
+                            name: name.clone(),
+                            by_value: Some(ty.clone()),
+                        });
+                    }
+
+                    self.uses_rc = true;
+                }
+
                 if matches!(ty, Ty::Rc(_)) {
                     if let Some(scope) = scopes.last_mut() {
-                        scope.push(name.clone());
+                        scope.push(Cleanup {
+                            name: name.clone(),
+                            by_value: None,
+                        });
                     }
                     if is_rc_borrow(init) {
                         // rule 2: a borrowed @T (Name, Field, …) → retain the
@@ -314,9 +368,9 @@ impl Lowerer {
 
     fn lower_return(&mut self, expr: Option<&Expr>, scopes: &Scopes, out: &mut Vec<Stmt>) {
         let transferred = expr.and_then(|e| transferred_local(scopes, e));
-        let mut live: Vec<String> = scopes.iter().flatten().cloned().collect();
+        let mut live: Vec<Cleanup> = scopes.iter().flatten().cloned().collect();
         if let Some(t) = &transferred
-            && let Some(idx) = live.iter().rposition(|n| n == t)
+            && let Some(idx) = live.iter().rposition(|c| &c.name == t)
         {
             live.remove(idx);
         }
@@ -461,12 +515,41 @@ impl Lowerer {
         out.push(Stmt::Retain(name));
     }
 
-    /// Emit releases for `names` in reverse declaration order (LIFO — last one
-    /// bound is the first one freed).
-    fn release(&mut self, names: &[String], out: &mut Vec<Stmt>) {
-        for name in names.iter().rev() {
+    fn holds_rc(&self, ty: &Ty) -> bool {
+        let mut seen: Vec<&str> = Vec::new();
+        self.holds_rc_inner(ty, &mut seen)
+    }
+
+    fn holds_rc_inner<'a>(&'a self, ty: &'a Ty, seen: &mut Vec<&'a str>) -> bool {
+        let (Ty::Named(name) | Ty::App(name, _)) = ty else {
+            return false;
+        };
+        if seen.contains(&name.as_str()) {
+            return false;
+        }
+        seen.push(name);
+        let inner = self
+            .struct_fields
+            .get(name)
+            .or_else(|| self.enum_payloads.get(name));
+        match inner {
+            Some(types) => types
+                .iter()
+                .any(|t| matches!(t, Ty::Rc(_)) || self.holds_rc_inner(t, seen)),
+            None => false,
+        }
+    }
+
+    fn release(&mut self, locals: &[Cleanup], out: &mut Vec<Stmt>) {
+        for local in locals.iter().rev() {
             self.uses_rc = true;
-            out.push(Stmt::Release(name.clone()));
+            match &local.by_value {
+                Some(ty) => out.push(Stmt::DropValue {
+                    name: local.name.clone(),
+                    ty: ty.clone(),
+                }),
+                None => out.push(Stmt::Release(local.name.clone())),
+            }
         }
     }
 
@@ -508,7 +591,9 @@ fn is_rc_borrow(e: &Expr) -> bool {
 }
 
 fn is_live_rc_local(scopes: &Scopes, name: &str) -> bool {
-    scopes.iter().any(|scope| scope.iter().any(|n| n == name))
+    scopes
+        .iter()
+        .any(|scope| scope.iter().any(|c| c.name == name && c.by_value.is_none()))
 }
 
 fn transferred_local(scopes: &Scopes, e: &Expr) -> Option<String> {

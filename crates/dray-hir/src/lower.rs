@@ -1261,7 +1261,42 @@ impl Lowerer {
             })
             .collect();
         self.check_duplicates(cases.iter().map(String::as_str), "case", node.span());
+        self.check_exhaustive(&scrutinee.ty, &arms, node.span());
         Some(Stmt::Switch { scrutinee, arms })
+    }
+
+    /// Every variant of the scrutinee's enum must be matched. (no `default` for now)
+    fn check_exhaustive(&mut self, scrut_ty: &Ty, arms: &[Arm], span: Span) {
+        let (Ty::Named(enum_name) | Ty::App(enum_name, _)) = scrut_ty else {
+            return; // not an enum (or unresolved)
+        };
+
+        let Some(variants) = self.enums.get(enum_name).cloned() else {
+            return;
+        };
+
+        let missing: Vec<&str> = variants
+            .iter()
+            .map(|v| v.name.as_str())
+            .filter(|name| {
+                !arms.iter().any(|a| match &a.pattern {
+                    Pattern::Enum { variant, .. } => variant == name,
+                    _ => false,
+                })
+            })
+            .collect();
+
+        if !missing.is_empty() {
+            let list = missing
+                .iter()
+                .map(|v| format!("`{enum_name}.{v}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.err(
+                span,
+                format!("this `switch` does not cover every variant of `{enum_name}`: {list}"),
+            );
+        }
     }
 
     fn lower_case(&mut self, clause: &SyntaxNode, scrut_ty: &Ty) -> Arm {

@@ -153,7 +153,23 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
             }
             Statement::For(fb.body(lower_body(ir, body)?).build())
         }
-        // RC operations: plain calls into the emitted runtime.
+        Stmt::DropValue { name, ty } => {
+            let type_name = match ty {
+                Ty::Named(n) => n.clone(),
+                other => {
+                    return Err(CodegenError::new(format!(
+                        "internal: cannot drop a by-value {other:?}"
+                    )));
+                }
+            };
+            Statement::Expr(tamago::Expr::new_fn_call(
+                tamago::Expr::new_ident(format!("dray_drop_{type_name}")),
+                vec![tamago::Expr::new_unary(
+                    tamago::Expr::new_ident(name.clone()),
+                    tamago::UnaryOp::AddrOf,
+                )],
+            ))
+        }
         Stmt::Retain(name) => Statement::Expr(rc_call("dray_rc_retain", name)),
         Stmt::Release(name) | Stmt::Free(name) => Statement::Expr(rc_call("dray_rc_release", name)),
         Stmt::Switch { scrutinee, arms } => lower_switch(ir, scrutinee, arms)?,
@@ -521,12 +537,17 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
 
     // 3. Drop glue and constructors, with every type now fully defined.
     for sd in &ir.structs {
-        if has_rc_field(sd) {
-            out.push(GlobalStatement::Function(drop_fn(sd)?));
+        if has_rc_field(ir, sd) {
+            out.push(GlobalStatement::Function(drop_fn(ir, sd)?));
+        }
+    }
+    for ed in &ir.enums {
+        if enum_has_rc_payload(ir, ed) {
+            out.push(GlobalStatement::Function(enum_drop_fn(ir, ed)?));
         }
     }
     for sd in &ir.structs {
-        out.push(GlobalStatement::Function(constructor_fn(sd)?));
+        out.push(GlobalStatement::Function(constructor_fn(ir, sd)?));
     }
     for ed in &ir.enums {
         for v in &ed.variants {
@@ -603,7 +624,7 @@ fn topo_visit<'a>(
 }
 
 /// `void dray_drop_T(void *p) { T *self = (T *)p; dray_rc_release(self->f); ... }`
-fn drop_fn(sd: &dray_ir::StructDef) -> Result<tamago::Function> {
+fn drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
     let self_ty = Type::ptr(Type::base(BaseType::Struct(sd.name.clone())));
     let mut body = BlockBuilder::new();
     body = body.statement(tamago::Statement::Variable(
@@ -615,11 +636,23 @@ fn drop_fn(sd: &dray_ir::StructDef) -> Result<tamago::Function> {
             .build(),
     ));
     for f in &sd.fields {
-        if matches!(f.ty, Ty::Rc(_)) {
-            body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
-                tamago::Expr::new_ident_with_str("dray_rc_release"),
-                vec![self_field("self", &f.name)],
-            )));
+        match &f.ty {
+            Ty::Rc(_) => {
+                body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
+                    tamago::Expr::new_ident_with_str("dray_rc_release"),
+                    vec![self_field("self", &f.name)],
+                )));
+            }
+            Ty::Named(inner) if ty_holds_rc(ir, &f.ty) => {
+                body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
+                    tamago::Expr::new_ident(format!("dray_drop_{inner}")),
+                    vec![tamago::Expr::new_unary(
+                        self_field("self", &f.name),
+                        tamago::UnaryOp::AddrOf,
+                    )],
+                )));
+            }
+            _ => {}
         }
     }
     Ok(FunctionBuilder::new_with_str(
@@ -633,10 +666,10 @@ fn drop_fn(sd: &dray_ir::StructDef) -> Result<tamago::Function> {
 
 /// `T *dray_new_T(f0 t0, ...) { T *self = (T *)dray_rc_alloc(sizeof(T), drop);
 ///  self->f0 = t0; ...; return self; }`
-fn constructor_fn(sd: &dray_ir::StructDef) -> Result<tamago::Function> {
+fn constructor_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
     let struct_ty = Type::base(BaseType::Struct(sd.name.clone()));
     let self_ty = Type::ptr(struct_ty.clone());
-    let drop_arg = if has_rc_field(sd) {
+    let drop_arg = if has_rc_field(ir, sd) {
         tamago::Expr::new_ident(format!("dray_drop_{}", sd.name))
     } else {
         tamago::Expr::Int(0)
@@ -683,8 +716,36 @@ fn self_field(base: &str, field: &str) -> tamago::Expr {
     )
 }
 
-fn has_rc_field(sd: &dray_ir::StructDef) -> bool {
-    sd.fields.iter().any(|f| matches!(f.ty, Ty::Rc(_)))
+fn has_rc_field(ir: &Ir, sd: &dray_ir::StructDef) -> bool {
+    sd.fields.iter().any(|f| ty_holds_rc(ir, &f.ty))
+}
+
+fn ty_holds_rc(ir: &Ir, ty: &Ty) -> bool {
+    fn walk<'a>(ir: &'a Ir, ty: &'a Ty, seen: &mut Vec<&'a str>) -> bool {
+        match ty {
+            Ty::Rc(_) => true,
+            Ty::Named(name) => {
+                if seen.contains(&name.as_str()) {
+                    return false;
+                }
+                seen.push(name);
+                if let Some(sd) = ir.structs.iter().find(|s| &s.name == name) {
+                    return sd.fields.iter().any(|f| walk(ir, &f.ty, seen));
+                }
+                if let Some(ed) = ir.enums.iter().find(|e| &e.name == name) {
+                    return ed
+                        .variants
+                        .iter()
+                        .flat_map(|v| v.payload.iter())
+                        .any(|t| walk(ir, t, seen));
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    walk(ir, ty, &mut Vec::new())
 }
 
 /// Build the C globals for every enum with Tamago's typed builders: a tag `enum`,
@@ -716,6 +777,73 @@ fn enum_definition(ed: &dray_ir::EnumDef) -> Result<tamago::Struct> {
 
 /// `Name dray_new_Name_V(t0 f0, ...) { Name self; self.tag = Name_V;
 ///  self.V_f0 = f0; ...; return self; }`
+fn enum_has_rc_payload(ir: &Ir, ed: &dray_ir::EnumDef) -> bool {
+    ed.variants
+        .iter()
+        .any(|v| v.payload.iter().any(|t| ty_holds_rc(ir, t)))
+}
+
+/// `void dray_drop_E(void *p) { E *self = ...; switch (self->tag) { ... } }`
+fn enum_drop_fn(ir: &Ir, ed: &dray_ir::EnumDef) -> Result<tamago::Function> {
+    let self_ty = Type::ptr(Type::base(BaseType::Struct(ed.name.clone())));
+    let mut body = BlockBuilder::new();
+    body = body.statement(tamago::Statement::Variable(
+        VariableBuilder::new_with_str("self", self_ty.clone())
+            .value(tamago::Expr::new_cast(
+                self_ty,
+                tamago::Expr::new_ident_with_str("p"),
+            ))
+            .build(),
+    ));
+
+    let mut sw = SwitchBuilder::new(self_field("self", "tag"));
+    for v in &ed.variants {
+        let owning: Vec<(usize, &Ty)> = v
+            .payload
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| ty_holds_rc(ir, t))
+            .collect();
+        if owning.is_empty() {
+            continue;
+        }
+        let mut case = BlockBuilder::new();
+        for (i, ty) in owning {
+            let slot = self_field("self", &payload_field(&v.name, i));
+            case = case.statement(tamago::Statement::Expr(match ty {
+                Ty::Rc(_) => tamago::Expr::new_fn_call(
+                    tamago::Expr::new_ident_with_str("dray_rc_release"),
+                    vec![slot],
+                ),
+                // A by-value payload owns its own nested pointers.
+                Ty::Named(inner) => tamago::Expr::new_fn_call(
+                    tamago::Expr::new_ident(format!("dray_drop_{inner}")),
+                    vec![tamago::Expr::new_unary(slot, tamago::UnaryOp::AddrOf)],
+                ),
+                other => {
+                    return Err(CodegenError::new(format!(
+                        "internal: cannot drop payload of type {other:?}"
+                    )));
+                }
+            }));
+        }
+        case = case.statement(tamago::Statement::Break);
+        sw = sw.case(
+            tamago::Expr::new_ident(tag_const(&ed.name, &v.name)),
+            case.build(),
+        );
+    }
+    body = body.statement(tamago::Statement::Switch(sw.build()));
+
+    Ok(FunctionBuilder::new_with_str(
+        &format!("dray_drop_{}", ed.name),
+        Type::base(BaseType::Void),
+    )
+    .param(ParameterBuilder::new_with_str("p", Type::ptr(Type::base(BaseType::Void))).build())
+    .body(body.build())
+    .build())
+}
+
 fn enum_ctor(ed: &dray_ir::EnumDef, v: &dray_ir::Variant) -> Result<tamago::Function> {
     use tamago::Expr as T;
     let struct_ty = Type::base(BaseType::Struct(ed.name.clone()));

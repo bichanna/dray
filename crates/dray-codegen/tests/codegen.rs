@@ -492,3 +492,74 @@ fn e2e_rc_local_stored_in_an_enum_payload_is_retained() {
         assert_eq!(code, 1, "the referenced node must still be alive");
     }
 }
+
+#[test]
+fn e2e_by_value_struct_releases_its_rc_fields() {
+    // A by-value aggregate owns the `@T` it holds; when it dies, that reference
+    // must be given up or the object leaks.
+    let src = "Node :: struct { value: int32 }\n\
+               Holder :: struct { n: @Node }\n\
+               rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+               main :: proc() -> int32 {\n\
+                   if true {\n\
+                       a := alloc Node{ value: 7 };\n\
+                       h := Holder{ n: a };\n\
+                   }\n\
+                   return cast(int32) rc_live();\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 0, "by-value struct leaked its @Node");
+    }
+}
+
+#[test]
+fn e2e_by_value_enum_releases_its_payload() {
+    let src = "Node :: struct { value: int32 }\n\
+               Maybe :: enum(comptime T: type) { Some(T), None }\n\
+               rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+               main :: proc() -> int32 {\n\
+                   if true {\n\
+                       a := alloc Node{ value: 7 };\n\
+                       m := Maybe(@Node).Some(a);\n\
+                   }\n\
+                   return cast(int32) rc_live();\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 0, "by-value enum leaked its payload");
+    }
+}
+
+#[test]
+fn e2e_nested_by_value_aggregates_release_transitively() {
+    let src = "Node :: struct { value: int32 }\n\
+               Inner :: struct { n: @Node }\n\
+               Outer :: struct { inner: Inner }\n\
+               rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+               main :: proc() -> int32 {\n\
+                   if true {\n\
+                       a := alloc Node{ value: 7 };\n\
+                       o := alloc Outer{ inner: Inner{ n: a } };\n\
+                   }\n\
+                   return cast(int32) rc_live();\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 0, "nested by-value aggregate leaked");
+    }
+}
+
+#[test]
+fn enum_with_an_rc_payload_gets_drop_glue() {
+    let out = c("Node :: struct { value: int32 }\n\
+                 Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                 main :: proc() -> int32 {\n\
+                     a := alloc Node{ value: 1 };\n\
+                     m := Maybe(@Node).Some(a);\n\
+                     return 0;\n\
+                 }\n");
+    assert!(
+        out.contains("void dray_drop_Maybe_rc_Node"),
+        "enum drop glue: {out}"
+    );
+
+    assert!(out.contains("switch ((*self).tag)"), "tag switch: {out}");
+}
