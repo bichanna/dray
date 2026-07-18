@@ -46,6 +46,7 @@ struct Lowerer {
     errors: Vec<ResolveError>,
     structs: HashMap<String, Vec<Field>>,
     enums: HashMap<String, Vec<Variant>>,
+    enum_type_params: HashMap<String, Vec<String>>,
     /// Every declared type's comptime-parameter count, so type references can be
     /// checked for existence and correct arity (0 = a non-generic type).
     type_arity: HashMap<String, usize>,
@@ -60,6 +61,7 @@ impl Lowerer {
             errors: Vec::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            enum_type_params: HashMap::new(),
             type_arity: HashMap::new(),
         }
     }
@@ -105,8 +107,9 @@ impl Lowerer {
                         let variants = self.enum_variants(decl);
                         let id = self.add_def(name.clone(), DefKind::Enum, Ty::Named(name.clone()));
                         self.bind_module(name.clone(), id);
-                        self.type_arity
-                            .insert(name.clone(), comptime_type_params(decl).len());
+                        let tps = comptime_type_params(decl);
+                        self.type_arity.insert(name.clone(), tps.len());
+                        self.enum_type_params.insert(name.clone(), tps);
                         self.enums.insert(name, variants);
                     }
                 }
@@ -696,10 +699,7 @@ impl Lowerer {
     /// else yields `None` so the caller falls back to treating it as a call.
     fn type_args_from_call(&self, call: &SyntaxNode) -> Option<Vec<Ty>> {
         let arg_list = call.child_of_kind(SyntaxKind::ArgList)?;
-        self.expr_children(&arg_list)
-            .iter()
-            .map(|a| expr_as_type(a))
-            .collect()
+        arg_list.children().iter().map(expr_as_type).collect()
     }
 
     fn lower_index(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
@@ -952,22 +952,43 @@ impl Lowerer {
             bindings,
         } = &pattern
         {
-            let payload = self
-                .enums
-                .get(enum_name)
-                .and_then(|vs| vs.iter().find(|v| &v.name == variant))
-                .map(|v| v.payload.clone())
-                .unwrap_or_default();
+            let payload = self.concrete_variant_payload(enum_name, variant, scrut_ty);
             for (i, b) in bindings.iter().enumerate() {
                 let ty = payload.get(i).cloned().unwrap_or(Ty::Infer);
                 let id = self.add_def(b.clone(), DefKind::Local, ty);
                 self.bind_local(b.clone(), id);
             }
         }
-        let _ = scrut_ty;
         let body = self.lower_block(clause);
         self.pop_scope();
         Arm { pattern, body }
+    }
+
+    /// The payload types of `enum_name::variant`, with the enum's type parameters
+    /// substituted by the scrutinee's actual type arguments when it is a generic
+    /// instantiation (`Maybe(@Node)` → `Some`'s `T` becomes `@Node`). This is what
+    /// gives a matched binding its concrete type, so field access through it
+    /// auto-dereferences correctly :)
+    fn concrete_variant_payload(&self, enum_name: &str, variant: &str, scrut_ty: &Ty) -> Vec<Ty> {
+        let payload = self
+            .enums
+            .get(enum_name)
+            .and_then(|vs| vs.iter().find(|v| v.name == variant))
+            .map(|v| v.payload.clone())
+            .unwrap_or_default();
+
+        let type_args = match scrut_ty {
+            Ty::App(_, args) => args.as_slice(),
+            _ => return payload,
+        };
+        let params = match self.enum_type_params.get(enum_name) {
+            Some(p) => p,
+            None => return payload,
+        };
+        payload
+            .iter()
+            .map(|ty| subst_type_params(ty, params, type_args))
+            .collect()
     }
 
     fn lower_enum_pattern(&mut self, pat: &SyntaxNode) -> Pattern {
@@ -1167,6 +1188,24 @@ fn first_ident(node: &SyntaxNode) -> Option<String> {
         .map(|t| t.text().to_string())
 }
 
+fn subst_type_params(ty: &Ty, params: &[String], args: &[Ty]) -> Ty {
+    match ty {
+        Ty::Named(n) => match params.iter().position(|p| p == n) {
+            Some(i) => args.get(i).cloned().unwrap_or_else(|| ty.clone()),
+            None => ty.clone(),
+        },
+        Ty::Ptr(inner) => Ty::Ptr(Box::new(subst_type_params(inner, params, args))),
+        Ty::Rc(inner) => Ty::Rc(Box::new(subst_type_params(inner, params, args))),
+        Ty::App(n, a) => Ty::App(
+            n.clone(),
+            a.iter()
+                .map(|t| subst_type_params(t, params, args))
+                .collect(),
+        ),
+        _ => ty.clone(),
+    }
+}
+
 fn enum_instance_ty(enum_name: &str, type_args: Vec<Ty>) -> Ty {
     if type_args.is_empty() {
         Ty::Named(enum_name.to_string())
@@ -1176,6 +1215,11 @@ fn enum_instance_ty(enum_name: &str, type_args: Vec<Ty>) -> Ty {
 }
 
 fn expr_as_type(node: &SyntaxNode) -> Option<Ty> {
+    // An argument that was parsed directly as a type (`@Node`, `[]T`) — the arg
+    // list parses type-only-prefixed arguments as types (see `arg_list`).
+    if is_type(node.kind()) {
+        return lower_type(node);
+    }
     match node.kind() {
         SyntaxKind::NameExpr => {
             let name = node.token_of_kind(SyntaxKind::Ident)?.text().to_string();

@@ -914,7 +914,11 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::ArgList);
         self.expect(TokenKind::LParen, "'('");
         while !self.at(TokenKind::RParen) && !self.at_eof() {
-            self.expr();
+            if self.at(TokenKind::At) || self.at(TokenKind::LBracket) {
+                self.type_ref();
+            } else {
+                self.expr();
+            }
             if !self.eat(TokenKind::Comma) {
                 break;
             }

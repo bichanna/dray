@@ -4,6 +4,8 @@
 //! and types are still HIR's (reused unchanged), so only statements gain the RC
 //! operations and `alloc`.
 
+use std::collections::{HashMap, HashSet};
+
 use dray_hir::{AssignOp, BinOp, DefId, DefKind, Expr, ExprKind, IntWidth, Ty, UnOp};
 use dray_ir::{ExternProc, Ir, Item, Proc, Stmt};
 use tamago::{
@@ -31,12 +33,7 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
         scope = scope.global_statement(GlobalStatement::Raw(crate::RC_RUNTIME.to_string()));
     }
 
-    for gs in struct_globals(ir)? {
-        scope = scope.new_line();
-        scope = scope.global_statement(gs);
-    }
-
-    for gs in enum_globals(ir)? {
+    for gs in aggregate_globals(ir)? {
         scope = scope.new_line();
         scope = scope.global_statement(gs);
     }
@@ -445,10 +442,9 @@ fn assign_op(op: AssignOp) -> tamago::AssignOp {
 /// Build the C globals for every struct, entirely with Tamago's typed builders:
 /// a forward declaration, the definition, drop glue (for structs with `@T`
 /// fields), and a constructor `dray_new_T`. Emitted ahead of the user's functions.
-pub(crate) fn struct_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
+pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
     let mut out = Vec::new();
 
-    // Forward declarations first, so self- and mutual references resolve.
     for sd in &ir.structs {
         out.push(GlobalStatement::Struct(
             StructBuilder::new_with_str(&sd.name)
@@ -456,25 +452,115 @@ pub(crate) fn struct_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
                 .build(),
         ));
     }
-    // Definitions.
-    for sd in &ir.structs {
-        let mut sb = StructBuilder::new_with_str(&sd.name);
-        for f in &sd.fields {
-            sb = sb.field(FieldBuilder::new_with_str(&f.name, lower_ty(&f.ty)?).build());
+    for ed in &ir.enums {
+        let mut eb = EnumBuilder::new_with_str(&format!("{}_Tag", ed.name));
+        for v in &ed.variants {
+            eb = eb.variant(VariantBuilder::new_with_str(&tag_const(&ed.name, &v.name)).build());
         }
-        out.push(GlobalStatement::Struct(sb.define().build()));
+        out.push(GlobalStatement::Enum(eb.build()));
+        out.push(GlobalStatement::Struct(
+            StructBuilder::new_with_str(&ed.name)
+                .forward_declaration()
+                .build(),
+        ));
     }
-    // Drop glue: release each owned `@T` field (what makes freeing recursive).
+
+    // 2. Definitions in dependency order: a type embedded *by value* must be fully
+    //    defined before the type embedding it (a forward declaration only suffices
+    //    for a pointer field).
+    let structs: HashMap<&str, &dray_ir::StructDef> =
+        ir.structs.iter().map(|s| (s.name.as_str(), s)).collect();
+    let enums: HashMap<&str, &dray_ir::EnumDef> =
+        ir.enums.iter().map(|e| (e.name.as_str(), e)).collect();
+    for name in aggregate_definition_order(ir) {
+        if let Some(sd) = structs.get(name.as_str()) {
+            out.push(GlobalStatement::Struct(struct_definition(sd)?));
+        } else if let Some(ed) = enums.get(name.as_str()) {
+            out.push(GlobalStatement::Struct(enum_definition(ed)?));
+        }
+    }
+
+    // 3. Drop glue and constructors, with every type now fully defined.
     for sd in &ir.structs {
         if has_rc_field(sd) {
             out.push(GlobalStatement::Function(drop_fn(sd)?));
         }
     }
-    // Constructors.
     for sd in &ir.structs {
         out.push(GlobalStatement::Function(constructor_fn(sd)?));
     }
+    for ed in &ir.enums {
+        for v in &ed.variants {
+            out.push(GlobalStatement::Function(enum_ctor(ed, v)?));
+        }
+    }
     Ok(out)
+}
+
+/// `struct Name { fields };`
+fn struct_definition(sd: &dray_ir::StructDef) -> Result<tamago::Struct> {
+    let mut sb = StructBuilder::new_with_str(&sd.name);
+    for f in &sd.fields {
+        sb = sb.field(FieldBuilder::new_with_str(&f.name, lower_ty(&f.ty)?).build());
+    }
+    Ok(sb.define().build())
+}
+
+fn aggregate_definition_order(ir: &Ir) -> Vec<String> {
+    let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut names: Vec<&str> = Vec::new();
+    for sd in &ir.structs {
+        names.push(&sd.name);
+        deps.insert(
+            &sd.name,
+            sd.fields
+                .iter()
+                .filter_map(|f| by_value_dep(&f.ty))
+                .collect(),
+        );
+    }
+    for ed in &ir.enums {
+        names.push(&ed.name);
+        deps.insert(
+            &ed.name,
+            ed.variants
+                .iter()
+                .flat_map(|v| v.payload.iter())
+                .filter_map(by_value_dep)
+                .collect(),
+        );
+    }
+    let mut order = Vec::new();
+    let mut visited = HashSet::new();
+    for n in names {
+        topo_visit(n, &deps, &mut visited, &mut order);
+    }
+    order
+}
+
+fn by_value_dep(ty: &Ty) -> Option<&str> {
+    match ty {
+        Ty::Named(n) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+fn topo_visit<'a>(
+    name: &'a str,
+    deps: &HashMap<&'a str, Vec<&'a str>>,
+    visited: &mut HashSet<String>,
+    order: &mut Vec<String>,
+) {
+    if visited.contains(name) {
+        return;
+    }
+    visited.insert(name.to_string());
+    if let Some(ds) = deps.get(name) {
+        for d in ds {
+            topo_visit(d, deps, visited, order);
+        }
+    }
+    order.push(name.to_string());
 }
 
 /// `void dray_drop_T(void *p) { T *self = (T *)p; dray_rc_release(self->f); ... }`
@@ -569,40 +655,24 @@ fn has_rc_field(sd: &dray_ir::StructDef) -> bool {
 /// The layout is deliberately flat (payloads side-by-side, not overlapped in a
 /// union) — simple and correct; a union to reclaim the space is a later
 /// refinement. Only the active variant's fields are ever read, guarded by `tag`.
-pub(crate) fn enum_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
-    let mut out = Vec::new();
-    for ed in &ir.enums {
-        // Tag enum: `enum Name_Tag { Name_V0, Name_V1, ... };`
-        let mut eb = EnumBuilder::new_with_str(&format!("{}_Tag", ed.name));
-        for v in &ed.variants {
-            eb = eb.variant(VariantBuilder::new_with_str(&tag_const(&ed.name, &v.name)).build());
-        }
-        out.push(GlobalStatement::Enum(eb.build()));
-
-        // Wrapper struct: `struct Name { enum Name_Tag tag; <payload fields> };`
-        let mut sb = StructBuilder::new_with_str(&ed.name);
-        sb = sb.field(
-            FieldBuilder::new_with_str(
-                "tag",
-                Type::base(BaseType::Enum(format!("{}_Tag", ed.name))),
-            )
-            .build(),
-        );
-        for v in &ed.variants {
-            for (i, ty) in v.payload.iter().enumerate() {
-                sb = sb.field(
-                    FieldBuilder::new_with_str(&payload_field(&v.name, i), lower_ty(ty)?).build(),
-                );
-            }
-        }
-        out.push(GlobalStatement::Struct(sb.define().build()));
-
-        // Constructor per variant.
-        for v in &ed.variants {
-            out.push(GlobalStatement::Function(enum_ctor(ed, v)?));
+/// `struct Name { enum Name_Tag tag; <flat payload fields> };`
+fn enum_definition(ed: &dray_ir::EnumDef) -> Result<tamago::Struct> {
+    let mut sb = StructBuilder::new_with_str(&ed.name);
+    sb = sb.field(
+        FieldBuilder::new_with_str(
+            "tag",
+            Type::base(BaseType::Enum(format!("{}_Tag", ed.name))),
+        )
+        .build(),
+    );
+    for v in &ed.variants {
+        for (i, ty) in v.payload.iter().enumerate() {
+            sb = sb.field(
+                FieldBuilder::new_with_str(&payload_field(&v.name, i), lower_ty(ty)?).build(),
+            );
         }
     }
-    Ok(out)
+    Ok(sb.define().build())
 }
 
 /// `Name dray_new_Name_V(t0 f0, ...) { Name self; self.tag = Name_V;

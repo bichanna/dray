@@ -1,31 +1,23 @@
+Node :: struct {
+    value: int32,
+    next: Maybe(@Node),
+}
+
 Maybe :: enum(comptime T: type) {
     Some(T),
     None,
 }
 
-Result :: enum(comptime T: type, comptime E: type) {
-    Ok(T),
-    Err(E),
-}
-
-first_or :: proc(has: bool, fallback: int32) -> int32 {
-    m := Maybe(int32).None;
-    switch m {
-    case Maybe.Some(v):
-        return v;
-    case Maybe.None:
-        return fallback;
-    }
-}
-
 main :: proc() -> int32 {
-    r := Result(int32, bool).Ok(35);
-    total := 0;
-    switch r {
-    case Result.Ok(n):
-        total = n;
-    case Result.Err(e):
-        total = 0;
+    tail := alloc Node{ value: 2, next: Maybe(@Node).None };
+    head := alloc Node{ value: 40, next: Maybe(@Node).Some(tail) };
+
+    total := head.value;
+    switch head.next {
+    case Maybe.Some(n):
+        total = total + n.value;   // n: @Node, auto-dereferenced
+    case Maybe.None:
+        total = total + 0;
     }
-    return total + first_or(false, 7);   // 35 + 7 = 42
+    return total;   // 40 + 2 = 42
 }
