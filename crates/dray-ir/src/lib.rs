@@ -196,7 +196,7 @@ impl Lowerer {
                 // are Names of live @T locals need those sources retained: the new
                 // allocation is about to hold the same pointer, so the source
                 // binding's implicit +1 must be duplicated
-                self.emit_field_retains(init, scopes, out);
+                self.emit_field_retains(init, out);
 
                 out.push(Stmt::Let {
                     name: name.clone(),
@@ -219,7 +219,7 @@ impl Lowerer {
             H::Break => out.push(Stmt::Break),
             H::Continue => out.push(Stmt::Continue),
             H::Expr(e) => {
-                self.emit_field_retains(e, scopes, out);
+                self.emit_field_retains(e, out);
                 out.push(Stmt::Expr(e.clone()));
             }
             H::If {
@@ -341,7 +341,7 @@ impl Lowerer {
         out: &mut Vec<Stmt>,
     ) {
         // Field retains apply regardless of whether the target is @T.
-        self.emit_field_retains(value, scopes, out);
+        self.emit_field_retains(value, out);
 
         let target_name = if matches!(op, AssignOp::Assign)
             && matches!(target.ty, Ty::Rc(_))
@@ -392,11 +392,11 @@ impl Lowerer {
         }
     }
 
-    fn emit_field_retains(&mut self, e: &Expr, scopes: &Scopes, out: &mut Vec<Stmt>) {
+    fn emit_field_retains(&mut self, e: &Expr, out: &mut Vec<Stmt>) {
         match &e.kind {
             ExprKind::Alloc { fields, .. } => {
                 for (_, val) in fields {
-                    self.emit_field_retains(val, scopes, out);
+                    self.emit_field_retains(val, out);
                     if matches!(val.ty, Ty::Rc(_))
                         && let ExprKind::Name { name, .. } = &val.kind
                     {
@@ -405,22 +405,22 @@ impl Lowerer {
                 }
             }
             ExprKind::Call { callee, args } => {
-                self.emit_field_retains(callee, scopes, out);
+                self.emit_field_retains(callee, out);
                 for a in args {
-                    self.emit_field_retains(a, scopes, out);
+                    self.emit_field_retains(a, out);
                 }
             }
             ExprKind::Binary { lhs, rhs, .. } => {
-                self.emit_field_retains(lhs, scopes, out);
-                self.emit_field_retains(rhs, scopes, out);
+                self.emit_field_retains(lhs, out);
+                self.emit_field_retains(rhs, out);
             }
-            ExprKind::Unary { operand, .. } => self.emit_field_retains(operand, scopes, out),
-            ExprKind::Paren(inner) => self.emit_field_retains(inner, scopes, out),
-            ExprKind::Cast { operand, .. } => self.emit_field_retains(operand, scopes, out),
-            ExprKind::Field { recv, .. } => self.emit_field_retains(recv, scopes, out),
+            ExprKind::Unary { operand, .. } => self.emit_field_retains(operand, out),
+            ExprKind::Paren(inner) => self.emit_field_retains(inner, out),
+            ExprKind::Cast { operand, .. } => self.emit_field_retains(operand, out),
+            ExprKind::Field { recv, .. } => self.emit_field_retains(recv, out),
             ExprKind::Index { base, index } => {
-                self.emit_field_retains(base, scopes, out);
-                self.emit_field_retains(index, scopes, out);
+                self.emit_field_retains(base, out);
+                self.emit_field_retains(index, out);
             }
             _ => {}
         }

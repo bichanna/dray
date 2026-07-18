@@ -239,3 +239,47 @@ fn enum_and_switch_resolve() {
     );
     assert!(errs.is_empty(), "enum program should resolve: {errs:?}");
 }
+
+#[test]
+fn nonexistent_enum_variant_is_an_error() {
+    let errs = resolve_errors(
+        "Maybe :: enum(comptime T: type) {\n    Some(T),\n    None,\n}\n\nmain :: proc() -> int32 {\n    x := Maybe(int32).Nope;\n    return 0;\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("no variant")), "{errs:?}");
+}
+
+#[test]
+fn variant_payload_arity_is_checked() {
+    // `Some` takes one value; using it with none (as a unit variant) is an error.
+    let errs = resolve_errors(
+        "Maybe :: enum(comptime T: type) {\n    Some(T),\n    None,\n}\n\nmain :: proc() -> int32 {\n    x := Maybe(int32).Some;\n    return 0;\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("takes 1 value")), "{errs:?}");
+}
+
+#[test]
+fn pattern_variant_binding_count_is_checked() {
+    let errs = resolve_errors(
+        "Maybe :: enum(comptime T: type) {\n    Some(T),\n    None,\n}\n\nmain :: proc() -> int32 {\n    m := Maybe(int32).None;\n    switch m {\n    case Maybe.Some(a, b):\n        return 0;\n    case Maybe.None:\n        return 0;\n    }\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("takes 1 value")), "{errs:?}");
+}
+
+#[test]
+fn nonexistent_field_read_is_an_error() {
+    let errs = resolve_errors(
+        "P :: struct {\n    x: int32,\n}\n\nmain :: proc() -> int32 {\n    p := alloc P{ x: 1 };\n    return p.nope;\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("no field")), "{errs:?}");
+}
+
+#[test]
+fn proc_call_arity_is_checked() {
+    let errs = resolve_errors(
+        "add :: proc(a: int32, b: int32) -> int32 {\n    return a;\n}\n\nmain :: proc() -> int32 {\n    return add(1);\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("takes 2 argument")),
+        "{errs:?}"
+    );
+}

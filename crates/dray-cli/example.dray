@@ -10,7 +10,7 @@ Maybe :: enum(comptime T: type) {
 
 main :: proc() -> int32 {
     tail := alloc Node{ value: 2, next: Maybe(@Node).None };
-    head := alloc Node{ value: 40, next: Maybe(@Node).Some(tail) };
+    head := alloc Node{ value: 40, next: Maybe(@Node).Some(tail, ) };
 
     total := head.value;
     switch head.next {

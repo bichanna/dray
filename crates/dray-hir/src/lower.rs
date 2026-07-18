@@ -50,6 +50,8 @@ struct Lowerer {
     /// Every declared type's comptime-parameter count, so type references can be
     /// checked for existence and correct arity (0 = a non-generic type).
     type_arity: HashMap<String, usize>,
+    /// Each proc's runtime parameter count, to check call arity
+    proc_arity: HashMap<String, usize>,
 }
 
 impl Lowerer {
@@ -63,6 +65,7 @@ impl Lowerer {
             enums: HashMap::new(),
             enum_type_params: HashMap::new(),
             type_arity: HashMap::new(),
+            proc_arity: HashMap::new(),
         }
     }
 
@@ -79,6 +82,8 @@ impl Lowerer {
                 SyntaxKind::ProcDef => {
                     if let Some(name) = first_ident(decl) {
                         let ret = self.return_type(decl);
+                        self.proc_arity
+                            .insert(name.clone(), runtime_param_count(decl));
                         let id = self.add_def(name.clone(), DefKind::Proc, ret);
                         self.bind_module(name, id);
                     }
@@ -87,6 +92,8 @@ impl Lowerer {
                     if let Some(name) = first_ident(decl) {
                         let symbol = self.extern_symbol(decl).unwrap_or_else(|| name.clone());
                         let ret = self.return_type(decl);
+                        self.proc_arity
+                            .insert(name.clone(), runtime_param_count(decl));
                         let id = self.add_def(name.clone(), DefKind::ExternProc { symbol }, ret);
                         self.bind_module(name, id);
                     }
@@ -582,19 +589,20 @@ impl Lowerer {
         let callee_node = self.first_expr(node);
 
         // `Enum.Variant(args)` enum construction, not an ordinary call.
-        if let Some(cn) = &callee_node {
-            if let Some((enum_name, variant, type_args)) = self.enum_variant_ref(cn) {
-                let args = self.call_args(node);
-                let ty = enum_instance_ty(&enum_name, type_args);
-                return (
-                    ExprKind::EnumInit {
-                        enum_name,
-                        variant,
-                        args,
-                    },
-                    ty,
-                );
-            }
+        if let Some(cn) = &callee_node
+            && let Some((enum_name, variant, type_args)) = self.enum_variant_ref(cn)
+        {
+            let args = self.call_args(node);
+            self.check_variant(&enum_name, &variant, args.len(), node.span());
+            let ty = enum_instance_ty(&enum_name, type_args);
+            return (
+                ExprKind::EnumInit {
+                    enum_name,
+                    variant,
+                    args,
+                },
+                ty,
+            );
         }
 
         let callee = match callee_node {
@@ -602,6 +610,19 @@ impl Lowerer {
             None => return (ExprKind::Unresolved("call".into()), Ty::Infer),
         };
         let args = self.call_args(node);
+        // If the callee names a known proc, its argument count must match.
+        if let ExprKind::Name { name, .. } = &callee.kind
+            && let Some(&arity) = self.proc_arity.get(name)
+            && args.len() != arity
+        {
+            self.err(
+                node.span(),
+                format!(
+                    "proc `{name}` takes {arity} argument(s), but {} were given",
+                    args.len()
+                ),
+            );
+        }
         let ty = callee.ty.clone();
         (
             ExprKind::Call {
@@ -626,6 +647,7 @@ impl Lowerer {
     fn lower_field(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         // `Enum.Variant` with no call is a unit-variant construction.
         if let Some((enum_name, variant, type_args)) = self.enum_variant_ref(node) {
+            self.check_variant(&enum_name, &variant, 0, node.span());
             let ty = enum_instance_ty(&enum_name, type_args);
             return (
                 ExprKind::EnumInit {
@@ -645,12 +667,19 @@ impl Lowerer {
             .map(|t| t.text().to_string())
             .unwrap_or_default();
         let ty = match struct_name_of(&recv.ty) {
-            Some(sname) => self
-                .structs
-                .get(&sname)
-                .and_then(|fs| fs.iter().find(|f| f.name == member))
-                .map(|f| f.ty.clone())
-                .unwrap_or(Ty::Infer),
+            Some(sname) => match self.structs.get(&sname) {
+                Some(fields) => match fields.iter().find(|f| f.name == member) {
+                    Some(f) => f.ty.clone(),
+                    None => {
+                        self.err(
+                            node.span(),
+                            format!("struct `{sname}` has no field `{member}`"),
+                        );
+                        Ty::Infer
+                    }
+                },
+                None => Ty::Infer,
+            },
             None => Ty::Infer,
         };
         (
@@ -685,11 +714,27 @@ impl Lowerer {
             _ => return None,
         };
 
-        let variants = self.enums.get(&enum_name)?;
-        if variants.iter().any(|v| v.name == variant) {
-            Some((enum_name, variant, type_args))
-        } else {
-            None
+        self.enums.get(&enum_name)?;
+        Some((enum_name, variant, type_args))
+    }
+
+    fn check_variant(&mut self, enum_name: &str, variant: &str, count: usize, span: Span) {
+        let Some(variants) = self.enums.get(enum_name) else {
+            return; // receiver isn't an enum — reported elsewhere
+        };
+        match variants.iter().find(|v| v.name == variant) {
+            None => self.err(
+                span,
+                format!("enum `{enum_name}` has no variant `{variant}`"),
+            ),
+            Some(v) if v.payload.len() != count => self.err(
+                span,
+                format!(
+                    "variant `{enum_name}.{variant}` takes {} value(s), but {count} were given",
+                    v.payload.len()
+                ),
+            ),
+            Some(_) => {}
         }
     }
 
@@ -952,6 +997,7 @@ impl Lowerer {
             bindings,
         } = &pattern
         {
+            self.check_variant(enum_name, variant, bindings.len(), clause.span());
             let payload = self.concrete_variant_payload(enum_name, variant, scrut_ty);
             for (i, b) in bindings.iter().enumerate() {
                 let ty = payload.get(i).cloned().unwrap_or(Ty::Infer);
@@ -1240,7 +1286,20 @@ fn expr_as_type(node: &SyntaxNode) -> Option<Ty> {
     }
 }
 
-/// (`Box(comptime T: type)` → `["T"]`). Empty when there is no clause.
+fn runtime_param_count(node: &SyntaxNode) -> usize {
+    node.child_of_kind(SyntaxKind::ParamList)
+        .map(|pl| {
+            pl.children()
+                .iter()
+                .filter(|p| {
+                    p.kind() == SyntaxKind::Param
+                        && p.token_of_kind(SyntaxKind::KwComptime).is_none()
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn comptime_type_params(node: &SyntaxNode) -> Vec<String> {
     node.child_of_kind(SyntaxKind::ParamList)
         .map(|pl| {
@@ -1392,13 +1451,10 @@ fn unquote(text: &str) -> String {
             Some('x') => {
                 let hi = chars.next();
                 let lo = chars.next();
-                match (hi, lo) {
-                    (Some(h), Some(l)) => {
-                        if let Ok(byte) = u8::from_str_radix(&format!("{h}{l}"), 16) {
-                            out.push(byte as char);
-                        }
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    if let Ok(byte) = u8::from_str_radix(&format!("{h}{l}"), 16) {
+                        out.push(byte as char);
                     }
-                    _ => {}
                 }
             }
             // Unknown escape: keep it verbatim rather than dropping the backslash.
