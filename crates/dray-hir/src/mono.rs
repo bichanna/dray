@@ -34,6 +34,7 @@ pub fn monomorphize(mut hir: Hir) -> Result<Hir, MonoError> {
     // Split the generic templates out from the code that is kept as-is.
     let mut templates: HashMap<String, StructDef> = HashMap::new();
     let mut enum_templates: HashMap<String, EnumDef> = HashMap::new();
+    let mut proc_templates: HashMap<String, Proc> = HashMap::new();
     let mut kept: Vec<Item> = Vec::with_capacity(hir.items.len());
     for item in hir.items {
         match item {
@@ -43,6 +44,9 @@ pub fn monomorphize(mut hir: Hir) -> Result<Hir, MonoError> {
             Item::Enum(ed) if !ed.type_params.is_empty() => {
                 enum_templates.insert(ed.name.clone(), ed);
             }
+            Item::Proc(p) if !p.type_params.is_empty() => {
+                proc_templates.insert(p.name.clone(), p);
+            }
             other => kept.push(other),
         }
     }
@@ -50,30 +54,61 @@ pub fn monomorphize(mut hir: Hir) -> Result<Hir, MonoError> {
     let mut mono = Mono {
         templates,
         enum_templates,
+        proc_templates,
         generated: HashMap::new(),
         generated_enums: HashMap::new(),
+        generated_procs: HashMap::new(),
         done: HashSet::new(),
     };
 
     let mut queue: Vec<(String, Vec<Ty>)> = Vec::new();
+    let mut proc_queue: Vec<(String, Vec<Ty>)> = Vec::new();
     for item in &mut kept {
         each_structural_ty(item, &mut |ty| collect_apps(ty, &mut queue));
+        each_expr_in_item(item, &mut |e| {
+            if let ExprKind::GenericCall {
+                proc_name,
+                type_args,
+                ..
+            } = &e.kind
+            {
+                proc_queue.push((proc_name.clone(), type_args.clone()));
+            }
+        });
     }
 
-    while let Some((name, args)) = queue.pop() {
-        if 1 + args.iter().map(app_depth).max().unwrap_or(0) > INSTANTIATION_DEPTH_LIMIT {
-            return Err(MonoError {
-                message: format!(
-                    "generic instantiation of `{name}` nests deeper than the limit of \
-                     {INSTANTIATION_DEPTH_LIMIT} (a generic type is likely infinitely recursive)"
-                ),
-            });
+    while !queue.is_empty() || !proc_queue.is_empty() {
+        while let Some((name, args)) = queue.pop() {
+            if 1 + args.iter().map(app_depth).max().unwrap_or(0) > INSTANTIATION_DEPTH_LIMIT {
+                return Err(MonoError {
+                    message: format!(
+                        "generic instantiation of `{name}` nests deeper than the limit of \
+                         {INSTANTIATION_DEPTH_LIMIT} (a generic type is likely infinitely recursive)"
+                    ),
+                });
+            }
+            mono.instantiate(&name, &args, &mut queue);
         }
-        mono.instantiate(&name, &args, &mut queue);
+        while let Some((name, args)) = proc_queue.pop() {
+            if 1 + args.iter().map(app_depth).max().unwrap_or(0) > INSTANTIATION_DEPTH_LIMIT {
+                return Err(MonoError {
+                    message: format!(
+                        "generic instantiation of proc `{name}` nests deeper than the limit of \
+                         {INSTANTIATION_DEPTH_LIMIT} (a generic proc is likely infinitely recursive)"
+                    ),
+                });
+            }
+            mono.instantiate_proc(&name, &args, &mut queue, &mut proc_queue);
+        }
     }
+
+    let mut generated_procs: Vec<Proc> = mono.generated_procs.into_values().collect();
+    generated_procs.sort_by(|a, b| a.name.cmp(&b.name));
+    kept.extend(generated_procs.into_iter().map(Item::Proc));
 
     for item in &mut kept {
         each_structural_ty(item, &mut rewrite_ty);
+        each_expr_in_item(item, &mut rewrite_generic_call);
     }
 
     let mut generated: Vec<StructDef> = mono.generated.into_values().collect();
@@ -103,15 +138,73 @@ pub fn monomorphize(mut hir: Hir) -> Result<Hir, MonoError> {
 struct Mono {
     templates: HashMap<String, StructDef>,
     enum_templates: HashMap<String, EnumDef>,
+    proc_templates: HashMap<String, Proc>,
     /// Mangled name → concrete struct.
     generated: HashMap<String, StructDef>,
     /// Mangled name → concrete enum.
     generated_enums: HashMap<String, EnumDef>,
+    /// Mangled name → concrete proc.
+    generated_procs: HashMap<String, Proc>,
     /// Mangled names already generated, to avoid repeating work.
     done: HashSet<String>,
 }
 
 impl Mono {
+    fn instantiate_proc(
+        &mut self,
+        name: &str,
+        args: &[Ty],
+        types: &mut Vec<(String, Vec<Ty>)>,
+        procs: &mut Vec<(String, Vec<Ty>)>,
+    ) {
+        let mangled = mangle(name, args);
+        if self.done.contains(&mangled) {
+            return;
+        }
+        let Some(template) = self.proc_templates.get(name) else {
+            return; // not a generic proc
+        };
+        self.done.insert(mangled.clone());
+
+        let subst = param_map(&template.type_params, args);
+        let concrete = Proc {
+            def: template.def,
+            name: mangled.clone(),
+            type_params: Vec::new(),
+            params: template
+                .params
+                .iter()
+                .map(|p| Param {
+                    def: p.def,
+                    name: p.name.clone(),
+                    ty: subst_ty(&p.ty, &subst),
+                })
+                .collect(),
+            ret: subst_ty(&template.ret, &subst),
+            body: template.body.clone(),
+        };
+
+        // Substitute the type parameters everywhere in the cloned body.
+        let mut item = Item::Proc(concrete);
+        each_structural_ty(&mut item, &mut |ty| *ty = subst_ty(ty, &subst));
+        // The instantiated body may name generic types or call generic procs
+        each_structural_ty(&mut item, &mut |ty| collect_apps(ty, types));
+        each_expr_in_item(&mut item, &mut |e| {
+            if let ExprKind::GenericCall {
+                proc_name,
+                type_args,
+                ..
+            } = &e.kind
+            {
+                procs.push((proc_name.clone(), type_args.clone()));
+            }
+        });
+
+        if let Item::Proc(concrete) = item {
+            self.generated_procs.insert(mangled, concrete);
+        }
+    }
+
     fn instantiate(&mut self, name: &str, args: &[Ty], queue: &mut Vec<(String, Vec<Ty>)>) {
         let mangled = mangle(name, args);
         if self.done.contains(&mangled) {
@@ -346,6 +439,135 @@ fn each_ty_in_block(body: &mut [Stmt], f: &mut impl FnMut(&mut Ty)) {
     }
 }
 
+fn rewrite_generic_call(e: &mut Expr) {
+    let ExprKind::GenericCall {
+        proc_name,
+        type_args,
+        args,
+    } = &mut e.kind
+    else {
+        return;
+    };
+    let mangled = mangle(proc_name, type_args);
+    let callee = Expr {
+        kind: ExprKind::Name {
+            def: DefId(0),
+            name: mangled,
+        },
+        ty: e.ty.clone(),
+        span: e.span,
+    };
+    e.kind = ExprKind::Call {
+        callee: Box::new(callee),
+        args: std::mem::take(args),
+    };
+}
+
+fn each_expr_in_item(item: &mut Item, f: &mut impl FnMut(&mut Expr)) {
+    if let Item::Proc(p) = item {
+        each_expr_in_block(&mut p.body, f);
+    }
+}
+
+fn each_expr_in_block(body: &mut [Stmt], f: &mut impl FnMut(&mut Expr)) {
+    for st in body {
+        each_expr_in_stmt(st, f);
+    }
+}
+
+fn each_expr_in_stmt(s: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
+    match s {
+        Stmt::Let { init, .. } => each_expr(init, f),
+        Stmt::Assign { target, value, .. } => {
+            each_expr(target, f);
+            each_expr(value, f);
+        }
+        Stmt::Return(Some(e)) | Stmt::Expr(e) => each_expr(e, f),
+        Stmt::StaticAssert { cond, .. } => each_expr(cond, f),
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            each_expr(cond, f);
+            each_expr_in_block(then_branch, f);
+            if let Some(eb) = else_branch {
+                each_expr_in_block(eb, f);
+            }
+        }
+        Stmt::While { cond, body } => {
+            each_expr(cond, f);
+            each_expr_in_block(body, f);
+        }
+        Stmt::CFor {
+            init,
+            cond,
+            post,
+            body,
+        } => {
+            if let Some(i) = init {
+                each_expr_in_stmt(i, f);
+            }
+            if let Some(c) = cond {
+                each_expr(c, f);
+            }
+            if let Some(p) = post {
+                each_expr_in_stmt(p, f);
+            }
+            each_expr_in_block(body, f);
+        }
+        Stmt::Loop { body } => each_expr_in_block(body, f),
+        Stmt::Switch { scrutinee, arms } => {
+            each_expr(scrutinee, f);
+            for arm in arms {
+                each_expr_in_block(&mut arm.body, f);
+            }
+        }
+    }
+}
+
+fn each_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+    f(e);
+    match &mut e.kind {
+        ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => each_expr(operand, f),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            each_expr(lhs, f);
+            each_expr(rhs, f);
+        }
+        ExprKind::Call { callee, args } => {
+            each_expr(callee, f);
+            for a in args {
+                each_expr(a, f);
+            }
+        }
+        ExprKind::Field { recv, .. } => each_expr(recv, f),
+        ExprKind::Index { base, index } => {
+            each_expr(base, f);
+            each_expr(index, f);
+        }
+        ExprKind::Cast { operand, .. } => each_expr(operand, f),
+        ExprKind::Alloc { fields, .. } => {
+            for (_, fe) in fields {
+                each_expr(fe, f);
+            }
+        }
+        ExprKind::EnumInit { args, .. } | ExprKind::GenericCall { args, .. } => {
+            for a in args {
+                each_expr(a, f);
+            }
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::Name { .. }
+        | ExprKind::Unresolved(_) => {}
+    }
+}
+
 fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
     f(&mut e.ty);
     match &mut e.kind {
@@ -377,6 +599,16 @@ fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
             }
         }
         ExprKind::EnumInit { args, .. } => {
+            for a in args {
+                each_ty_in_expr(a, f);
+            }
+        }
+        ExprKind::GenericCall {
+            type_args, args, ..
+        } => {
+            for ty in type_args {
+                f(ty);
+            }
             for a in args {
                 each_ty_in_expr(a, f);
             }

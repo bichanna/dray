@@ -94,6 +94,7 @@ pub struct Field {
 pub struct Proc {
     pub def: DefId,
     pub name: String,
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Ty,
     pub body: Vec<Stmt>,
@@ -245,6 +246,11 @@ pub enum ExprKind {
         args: Vec<Expr>,
     },
     SizeOf(Ty),
+    GenericCall {
+        proc_name: String,
+        type_args: Vec<Ty>,
+        args: Vec<Expr>,
+    },
     Paren(Box<Expr>),
 }
 

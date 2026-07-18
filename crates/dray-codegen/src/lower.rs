@@ -42,6 +42,13 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
     }
 
     for item in &ir.items {
+        if let Item::Proc(p) = item {
+            scope = scope.new_line();
+            scope = scope.global_statement(GlobalStatement::Function(proc_prototype(p)?));
+        }
+    }
+
+    for item in &ir.items {
         scope = scope.new_line();
         match item {
             Item::Include(h) => {
@@ -68,13 +75,21 @@ fn lower_extern(e: &ExternProc) -> Result<tamago::Function> {
     Ok(fb.build())
 }
 
-fn lower_proc(ir: &Ir, p: &Proc) -> Result<tamago::Function> {
+fn proc_signature(p: &Proc) -> Result<FunctionBuilder> {
     let mut fb = FunctionBuilder::new_with_str(&p.name, lower_ty(&p.ret)?);
     for param in &p.params {
         fb = fb.param(ParameterBuilder::new_with_str(&param.name, lower_ty(&param.ty)?).build());
     }
-    fb = fb.body(lower_body(ir, &p.body)?);
-    Ok(fb.build())
+    Ok(fb)
+}
+
+/// `ret name(params);` a declaration with no body
+fn proc_prototype(p: &Proc) -> Result<tamago::Function> {
+    Ok(proc_signature(p)?.build())
+}
+
+fn lower_proc(ir: &Ir, p: &Proc) -> Result<tamago::Function> {
+    Ok(proc_signature(p)?.body(lower_body(ir, &p.body)?).build())
 }
 
 fn lower_body(ir: &Ir, stmts: &[Stmt]) -> Result<Block> {
@@ -313,6 +328,11 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
         }
         ExprKind::Cast { ty, operand } => T::new_cast(lower_ty(ty)?, lower_expr(ir, operand)?),
         ExprKind::SizeOf(ty) => T::new_sizeof(lower_ty(ty)?),
+        ExprKind::GenericCall { proc_name, .. } => {
+            return Err(CodegenError::new(format!(
+                "internal: un-monomorphized call to generic proc `{proc_name}` reached codegen"
+            )));
+        }
         ExprKind::EnumInit {
             enum_name,
             variant,

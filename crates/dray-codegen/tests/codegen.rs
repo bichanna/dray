@@ -356,3 +356,60 @@ fn e2e_sizeof_and_static_assert() {
         assert_eq!(code, 12); // 4 + 8
     }
 }
+
+#[test]
+fn generic_proc_monomorphizes_per_instantiation() {
+    let out = c(
+        "identity :: proc(comptime T: type, x: T) -> T { return x; }\n\
+                 main :: proc() -> int32 {\n\
+                     a := identity(1);\n\
+                     b := identity(true);\n\
+                     return a;\n\
+                 }\n",
+    );
+    assert!(out.contains("identity_int32(int32_t x)"), "{out}");
+    assert!(out.contains("identity_bool(bool x)"), "{out}");
+    assert!(!out.contains("identity(int32_t"), "template leaked: {out}");
+}
+
+#[test]
+fn procs_get_prototypes_so_forward_calls_work() {
+    let out = c("main :: proc() -> int32 { return helper(); }\n\
+                 helper :: proc() -> int32 { return 1; }\n");
+    // A prototype precedes the definition of `main`, so the later `helper` is
+    // declared before its use
+    let proto = out.find("int32_t helper(void);").expect("prototype");
+    let body = out.find("int32_t main(void) {").expect("main body");
+    assert!(proto < body, "prototype must precede definitions: {out}");
+}
+
+#[test]
+fn e2e_mutual_recursion() {
+    let src = "is_even :: proc(n: int32) -> bool {\n\
+                   if n == 0 { return true; }\n\
+                   return is_odd(n - 1);\n\
+               }\n\
+               is_odd :: proc(n: int32) -> bool {\n\
+                   if n == 0 { return false; }\n\
+                   return is_even(n - 1);\n\
+               }\n\
+               main :: proc() -> int32 {\n\
+                   if is_even(10) { return 42; }\n\
+                   return 0;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn e2e_generic_proc_with_inference() {
+    let src = "identity :: proc(comptime T: type, x: T) -> T { return x; }\n\
+               first :: proc(comptime T: type, a: T, b: T) -> T { return a; }\n\
+               main :: proc() -> int32 {\n\
+                   return identity(40) + first(2, 99);\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}

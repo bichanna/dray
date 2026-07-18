@@ -334,3 +334,46 @@ fn sizeof_and_static_assert_are_validated() {
         "{bad_assert:?}"
     );
 }
+
+#[test]
+fn generic_proc_type_parameter_is_inferred() {
+    let errs = resolve_errors(
+        "identity :: proc(comptime T: type, x: T) -> T {\n    return x;\n}\n\nmain :: proc() -> int32 {\n    return identity(42);\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn generic_proc_accepts_explicit_type_arguments() {
+    let errs = resolve_errors(
+        "identity :: proc(comptime T: type, x: T) -> T {\n    return x;\n}\n\nmain :: proc() -> int32 {\n    return identity(int32, 42);\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn uninferable_type_parameter_is_an_error() {
+    let errs = resolve_errors(
+        "nothing :: proc(comptime T: type) -> int32 {\n    return 0;\n}\n\nmain :: proc() -> int32 {\n    return nothing();\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("cannot infer")), "{errs:?}");
+}
+
+#[test]
+fn generic_proc_call_arity_is_checked() {
+    let errs = resolve_errors(
+        "identity :: proc(comptime T: type, x: T) -> T {\n    return x;\n}\n\nmain :: proc() -> int32 {\n    return identity(1, 2, 3);\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("takes 1 argument")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn type_parameter_is_in_scope_inside_the_proc_body() {
+    let errs = resolve_errors(
+        "pack :: proc(comptime T: type, value: T) -> int32 {\n    static_assert(sizeof(T) == 4, \"4-byte only\");\n    return 0;\n}\n\nmain :: proc() -> int32 {\n    return pack(1);\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}

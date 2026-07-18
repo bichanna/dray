@@ -189,6 +189,15 @@ pub fn expr(e: &Expr) -> String {
         ExprKind::Bool(b) => b.to_string(),
         ExprKind::Name { def, name } => format!("{name}#{}", def.0),
         ExprKind::Unresolved(n) => format!("<unresolved {n}>"),
+        ExprKind::GenericCall {
+            proc_name,
+            type_args,
+            args,
+        } => {
+            let ts: Vec<String> = type_args.iter().map(ty).collect();
+            let as_: Vec<String> = args.iter().map(expr).collect();
+            format!("{proc_name}[{}]({})", ts.join(", "), as_.join(", "))
+        }
         ExprKind::SizeOf(t) => format!("sizeof({})", ty(t)),
         ExprKind::Unary { op, operand } => format!("({}{})", un(*op), expr(operand)),
         ExprKind::Binary { op, lhs, rhs } => {

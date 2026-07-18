@@ -1,18 +1,46 @@
-P :: struct {
-    a: int32,
-    b: int32,
-}
-
 Box :: struct(comptime T: type) {
     value: T,
 }
 
+Maybe :: enum(comptime T: type) {
+    Some(T),
+    None,
+}
+
+identity :: proc(comptime T: type, x: T) -> T {
+    return x;
+}
+
+packed_size :: proc(comptime T: type, value: T) -> int32 {
+    static_assert(sizeof(T) == 4, "packed_size only supports 4-byte types");
+    return cast(int32) sizeof(T);
+}
+
+wrap :: proc(comptime T: type, v: T) -> Maybe(T) {
+    return Maybe(T).Some(v);
+}
+
+boxed_value :: proc(comptime T: type, v: T) -> T {
+    b := alloc Box(T){ value: identity(v) };
+    return b.value;
+}
+
 main :: proc() -> int32 {
-    static_assert(sizeof(int32) == 4, "int32 must be 4 bytes");
-    static_assert(sizeof(P) == 8, "P must be two int32s");
+    a := identity(30);            // T inferred as int32
+    b := identity(int32, 4);      // T given explicitly
+    c := packed_size(1);          // 4
+    d := boxed_value(2);          // 2
 
-    static_assert(sizeof(Box(int32)) == 4, "Box(int32) wraps one int32");
+    total := a + b + c + d;       // 30 + 4 + 4 + 2 = 40
 
-    total := sizeof(int32) + sizeof(P) + sizeof(Box(int32));
-    return cast(int32) total;   // 4 + 8 + 4 = 16
+    m := wrap(2);
+    switch m {
+    case Maybe.Some(v):
+        return total + v;         // 42
+    case Maybe.None:
+        return 0;
+    }
+
+
+    // I'm so cool :)
 }

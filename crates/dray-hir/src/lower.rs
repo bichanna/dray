@@ -52,6 +52,14 @@ struct Lowerer {
     type_arity: HashMap<String, usize>,
     /// Each proc's runtime parameter count, to check call arity
     proc_arity: HashMap<String, usize>,
+    /// Each generic proc's comptime type-parameter names, for call-site inference.
+    proc_type_params: HashMap<String, Vec<String>>,
+    /// Each generic proc's declared runtime parameter types, still mentioning its
+    /// type parameters — the patterns that argument types are matched against
+    proc_param_types: HashMap<String, Vec<Ty>>,
+    /// The comptime type parameters of the declaration currently being lowered, so
+    /// type references inside its body (`sizeof(T)`) resolve to them.
+    type_params_in_scope: Vec<String>,
 }
 
 impl Lowerer {
@@ -66,6 +74,9 @@ impl Lowerer {
             enum_type_params: HashMap::new(),
             type_arity: HashMap::new(),
             proc_arity: HashMap::new(),
+            proc_type_params: HashMap::new(),
+            proc_param_types: HashMap::new(),
+            type_params_in_scope: Vec::new(),
         }
     }
 
@@ -84,8 +95,14 @@ impl Lowerer {
                         let ret = self.return_type(decl);
                         self.proc_arity
                             .insert(name.clone(), runtime_param_count(decl));
+                        let type_params = comptime_type_params(decl);
+                        if !type_params.is_empty() {
+                            self.proc_param_types
+                                .insert(name.clone(), declared_param_types(decl));
+                            self.proc_type_params.insert(name.clone(), type_params);
+                        }
                         let id = self.add_def(name.clone(), DefKind::Proc, ret);
-                        self.bind_module(name, id, decl.span());
+                        self.bind_module(name.clone(), id, decl.span());
                     }
                 }
                 SyntaxKind::ExternProcDecl => {
@@ -166,7 +183,9 @@ impl Lowerer {
     }
 
     fn bind_local(&mut self, name: String, id: DefId) {
-        self.scopes.last_mut().unwrap().names.insert(name, id);
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.names.insert(name, id);
+        }
     }
 
     fn push_scope(&mut self) {
@@ -191,12 +210,14 @@ impl Lowerer {
             Some(n) => n,
             None => return,
         };
-        let def = self.resolve(&name).unwrap(); // registered in pass 1
+        let def = self.resolve(&name).unwrap_or(DefId(0));
         let ret = self.return_type(node);
 
-        self.validate_decl_types(node, &[]);
+        let type_params = comptime_type_params(node);
+        self.validate_decl_types(node, &type_params);
 
         self.push_scope();
+        self.type_params_in_scope = type_params.clone();
         let params = self.lower_params(node);
         let body = match node.child_of_kind(SyntaxKind::Block) {
             Some(b) => self.lower_block(&b),
@@ -205,11 +226,14 @@ impl Lowerer {
                 Vec::new()
             }
         };
+
+        self.type_params_in_scope.clear();
         self.pop_scope();
 
         self.items.push(Item::Proc(Proc {
             def,
             name,
+            type_params,
             params,
             ret,
             body,
@@ -221,7 +245,7 @@ impl Lowerer {
             Some(n) => n,
             None => return,
         };
-        let def = self.resolve(&name).unwrap();
+        let def = self.resolve(&name).unwrap_or(DefId(0));
         let symbol = self.extern_symbol(node).unwrap_or_else(|| name.clone());
         let ret = self.return_type(node);
         self.push_scope();
@@ -247,10 +271,6 @@ impl Lowerer {
                 continue;
             }
             if p.token_of_kind(SyntaxKind::KwComptime).is_some() {
-                self.err(
-                    p.span(),
-                    "comptime parameters need monomorphization (not in HIR yet)",
-                );
                 continue;
             }
             let pname = match first_ident(&p) {
@@ -622,6 +642,13 @@ impl Lowerer {
             return self.lower_sizeof(node);
         }
 
+        if let Some(cn) = &callee_node
+            && cn.kind() == SyntaxKind::NameExpr
+            && self.proc_type_params.contains_key(&ident_text(cn))
+        {
+            return self.lower_generic_call(node, &ident_text(cn));
+        }
+
         let callee = match callee_node {
             Some(c) => self.lower_expr(&c),
             None => return (ExprKind::Unresolved("call".into()), Ty::Infer),
@@ -767,6 +794,90 @@ impl Lowerer {
         })
     }
 
+    /// Lower a call to a generic proc, resolving its `comptime` type arguments.
+    fn lower_generic_call(&mut self, node: &SyntaxNode, proc_name: &str) -> (ExprKind, Ty) {
+        let type_params = self
+            .proc_type_params
+            .get(proc_name)
+            .cloned()
+            .unwrap_or_default();
+        let param_types = self
+            .proc_param_types
+            .get(proc_name)
+            .cloned()
+            .unwrap_or_default();
+        let ret = self
+            .resolve(proc_name)
+            .map(|id| self.defs[id.0 as usize].ty.clone())
+            .unwrap_or(Ty::Infer);
+
+        let arg_nodes: Vec<SyntaxNode> = node
+            .child_of_kind(SyntaxKind::ArgList)
+            .map(|al| al.children())
+            .unwrap_or_default();
+        let n_types = type_params.len();
+        let n_values = param_types.len();
+
+        // Either every type argument is written out, or none of them are
+        let (explicit, value_nodes) = if arg_nodes.len() == n_types + n_values {
+            arg_nodes.split_at(n_types)
+        } else if arg_nodes.len() == n_values {
+            arg_nodes.split_at(0)
+        } else {
+            self.err(
+                node.span(),
+                format!(
+                    "proc `{proc_name}` takes {n_values} argument(s) (or {} with explicit type arguments), but {} were given",
+                    n_types + n_values,
+                    arg_nodes.len()
+                ),
+            );
+            return (ExprKind::Unresolved(proc_name.to_string()), ret);
+        };
+
+        let args: Vec<Expr> = value_nodes.iter().map(|a| self.lower_expr(a)).collect();
+
+        let mut bindings: HashMap<String, Ty> = HashMap::new();
+        for (arg_node, param) in explicit.iter().zip(&type_params) {
+            match expr_as_type(arg_node) {
+                Some(ty) => {
+                    self.check_type_in_scope(&ty, arg_node.span());
+                    bindings.insert(param.clone(), ty);
+                }
+                None => self.err(arg_node.span(), format!("expected a type for `{param}`")),
+            }
+        }
+        for (param_ty, arg) in param_types.iter().zip(&args) {
+            infer_type_params(param_ty, &arg.ty, &type_params, &mut bindings);
+        }
+
+        let mut type_args = Vec::with_capacity(n_types);
+        for param in &type_params {
+            match bindings.get(param) {
+                Some(ty) => type_args.push(ty.clone()),
+                None => {
+                    self.err(
+                        node.span(),
+                        format!(
+                            "cannot infer type parameter `{param}` of `{proc_name}` from the arguments; pass it explicitly"
+                        ),
+                    );
+                    type_args.push(Ty::Infer);
+                }
+            }
+        }
+
+        let ret = subst_type_params(&ret, &type_params, &type_args);
+        (
+            ExprKind::GenericCall {
+                proc_name: proc_name.to_string(),
+                type_args,
+                args,
+            },
+            ret,
+        )
+    }
+
     fn lower_sizeof(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         let size_ty = Ty::Int {
             bits: IntWidth::Size,
@@ -788,7 +899,7 @@ impl Lowerer {
         };
         match expr_as_type(arg) {
             Some(ty) => {
-                self.check_type(&ty, &[], arg.span());
+                self.check_type_in_scope(&ty, arg.span());
                 (ExprKind::SizeOf(ty), size_ty)
             }
             None => {
@@ -913,6 +1024,12 @@ impl Lowerer {
     /// Report an error for any type reference that names an undeclared type uses
     /// a generic type with the wrong number of arguments, or applies type
     /// arguments to something that isn't generic.
+    fn check_type_in_scope(&mut self, ty: &Ty, span: Span) {
+        let scoped = std::mem::take(&mut self.type_params_in_scope);
+        self.check_type(ty, &scoped, span);
+        self.type_params_in_scope = scoped;
+    }
+
     fn check_type(&mut self, ty: &Ty, type_params: &[String], span: Span) {
         match ty {
             Ty::Named(n) => {
@@ -1396,6 +1513,51 @@ fn expr_as_type(node: &SyntaxNode) -> Option<Ty> {
         }
         SyntaxKind::ParenExpr => expr_as_type(&node.children().into_iter().next()?),
         _ => None,
+    }
+}
+
+fn declared_param_types(node: &SyntaxNode) -> Vec<Ty> {
+    node.child_of_kind(SyntaxKind::ParamList)
+        .map(|pl| {
+            pl.children()
+                .iter()
+                .filter(|p| {
+                    p.kind() == SyntaxKind::Param
+                        && p.token_of_kind(SyntaxKind::KwComptime).is_none()
+                })
+                .map(|p| {
+                    p.children()
+                        .into_iter()
+                        .find(|c| is_type(c.kind()))
+                        .and_then(|t| lower_type(&t))
+                        .unwrap_or(Ty::Infer)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Match a declared parameter type against an actual argument type, binding any
+/// type parameter it mentions
+fn infer_type_params(
+    param_ty: &Ty,
+    arg_ty: &Ty,
+    type_params: &[String],
+    bindings: &mut HashMap<String, Ty>,
+) {
+    match (param_ty, arg_ty) {
+        (Ty::Named(p), actual) if type_params.iter().any(|tp| tp == p) => {
+            bindings.entry(p.clone()).or_insert_with(|| actual.clone());
+        }
+        (Ty::Ptr(pi), Ty::Ptr(ai)) | (Ty::Rc(pi), Ty::Rc(ai)) => {
+            infer_type_params(pi, ai, type_params, bindings)
+        }
+        (Ty::App(pn, pargs), Ty::App(an, aargs)) if pn == an => {
+            for (p, a) in pargs.iter().zip(aargs) {
+                infer_type_params(p, a, type_params, bindings);
+            }
+        }
+        _ => {}
     }
 }
 
