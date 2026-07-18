@@ -222,6 +222,13 @@ pub fn expr(e: &Expr) -> String {
                 format!("{enum_name}.{variant}({})", a.join(", "))
             }
         }
+        ExprKind::StructLit { ty: t, fields } => {
+            let fs: Vec<String> = fields
+                .iter()
+                .map(|(n, e)| format!("{n}: {}", expr(e)))
+                .collect();
+            format!("{}{{ {} }}", ty(t), fs.join(", "))
+        }
         ExprKind::Alloc { ty: t, fields } => {
             if fields.is_empty() {
                 format!("alloc {}", ty(t))

@@ -102,8 +102,9 @@ fn returning_a_fresh_rc_local_transfers_ownership_without_release() {
 #[test]
 fn composite_alloc_field_of_rc_local_is_retained() {
     let ir = ir_of(
-        "N :: struct { v: int32, next: @N }\n\
-         f :: proc() {\n    a := alloc N{v: 1};\n    b := alloc N{v: 2, next: a};\n}\n",
+        "Inner :: struct { v: int32 }\n\
+         N :: struct { v: int32, inner: @Inner }\n\
+         f :: proc() {\n    a := alloc Inner{v: 1};\n    b := alloc N{v: 2, inner: a};\n}\n",
     );
     let s = shapes(body_of(&ir, "f"));
     let a_idx = s

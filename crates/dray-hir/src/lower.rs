@@ -47,6 +47,9 @@ struct Lowerer {
     structs: HashMap<String, Vec<Field>>,
     enums: HashMap<String, Vec<Variant>>,
     enum_type_params: HashMap<String, Vec<String>>,
+    /// Each struct's comptime type-parameter names, for substituting a generic
+    /// instantiation's arguments into its field types
+    struct_type_params: HashMap<String, Vec<String>>,
     /// Every declared type's comptime-parameter count, so type references can be
     /// checked for existence and correct arity (0 = a non-generic type).
     type_arity: HashMap<String, usize>,
@@ -57,6 +60,9 @@ struct Lowerer {
     /// Each generic proc's declared runtime parameter types, still mentioning its
     /// type parameters — the patterns that argument types are matched against
     proc_param_types: HashMap<String, Vec<Ty>>,
+    /// Struct names currently being zero-initialized, so a by-value cycle cannot
+    /// drive `zero_aggregate` into unbounded recursion.
+    zeroing: Vec<String>,
     /// The comptime type parameters of the declaration currently being lowered, so
     /// type references inside its body (`sizeof(T)`) resolve to them.
     type_params_in_scope: Vec<String>,
@@ -72,10 +78,12 @@ impl Lowerer {
             structs: HashMap::new(),
             enums: HashMap::new(),
             enum_type_params: HashMap::new(),
+            struct_type_params: HashMap::new(),
             type_arity: HashMap::new(),
             proc_arity: HashMap::new(),
             proc_type_params: HashMap::new(),
             proc_param_types: HashMap::new(),
+            zeroing: Vec::new(),
             type_params_in_scope: Vec::new(),
         }
     }
@@ -121,8 +129,9 @@ impl Lowerer {
                         let id =
                             self.add_def(name.clone(), DefKind::Struct, Ty::Named(name.clone()));
                         self.bind_module(name.clone(), id, decl.span());
-                        self.type_arity
-                            .insert(name.clone(), comptime_type_params(decl).len());
+                        let tps = comptime_type_params(decl);
+                        self.type_arity.insert(name.clone(), tps.len());
+                        self.struct_type_params.insert(name.clone(), tps);
                         self.structs.insert(name, fields);
                     }
                 }
@@ -346,8 +355,8 @@ impl Lowerer {
             .into_iter()
             .find(|c| is_type(c.kind()))
             .and_then(|t| self.checked_type(&t));
-        let init_node = self.first_expr(node)?;
-        let init = self.lower_expr(&init_node);
+        let init_node = self.first_value_of(node)?;
+        let init = self.lower_value(&init_node, declared.as_ref());
         let ty = declared.unwrap_or_else(|| default_ty(&init.ty));
         let id = self.add_def(name.clone(), DefKind::Local, ty.clone());
         self.bind_local(name.clone(), id);
@@ -500,6 +509,7 @@ impl Lowerer {
             SyntaxKind::IndexExpr => self.lower_index(node),
             SyntaxKind::CastExpr => self.lower_cast(node),
             SyntaxKind::AllocExpr => self.lower_alloc(node),
+            SyntaxKind::CompositeLit => self.lower_struct_lit(node, None),
             other => {
                 self.err(span, format!("unsupported expression {other:?}"));
                 (ExprKind::Unresolved(format!("{other:?}")), Ty::Infer)
@@ -1077,6 +1087,45 @@ impl Lowerer {
         }
     }
 
+    /// If `root` reaches itself through by-value struct fields, describe the path
+    /// (`A -> B -> A`). Pointer fields break the cycle: they only need a forward
+    /// declaration, so a linked structure recursing through `@T` is fine
+    fn by_value_cycle(&self, root: &str) -> Option<String> {
+        let mut path: Vec<String> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        self.walk_by_value(root, root, &mut path, &mut seen)
+            .map(|()| format!("{} -> {root}", path.join(" -> ")))
+    }
+
+    fn walk_by_value(
+        &self,
+        current: &str,
+        root: &str,
+        path: &mut Vec<String>,
+        seen: &mut Vec<String>,
+    ) -> Option<()> {
+        if seen.iter().any(|s| s == current) {
+            return None; // already explored, and it did not reach `root`
+        }
+        seen.push(current.to_string());
+        path.push(current.to_string());
+        let fields = self.structs.get(current)?;
+        for f in fields {
+            // Only a plain named type is embedded by value; `@T`/`*T` are pointers.
+            let (Ty::Named(next) | Ty::App(next, _)) = &f.ty else {
+                continue;
+            };
+            if next == root {
+                return Some(());
+            }
+            if self.walk_by_value(next, root, path, seen).is_some() {
+                return Some(());
+            }
+        }
+        path.pop();
+        None
+    }
+
     fn check_duplicates<'n, I>(&mut self, names: I, what: &str, span: Span)
     where
         I: IntoIterator<Item = &'n str>,
@@ -1103,6 +1152,17 @@ impl Lowerer {
         let type_params = comptime_type_params(node);
         self.validate_decl_types(node, &type_params);
         self.check_duplicates(fields.iter().map(|f| f.name.as_str()), "field", node.span());
+
+        if let Some(cycle) = self.by_value_cycle(&name) {
+            self.err(
+                node.span(),
+                format!(
+                    "`{name}` contains itself by value ({cycle}); make one of these fields a \
+                     pointer (`@T`) to break the cycle"
+                ),
+            );
+        }
+
         for f in &fields {
             if type_params.contains(&f.name) {
                 self.err(
@@ -1322,50 +1382,277 @@ impl Lowerer {
     /// Lower a `CompositeLit` sitting under an `alloc`: resolve the struct type,
     /// then each `field: value` element (checking the field exists).
     fn lower_composite_alloc(&mut self, lit: &SyntaxNode) -> (ExprKind, Ty) {
-        let ty_node = lit.children().into_iter().find(|c| is_type(c.kind()));
-        let ty = match ty_node.and_then(|t| self.checked_type(&t)) {
+        match self.lower_composite(lit, None) {
+            Some((ty, fields)) => (
+                ExprKind::Alloc {
+                    ty: ty.clone(),
+                    fields,
+                },
+                Ty::Rc(Box::new(ty)),
+            ),
+            None => (ExprKind::Unresolved("composite".into()), Ty::Infer),
+        }
+    }
+
+    /// `T{ ... }` or a bare `{ ... }` a by value struct literal.
+    fn lower_struct_lit(&mut self, lit: &SyntaxNode, target: Option<&Ty>) -> (ExprKind, Ty) {
+        match self.lower_composite(lit, target) {
+            Some((ty, fields)) => (
+                ExprKind::StructLit {
+                    ty: ty.clone(),
+                    fields,
+                },
+                ty,
+            ),
+            None => (ExprKind::Unresolved("composite".into()), Ty::Infer),
+        }
+    }
+
+    fn lower_composite(
+        &mut self,
+        lit: &SyntaxNode,
+        target: Option<&Ty>,
+    ) -> Option<(Ty, Vec<(String, Expr)>)> {
+        let ty = match self.composite_type(lit) {
             Some(t) => t,
-            None => {
-                self.err(lit.span(), "composite literal needs a type");
-                return (ExprKind::Unresolved("composite".into()), Ty::Infer);
-            }
+            // A bare literal takes the type known from context.
+            None => match target {
+                Some(t) => t.clone(),
+                None => {
+                    self.err(
+                        lit.span(),
+                        "cannot tell what this `{ ... }` builds; give it a type",
+                    );
+                    return None;
+                }
+            },
         };
+
         let struct_name = match &ty {
-            Ty::Named(n) => n.clone(),
-            Ty::App(n, _) => n.clone(),
+            Ty::Named(n) | Ty::App(n, _) => n.clone(),
             _ => {
                 self.err(lit.span(), "only structs can be built with `{ ... }`");
-                return (ExprKind::Unresolved("composite".into()), Ty::Infer);
+                return None;
             }
         };
-        let known: Vec<String> = self
-            .structs
-            .get(&struct_name)
-            .map(|fs| fs.iter().map(|f| f.name.clone()).collect())
-            .unwrap_or_default();
+        let Some(declared) = self.structs.get(&struct_name).cloned() else {
+            self.err(
+                lit.span(),
+                format!("`{struct_name}` is not a struct, so it cannot be built with `{{ ... }}`"),
+            );
+            return None;
+        };
 
-        let mut fields = Vec::new();
+        let type_params = self
+            .struct_type_params
+            .get(&struct_name)
+            .cloned()
+            .unwrap_or_default();
+        let type_args: Vec<Ty> = match &ty {
+            Ty::App(_, args) => args.clone(),
+            _ => Vec::new(),
+        };
+        let field_ty = |name: &str| -> Option<Ty> {
+            declared
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| subst_type_params(&f.ty, &type_params, &type_args))
+        };
+
+        let mut fields: Vec<(String, Expr)> = Vec::new();
         for el in lit.children() {
             if el.kind() != SyntaxKind::Element {
                 continue;
             }
             let fname = ident_text(&el);
-            if !known.is_empty() && !known.contains(&fname) {
+            let expected = field_ty(&fname);
+            if expected.is_none() {
                 self.err(el.span(), format!("`{struct_name}` has no field `{fname}`"));
             }
-            let value = match self.first_expr(&el) {
-                Some(e) => self.lower_expr(&e),
-                None => continue,
+            if fields.iter().any(|(n, _)| n == &fname) {
+                self.err(
+                    el.span(),
+                    format!("field `{fname}` is given more than once"),
+                );
+            }
+            let Some(value_node) = self.first_value(&el) else {
+                continue;
             };
+            let value = self.lower_value(&value_node, expected.as_ref());
             fields.push((fname, value));
         }
-        (
-            ExprKind::Alloc {
+
+        for f in &declared {
+            if fields.iter().any(|(n, _)| n == &f.name) {
+                continue;
+            }
+            let concrete = subst_type_params(&f.ty, &type_params, &type_args);
+            if let Some(zero) = self.zero_value(&concrete, lit.span(), &struct_name, &f.name) {
+                fields.push((f.name.clone(), zero));
+            }
+        }
+
+        fields.sort_by_key(|(n, _)| {
+            declared
+                .iter()
+                .position(|f| &f.name == n)
+                .unwrap_or(usize::MAX)
+        });
+        Some((ty, fields))
+    }
+
+    fn composite_type(&mut self, lit: &SyntaxNode) -> Option<Ty> {
+        let head = lit.children().into_iter().find(|c| {
+            is_type(c.kind()) || matches!(c.kind(), SyntaxKind::NameExpr | SyntaxKind::CallExpr)
+        })?;
+        let ty = if is_type(head.kind()) {
+            self.checked_type(&head)?
+        } else {
+            expr_as_type(&head)?
+        };
+        self.check_type_in_scope(&ty, head.span());
+        Some(ty)
+    }
+
+    /// A declaration's initializer node, which may be an ordinary expression or a
+    /// bare composite literal
+    fn first_value_of(&self, node: &SyntaxNode) -> Option<SyntaxNode> {
+        self.first_expr(node)
+    }
+
+    /// The value node of a composite literal element, skipping the field-name
+    /// token and any type prefix
+    fn first_value(&self, el: &SyntaxNode) -> Option<SyntaxNode> {
+        self.first_expr(el)
+    }
+
+    fn lower_value(&mut self, node: &SyntaxNode, target: Option<&Ty>) -> Expr {
+        if node.kind() == SyntaxKind::CompositeLit {
+            let (kind, ty) = self.lower_struct_lit(node, target);
+            return Expr {
+                kind,
+                ty,
+                span: node.span(),
+            };
+        }
+        self.lower_expr(node)
+    }
+
+    fn zero_value(&mut self, ty: &Ty, span: Span, struct_name: &str, field: &str) -> Option<Expr> {
+        let kind = match ty {
+            Ty::Bool => ExprKind::Bool(false),
+            Ty::Int { .. } => ExprKind::Int(0),
+            Ty::Float { .. } => ExprKind::Float(0.0),
+            // Non-nullable by construction: there is no "absent" value to use.
+            Ty::Ptr(_) | Ty::Rc(_) => {
+                self.err(
+                    span,
+                    format!(
+                        "field `{field}` of `{struct_name}` is a non-nullable pointer and has no \
+                         zero value, so it must be given"
+                    ),
+                );
+                return None;
+            }
+            Ty::Named(n) | Ty::App(n, _) => {
+                return self.zero_aggregate(ty, n, span, struct_name, field);
+            }
+            Ty::Void | Ty::Infer => {
+                self.err(
+                    span,
+                    format!(
+                        "field `{field}` of `{struct_name}` has no zero value, so it must be given"
+                    ),
+                );
+                return None;
+            }
+        };
+        Some(Expr {
+            kind,
+            ty: ty.clone(),
+            span,
+        })
+    }
+
+    /// The zero value of a named struct (recursively zeroed) or enum (its first
+    /// payload-less variant:`.None` for `Maybe(T)`).
+    ///
+    /// The variant is constructed explicitly rather than relying on a zeroed tag:
+    /// the tag's zero is the *first* variant, which for `Maybe(T) { Some(T), None }`
+    /// would be `Some` with a garbage payload.
+    fn zero_aggregate(
+        &mut self,
+        ty: &Ty,
+        name: &str,
+        span: Span,
+        struct_name: &str,
+        field: &str,
+    ) -> Option<Expr> {
+        if self.zeroing.iter().any(|n| n == name) {
+            return None;
+        }
+        if let Some(declared) = self.structs.get(name).cloned() {
+            let type_params = self
+                .struct_type_params
+                .get(name)
+                .cloned()
+                .unwrap_or_default();
+            let type_args: Vec<Ty> = match ty {
+                Ty::App(_, args) => args.clone(),
+                _ => Vec::new(),
+            };
+
+            let mut fields = Vec::new();
+            self.zeroing.push(name.to_string());
+            for f in &declared {
+                let concrete = subst_type_params(&f.ty, &type_params, &type_args);
+                match self.zero_value(&concrete, span, name, &f.name) {
+                    Some(zero) => fields.push((f.name.clone(), zero)),
+                    None => {
+                        self.zeroing.pop();
+                        return None;
+                    }
+                }
+            }
+
+            self.zeroing.pop();
+            return Some(Expr {
+                kind: ExprKind::StructLit {
+                    ty: ty.clone(),
+                    fields,
+                },
                 ty: ty.clone(),
-                fields,
-            },
-            Ty::Rc(Box::new(ty)),
-        )
+                span,
+            });
+        }
+
+        if let Some(variants) = self.enums.get(name).cloned() {
+            let Some(empty) = variants.iter().find(|v| v.payload.is_empty()) else {
+                self.err(
+                    span,
+                    format!(
+                        "field `{field}` of `{struct_name}` is an enum with no payload-less \
+                         variant, so it has no zero value and must be given"
+                    ),
+                );
+                return None;
+            };
+            return Some(Expr {
+                kind: ExprKind::EnumInit {
+                    enum_name: name.to_string(),
+                    variant: empty.name.clone(),
+                    args: Vec::new(),
+                },
+                ty: ty.clone(),
+                span,
+            });
+        }
+
+        self.err(
+            span,
+            format!("field `{field}` of `{struct_name}` has no zero value, so it must be given"),
+        );
+        None
     }
 
     fn checked_type(&mut self, node: &SyntaxNode) -> Option<Ty> {
@@ -1456,6 +1743,7 @@ fn is_expr(kind: SyntaxKind) -> bool {
             | SyntaxKind::IndexExpr
             | SyntaxKind::CastExpr
             | SyntaxKind::AllocExpr
+            | SyntaxKind::CompositeLit
     )
 }
 

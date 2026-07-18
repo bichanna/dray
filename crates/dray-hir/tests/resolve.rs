@@ -219,7 +219,7 @@ fn escapes_are_decoded() {
 #[test]
 fn struct_defines_a_type_and_fields() {
     let errs = resolve_errors(
-        "Node :: struct {\n    value: int32,\n    next: @Node,\n}\n\nmain :: proc() -> int32 {\n    n := alloc Node{ value: 1 };\n    return n.value;\n}\n",
+        "Maybe :: enum(comptime T: type) {\n    Some(T),\n    None,\n}\n\nNode :: struct {\n    value: int32,\n    next: Maybe(@Node),\n}\n\nmain :: proc() -> int32 {\n    n := alloc Node{ value: 1 };\n    return n.value;\n}\n",
     );
     assert!(errs.is_empty(), "struct program should resolve: {errs:?}");
 }
@@ -374,6 +374,91 @@ fn generic_proc_call_arity_is_checked() {
 fn type_parameter_is_in_scope_inside_the_proc_body() {
     let errs = resolve_errors(
         "pack :: proc(comptime T: type, value: T) -> int32 {\n    static_assert(sizeof(T) == 4, \"4-byte only\");\n    return 0;\n}\n\nmain :: proc() -> int32 {\n    return pack(1);\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn omitted_field_takes_its_zero_value() {
+    let errs = resolve_errors(
+        "P :: struct {\n    x: int32,\n    flag: bool,\n}\n\nmain :: proc() -> int32 {\n    p := P{ x: 1 };\n    return p.x;\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn omitted_non_nullable_pointer_field_is_an_error() {
+    // Spec §4.3: there is no zero value for "non-nullable, but absent".
+    let errs = resolve_errors(
+        "Node :: struct {\n    value: int32,\n    next: @Node,\n}\n\nmain :: proc() -> int32 {\n    n := alloc Node{ value: 1 };\n    return n.value;\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("non-nullable pointer")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn omitted_enum_field_without_a_payload_less_variant_is_an_error() {
+    let errs = resolve_errors(
+        "E :: enum {\n    A(int32),\n    B(int32),\n}\n\nP :: struct {\n    e: E,\n    x: int32,\n}\n\nmain :: proc() -> int32 {\n    p := P{ x: 1 };\n    return p.x;\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("no payload-less variant")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn bare_composite_literal_needs_a_target_type() {
+    let errs = resolve_errors(
+        "P :: struct {\n    x: int32,\n}\n\nmain :: proc() -> int32 {\n    p := { x: 1 };\n    return 0;\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("cannot tell")), "{errs:?}");
+}
+
+#[test]
+fn target_type_propagates_into_nested_bare_literals() {
+    let errs = resolve_errors(
+        "A :: struct {\n    v: int32,\n}\n\nB :: struct {\n    a: A,\n}\n\nmain :: proc() -> int32 {\n    b: B = { a: { v: 1 } };\n    return b.a.v;\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn a_field_given_twice_is_an_error() {
+    let errs = resolve_errors(
+        "P :: struct {\n    x: int32,\n}\n\nmain :: proc() -> int32 {\n    p := P{ x: 1, x: 2 };\n    return p.x;\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("more than once")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn by_value_struct_cycles_are_rejected() {
+    let direct = resolve_errors("P :: struct {\n    x: int32,\n    p: P,\n}\n");
+    assert!(
+        direct
+            .iter()
+            .any(|m| m.contains("contains itself by value")),
+        "{direct:?}"
+    );
+
+    let mutual = resolve_errors("A :: struct {\n    b: B,\n}\n\nB :: struct {\n    a: A,\n}\n");
+    assert!(
+        mutual
+            .iter()
+            .any(|m| m.contains("contains itself by value")),
+        "{mutual:?}"
+    );
+}
+
+#[test]
+fn recursion_through_a_pointer_is_allowed() {
+    let errs = resolve_errors(
+        "Maybe :: enum(comptime T: type) {\n    Some(T),\n    None,\n}\n\nNode :: struct {\n    value: int32,\n    next: Maybe(@Node),\n}\n\nmain :: proc() -> int32 {\n    n := alloc Node{ value: 1 };\n    return n.value;\n}\n",
     );
     assert!(errs.is_empty(), "{errs:?}");
 }

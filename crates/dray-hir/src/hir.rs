@@ -240,6 +240,10 @@ pub enum ExprKind {
         ty: Ty,
         fields: Vec<(String, Expr)>,
     },
+    StructLit {
+        ty: Ty,
+        fields: Vec<(String, Expr)>,
+    },
     EnumInit {
         enum_name: String,
         variant: String,

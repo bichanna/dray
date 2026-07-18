@@ -183,14 +183,14 @@ fn e2e_prime_count() {
 #[test]
 fn struct_emits_definition_constructor_and_drop() {
     let out = c(
-        "Node :: struct {\n    value: int32,\n    next: @Node,\n}\n\nmain :: proc() -> int32 {\n    n := alloc Node{ value: 1 };\n    return n.value;\n}\n",
+        "Inner :: struct {\n    value: int32,\n}\n\nNode :: struct {\n    value: int32,\n    inner: @Inner,\n}\n\nmain :: proc() -> int32 {\n    i := alloc Inner{ value: 1 };\n    n := alloc Node{ value: 1, inner: i };\n    return n.value;\n}\n",
     );
     assert!(out.contains("struct Node;"), "forward decl: {out}");
     assert!(out.contains("Node *dray_new_Node("), "constructor: {out}");
-    // Node has an @Node field, so it needs drop glue that releases it.
+    // Node has an @Inner field, so it needs drop glue that releases it.
     assert!(out.contains("void dray_drop_Node"), "drop glue: {out}");
     assert!(
-        out.contains("dray_rc_release((*self).next)"),
+        out.contains("dray_rc_release((*self).inner)"),
         "field release: {out}"
     );
 }
@@ -248,12 +248,13 @@ main :: proc() -> int32 {\n\
 #[test]
 fn e2e_composite_lit_field_retains_source() {
     let src = "\
-Node :: struct { value: int32, next: @Node }\n\
+Inner :: struct { value: int32 }\n\
+Node :: struct { value: int32, inner: @Inner }\n\
 rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
 \n\
 build :: proc() {\n\
-    a := alloc Node{ value: 1 };\n\
-    b := alloc Node{ value: 2, next: a };\n\
+    a := alloc Inner{ value: 1 };\n\
+    b := alloc Node{ value: 2, inner: a };\n\
 }\n\
 \n\
 main :: proc() -> int32 {\n\
@@ -411,5 +412,83 @@ fn e2e_generic_proc_with_inference() {
                }\n";
     if let Some(code) = compile_and_run(&c(src)) {
         assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn struct_literal_lowers_to_a_compound_literal() {
+    let out = c("P :: struct { x: int32, y: int32 }\n\
+                 main :: proc() -> int32 { p := P{x: 1, y: 2}; return p.x; }\n");
+    assert!(out.contains("(struct P){"), "compound literal: {out}");
+    assert!(out.contains(".x=1"), "designated init: {out}");
+}
+
+#[test]
+fn omitted_fields_are_filled_with_zero_values() {
+    let out = c("P :: struct { x: int32, flag: bool }\n\
+                 main :: proc() -> int32 { p := P{x: 1}; return p.x; }\n");
+    // Every field is present in the emitted initializer, the omitted one zeroed.
+    assert!(out.contains(".flag=false"), "zeroed field: {out}");
+}
+
+#[test]
+fn e2e_stack_struct_literal_and_zero_values() {
+    let src = "P :: struct { x: int32, y: int32 }\n\
+               Outer :: struct { p: P, extra: int32 }\n\
+               main :: proc() -> int32 {\n\
+                   o: Outer = { p: { x: 40, y: 2 } };\n\
+                   return o.p.x + o.p.y + o.extra;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn e2e_by_value_generic_nesting() {
+    let src = "Box :: struct(comptime T: type) { value: T }\n\
+               main :: proc() -> int32 {\n\
+                   b := Box(Box(int32)){ value: Box(int32){ value: 42 } };\n\
+                   return b.value.value;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn e2e_omitted_maybe_field_defaults_to_none() {
+    let src = "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+               Node :: struct { value: int32, next: Maybe(@Node) }\n\
+               main :: proc() -> int32 {\n\
+                   n := alloc Node{ value: 42 };\n\
+                   switch n.next {\n\
+                   case Maybe.Some(x): return 0;\n\
+                   case Maybe.None: return n.value;\n\
+                   }\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn e2e_rc_local_stored_in_an_enum_payload_is_retained() {
+    let src = "Node :: struct { value: int32 }\n\
+               Maybe :: enum(comptime T: type) { Some(T), None }\n\
+               rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+               main :: proc() -> int32 {\n\
+                   m := Maybe(@Node).None;\n\
+                   if true {\n\
+                       a := alloc Node{ value: 7 };\n\
+                       m = Maybe(@Node).Some(a);\n\
+                   }\n\
+                   switch m {\n\
+                   case Maybe.Some(n): return cast(int32) rc_live();\n\
+                   case Maybe.None: return 0;\n\
+                   }\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 1, "the referenced node must still be alive");
     }
 }

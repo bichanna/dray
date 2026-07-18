@@ -1,46 +1,47 @@
-Box :: struct(comptime T: type) {
-    value: T,
-}
-
 Maybe :: enum(comptime T: type) {
     Some(T),
     None,
 }
 
-identity :: proc(comptime T: type, x: T) -> T {
-    return x;
+Point :: struct {
+    x: int32,
+    y: int32,
 }
 
-packed_size :: proc(comptime T: type, value: T) -> int32 {
-    static_assert(sizeof(T) == 4, "packed_size only supports 4-byte types");
-    return cast(int32) sizeof(T);
+Shape :: struct {
+    origin: Point,
+    label: int32,
+    visible: bool,
 }
 
-wrap :: proc(comptime T: type, v: T) -> Maybe(T) {
-    return Maybe(T).Some(v);
+Node :: struct {
+    value: int32,
+    next: Maybe(@Node),
 }
 
-boxed_value :: proc(comptime T: type, v: T) -> T {
-    b := alloc Box(T){ value: identity(v) };
-    return b.value;
+Box :: struct(comptime T: type) {
+    value: T,
 }
 
 main :: proc() -> int32 {
-    a := identity(30);            // T inferred as int32
-    b := identity(int32, 4);      // T given explicitly
-    c := packed_size(1);          // 4
-    d := boxed_value(2);          // 2
+    a := Point{ x: 10, y: 5 };
+    s: Shape = { origin: { x: 20, y: 5 }, label: 1 };
+    // omitted fields are zeroed recursively: `origin` becomes Point{x: 0, y: 0} 
+    t := Shape{ label: 2 };
+    b := Box(Box(int32)){ value: Box(int32){ value: 2 } };
 
-    total := a + b + c + d;       // 30 + 4 + 4 + 2 = 40
+    // `next` is omitted, so it takes `Maybe(@Node)`'s zero value: `.None` YAY :) finally no NULL
+    n := alloc Node{ value: 0 };
 
-    m := wrap(2);
-    switch m {
-    case Maybe.Some(v):
-        return total + v;         // 42
-    case Maybe.None:
+    total := a.x + a.y + s.origin.x + s.origin.y + t.origin.x + b.value.value;
+    if s.visible {
         return 0;
     }
 
-
-    // I'm so cool :)
+    switch n.next {
+    case Maybe.Some(x):
+        return 0;
+    case Maybe.None:
+        return total;   // 10 + 5 + 20 + 5 + 0 + 2 = 42
+    }
 }

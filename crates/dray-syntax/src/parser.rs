@@ -48,6 +48,7 @@ struct Parser<'a> {
     pos: usize,
     stack: Vec<Building>,
     errors: Vec<ParseError>,
+    no_struct_lit: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -55,6 +56,7 @@ impl<'a> Parser<'a> {
         Parser {
             src,
             tokens,
+            no_struct_lit: false,
             pos: 0,
             stack: Vec::new(),
             errors: Vec::new(),
@@ -599,7 +601,7 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::VarDecl);
         self.bump(); // name
         self.bump(); // :: | := | ::=
-        self.expr();
+        self.expr_or_bare_composite();
         if want_semi {
             self.expect(TokenKind::Semi, "';' after declaration");
         }
@@ -620,7 +622,7 @@ impl<'a> Parser<'a> {
                 "expected ':' , '=' , or ':=' after the type annotation",
             ),
         }
-        self.expr();
+        self.expr_or_bare_composite();
         if want_semi {
             self.expect(TokenKind::Semi, "';' after declaration");
         }
@@ -655,7 +657,9 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::SwitchStmt);
         self.expect(TokenKind::KwSwitch, "'switch'");
         if !self.at(TokenKind::LBrace) {
+            let saved = std::mem::replace(&mut self.no_struct_lit, true);
             self.expr();
+            self.no_struct_lit = saved;
         }
         self.expect(TokenKind::LBrace, "'{' to open the switch body");
         while self.at(TokenKind::KwCase) && !self.at_eof() {
@@ -801,7 +805,9 @@ impl<'a> Parser<'a> {
 
     fn condition(&mut self) {
         self.start(SyntaxKind::Condition);
+        let saved = std::mem::replace(&mut self.no_struct_lit, true);
         self.expr();
+        self.no_struct_lit = saved;
         self.finish_node();
     }
 
@@ -886,9 +892,22 @@ impl<'a> Parser<'a> {
     }
 
     /// `PrimaryExpr { Selector | Call | Index }`
+    fn expr_or_bare_composite(&mut self) {
+        if self.at(TokenKind::LBrace) {
+            self.start(SyntaxKind::CompositeLit);
+            self.composite_body();
+            self.finish_node();
+        } else {
+            self.expr();
+        }
+    }
+
     fn postfix_expr(&mut self) {
         let checkpoint = self.checkpoint();
+        let mut type_shaped = self.peek() == TokenKind::Ident;
+
         self.primary_expr();
+
         loop {
             match self.peek() {
                 TokenKind::Dot => {
@@ -896,6 +915,7 @@ impl<'a> Parser<'a> {
                     self.bump(); // .
                     self.expect(TokenKind::Ident, "a field or method name");
                     self.finish_node();
+                    type_shaped = false;
                 }
                 TokenKind::LParen => {
                     self.wrap_at(checkpoint, SyntaxKind::CallExpr);
@@ -905,9 +925,20 @@ impl<'a> Parser<'a> {
                 TokenKind::LBracket => {
                     self.wrap_at(checkpoint, SyntaxKind::IndexExpr);
                     self.bump(); // [
+                    let saved = std::mem::replace(&mut self.no_struct_lit, false);
                     self.expr();
+                    self.no_struct_lit = saved;
                     self.expect(TokenKind::RBracket, "']' after index");
                     self.finish_node();
+                    type_shaped = false;
+                }
+                // `Point{x: 1}` — a composite literal naming its type. Suppressed
+                // inside an `if`/`for` header, where `{` opens the body instead.
+                TokenKind::LBrace if type_shaped && !self.no_struct_lit => {
+                    self.wrap_at(checkpoint, SyntaxKind::CompositeLit);
+                    self.composite_body();
+                    self.finish_node();
+                    type_shaped = false;
                 }
                 _ => break,
             }
@@ -918,6 +949,8 @@ impl<'a> Parser<'a> {
     fn arg_list(&mut self) {
         self.start(SyntaxKind::ArgList);
         self.expect(TokenKind::LParen, "'('");
+
+        let saved = std::mem::replace(&mut self.no_struct_lit, false);
         while !self.at(TokenKind::RParen) && !self.at_eof() {
             if self.at(TokenKind::At) || self.at(TokenKind::LBracket) {
                 self.type_ref();
@@ -934,6 +967,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(TokenKind::RParen, "')'");
+        self.no_struct_lit = saved;
         self.finish_node();
     }
 
@@ -958,7 +992,9 @@ impl<'a> Parser<'a> {
             TokenKind::LParen => {
                 self.start(SyntaxKind::ParenExpr);
                 self.bump(); // (
+                let saved = std::mem::replace(&mut self.no_struct_lit, false);
                 self.expr();
+                self.no_struct_lit = saved;
                 self.expect(TokenKind::RParen, "')'");
                 self.finish_node();
             }
@@ -985,12 +1021,14 @@ impl<'a> Parser<'a> {
     /// literal, parsed into the currently-open `CompositeLit` node.
     fn composite_body(&mut self) {
         self.expect(TokenKind::LBrace, "'{' to open the composite literal");
+        let saved = std::mem::replace(&mut self.no_struct_lit, false);
         while !self.at(TokenKind::RBrace) && !self.at_eof() {
             self.element();
             if !self.eat(TokenKind::Comma) {
                 break;
             }
         }
+        self.no_struct_lit = saved;
         self.expect(TokenKind::RBrace, "'}' to close the composite literal");
     }
 
@@ -1001,7 +1039,8 @@ impl<'a> Parser<'a> {
             self.bump(); // field name
             self.bump(); // ':'
         }
-        self.expr();
+
+        self.expr_or_bare_composite();
         self.finish_node();
     }
 

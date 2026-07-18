@@ -178,8 +178,9 @@ impl Lowerer {
                 // If control falls off the end (no trailing return), release the
                 // proc's top-level @T locals here.
                 if !ends_in_return(&p.body) {
-                    let top = scopes.last().unwrap().clone();
-                    self.release(&top, &mut body);
+                    if let Some(top) = scopes.last().cloned() {
+                        self.release(&top, &mut body);
+                    }
                 }
                 Some(Item::Proc(Proc {
                     name: p.name.clone(),
@@ -209,7 +210,9 @@ impl Lowerer {
                     init: init.clone(),
                 });
                 if matches!(ty, Ty::Rc(_)) {
-                    scopes.last_mut().unwrap().push(name.clone());
+                    if let Some(scope) = scopes.last_mut() {
+                        scope.push(name.clone());
+                    }
                     if is_rc_borrow(init) {
                         // rule 2: a borrowed @T (Name, Field, …) → retain the
                         // new binding so the slot holds its own +1.
@@ -295,7 +298,8 @@ impl Lowerer {
         for s in stmts {
             self.stmt(s, scopes, &mut out);
         }
-        let scope = scopes.pop().unwrap();
+
+        let scope = scopes.pop().unwrap_or_default();
         if !ends_in_return(stmts) {
             self.release(&scope, &mut out);
         }
@@ -407,11 +411,19 @@ impl Lowerer {
                 self.uses_rc = true;
                 for (_, val) in fields {
                     self.emit_field_retains(val, out);
-                    if matches!(val.ty, Ty::Rc(_))
-                        && let ExprKind::Name { name, .. } = &val.kind
-                    {
-                        self.emit_retain(name.clone(), out);
-                    }
+                    self.retain_if_borrowed_rc(val, out);
+                }
+            }
+            ExprKind::StructLit { fields, .. } => {
+                for (_, val) in fields {
+                    self.emit_field_retains(val, out);
+                    self.retain_if_borrowed_rc(val, out);
+                }
+            }
+            ExprKind::EnumInit { args, .. } => {
+                for val in args {
+                    self.emit_field_retains(val, out);
+                    self.retain_if_borrowed_rc(val, out);
                 }
             }
             ExprKind::Call { callee, args } => {
@@ -433,6 +445,14 @@ impl Lowerer {
                 self.emit_field_retains(index, out);
             }
             _ => {}
+        }
+    }
+
+    fn retain_if_borrowed_rc(&mut self, val: &Expr, out: &mut Vec<Stmt>) {
+        if matches!(val.ty, Ty::Rc(_))
+            && let ExprKind::Name { name, .. } = &val.kind
+        {
+            self.emit_retain(name.clone(), out);
         }
     }
 

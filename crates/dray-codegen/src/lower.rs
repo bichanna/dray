@@ -328,6 +328,17 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
         }
         ExprKind::Cast { ty, operand } => T::new_cast(lower_ty(ty)?, lower_expr(ir, operand)?),
         ExprKind::SizeOf(ty) => T::new_sizeof(lower_ty(ty)?),
+        ExprKind::StructLit { ty, fields } => {
+            let mut names = Vec::with_capacity(fields.len());
+            let mut values = Vec::with_capacity(fields.len());
+
+            for (name, value) in fields {
+                names.push(name.clone());
+                values.push(lower_expr(ir, value)?);
+            }
+
+            T::new_compound_literal(lower_ty(ty)?, T::new_init_struct_designated(names, values))
+        }
         ExprKind::GenericCall { proc_name, .. } => {
             return Err(CodegenError::new(format!(
                 "internal: un-monomorphized call to generic proc `{proc_name}` reached codegen"
