@@ -176,6 +176,80 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
     })
 }
 
+fn block_uses_name(stmts: &[Stmt], name: &str) -> bool {
+    stmts.iter().any(|s| stmt_uses_name(s, name))
+}
+
+fn stmt_uses_name(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Let { init, .. } => expr_uses_name(init, name),
+        Stmt::Assign { target, value, .. } => {
+            expr_uses_name(target, name) || expr_uses_name(value, name)
+        }
+        Stmt::Return(Some(e)) | Stmt::Expr(e) => expr_uses_name(e, name),
+        Stmt::StaticAssert { cond, .. } => expr_uses_name(cond, name),
+        Stmt::DropValue { name: n, .. } => n == name,
+        Stmt::Retain(n) | Stmt::Release(n) | Stmt::Free(n) => n == name,
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue => false,
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_uses_name(cond, name)
+                || block_uses_name(then_branch, name)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|b| block_uses_name(b, name))
+        }
+        Stmt::While { cond, body } => expr_uses_name(cond, name) || block_uses_name(body, name),
+        Stmt::CFor {
+            init,
+            cond,
+            post,
+            body,
+        } => {
+            init.as_ref().is_some_and(|i| stmt_uses_name(i, name))
+                || cond.as_ref().is_some_and(|c| expr_uses_name(c, name))
+                || post.as_ref().is_some_and(|p| stmt_uses_name(p, name))
+                || block_uses_name(body, name)
+        }
+        Stmt::Loop { body } => block_uses_name(body, name),
+        Stmt::Switch { scrutinee, arms } => {
+            expr_uses_name(scrutinee, name) || arms.iter().any(|a| block_uses_name(&a.body, name))
+        }
+    }
+}
+
+fn expr_uses_name(e: &Expr, name: &str) -> bool {
+    match &e.kind {
+        ExprKind::Name { name: n, .. } => n == name,
+        ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => expr_uses_name(operand, name),
+        ExprKind::Binary { lhs, rhs, .. } => expr_uses_name(lhs, name) || expr_uses_name(rhs, name),
+        ExprKind::Call { callee, args } => {
+            expr_uses_name(callee, name) || args.iter().any(|a| expr_uses_name(a, name))
+        }
+        ExprKind::Field { recv, .. } => expr_uses_name(recv, name),
+        ExprKind::Index { base, index } => {
+            expr_uses_name(base, name) || expr_uses_name(index, name)
+        }
+        ExprKind::Cast { operand, .. } => expr_uses_name(operand, name),
+        ExprKind::Alloc { fields, .. } | ExprKind::StructLit { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_uses_name(v, name))
+        }
+        ExprKind::EnumInit { args, .. } | ExprKind::GenericCall { args, .. } => {
+            args.iter().any(|a| expr_uses_name(a, name))
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::Unresolved(_) => false,
+    }
+}
+
 fn lower_switch(
     ir: &Ir,
     scrutinee: &Expr,
@@ -197,6 +271,9 @@ fn lower_switch(
                 let concrete = enum_type_name(&scrutinee.ty, enum_name);
                 let payload = enum_payload(ir, concrete, variant);
                 for (i, bind) in bindings.iter().enumerate() {
+                    if !block_uses_name(&arm.body, bind) {
+                        continue;
+                    }
                     let ty = payload.get(i).cloned().unwrap_or(Ty::Infer);
                     let field =
                         T::new_mem_access(lower_expr(ir, scrutinee)?, payload_field(variant, i));
@@ -535,7 +612,27 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
         }
     }
 
-    // 3. Drop glue and constructors, with every type now fully defined.
+    // 3. Prototypes for every generated function, ahead of all definitions.
+    for sd in &ir.structs {
+        if has_rc_field(ir, sd) {
+            out.push(GlobalStatement::Function(drop_signature(&sd.name).build()));
+        }
+        out.push(GlobalStatement::Function(
+            constructor_signature(sd)?.build(),
+        ));
+    }
+    for ed in &ir.enums {
+        if enum_has_rc_payload(ir, ed) {
+            out.push(GlobalStatement::Function(drop_signature(&ed.name).build()));
+        }
+        for v in &ed.variants {
+            out.push(GlobalStatement::Function(
+                enum_ctor_signature(ed, v)?.build(),
+            ));
+        }
+    }
+
+    // 4. The definitions themselves.
     for sd in &ir.structs {
         if has_rc_field(ir, sd) {
             out.push(GlobalStatement::Function(drop_fn(ir, sd)?));
@@ -624,6 +721,15 @@ fn topo_visit<'a>(
 }
 
 /// `void dray_drop_T(void *p) { T *self = (T *)p; dray_rc_release(self->f); ... }`
+/// `void dray_drop_T(void *p)` — the shape every drop function shares.
+fn drop_signature(type_name: &str) -> FunctionBuilder {
+    FunctionBuilder::new_with_str(
+        &format!("dray_drop_{type_name}"),
+        Type::base(BaseType::Void),
+    )
+    .param(ParameterBuilder::new_with_str("p", Type::ptr(Type::base(BaseType::Void))).build())
+}
+
 fn drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
     let self_ty = Type::ptr(Type::base(BaseType::Struct(sd.name.clone())));
     let mut body = BlockBuilder::new();
@@ -655,13 +761,7 @@ fn drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
             _ => {}
         }
     }
-    Ok(FunctionBuilder::new_with_str(
-        &format!("dray_drop_{}", sd.name),
-        Type::base(BaseType::Void),
-    )
-    .param(ParameterBuilder::new_with_str("p", Type::ptr(Type::base(BaseType::Void))).build())
-    .body(body.build())
-    .build())
+    Ok(drop_signature(&sd.name).body(body.build()).build())
 }
 
 /// `T *dray_new_T(f0 t0, ...) { T *self = (T *)dray_rc_alloc(sizeof(T), drop);
@@ -698,11 +798,17 @@ fn constructor_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> 
         tamago::Expr::new_ident_with_str("self"),
     )));
 
+    Ok(constructor_signature(sd)?.body(body.build()).build())
+}
+
+/// `T *dray_new_T(f0 t0, ...)` — shared by the prototype and the definition.
+fn constructor_signature(sd: &dray_ir::StructDef) -> Result<FunctionBuilder> {
+    let self_ty = Type::ptr(Type::base(BaseType::Struct(sd.name.clone())));
     let mut fb = FunctionBuilder::new_with_str(&format!("dray_new_{}", sd.name), self_ty);
     for f in &sd.fields {
         fb = fb.param(ParameterBuilder::new_with_str(&f.name, lower_ty(&f.ty)?).build());
     }
-    Ok(fb.body(body.build()).build())
+    Ok(fb)
 }
 
 /// `(*base).field` — field access through a struct pointer.
@@ -833,15 +939,16 @@ fn enum_drop_fn(ir: &Ir, ed: &dray_ir::EnumDef) -> Result<tamago::Function> {
             case.build(),
         );
     }
+    // Variants with nothing to release contribute no case, so a `default` keeps
+    // the switch exhaustive as far as the C compiler is concerned (-Wswitch).
+    sw = sw.default(
+        BlockBuilder::new()
+            .statement(tamago::Statement::Break)
+            .build(),
+    );
     body = body.statement(tamago::Statement::Switch(sw.build()));
 
-    Ok(FunctionBuilder::new_with_str(
-        &format!("dray_drop_{}", ed.name),
-        Type::base(BaseType::Void),
-    )
-    .param(ParameterBuilder::new_with_str("p", Type::ptr(Type::base(BaseType::Void))).build())
-    .body(body.build())
-    .build())
+    Ok(drop_signature(&ed.name).body(body.build()).build())
 }
 
 fn enum_ctor(ed: &dray_ir::EnumDef, v: &dray_ir::Variant) -> Result<tamago::Function> {
@@ -870,9 +977,15 @@ fn enum_ctor(ed: &dray_ir::EnumDef, v: &dray_ir::Variant) -> Result<tamago::Func
         "self",
     ))));
 
+    Ok(enum_ctor_signature(ed, v)?.body(body.build()).build())
+}
+
+/// `E dray_new_E_V(f0 t0, ...)` — shared by the prototype and the definition.
+fn enum_ctor_signature(ed: &dray_ir::EnumDef, v: &dray_ir::Variant) -> Result<FunctionBuilder> {
+    let struct_ty = Type::base(BaseType::Struct(ed.name.clone()));
     let mut fb = FunctionBuilder::new_with_str(&enum_ctor_name(&ed.name, &v.name), struct_ty);
     for (i, ty) in v.payload.iter().enumerate() {
         fb = fb.param(ParameterBuilder::new_with_str(&format!("f{i}"), lower_ty(ty)?).build());
     }
-    Ok(fb.body(body.build()).build())
+    Ok(fb)
 }

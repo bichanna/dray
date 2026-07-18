@@ -140,15 +140,29 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
     let c_path = dir.join(format!("{stamp}.c"));
     let bin = dir.join(&stamp);
     std::fs::write(&c_path, c_src).unwrap();
+
+    // Generated C must compile without diagnostics: a warning here (an unhandled
+    // switch value, an unused local, an implicit declaration) is a codegen bug,
+    // so treat warnings as errors to catch that class automatically.
+    //
+    // `unused-parameter` is excluded deliberately: a Dray proc may legitimately
+    // ignore one of its parameters, and the parameter still has to appear in the
+    // C signature, so that diagnostic reflects the user's code rather than ours.
+    let compile = Command::new(&cc)
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-Werror")
+        .arg("-Wno-unused-parameter")
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+
     assert!(
-        Command::new(&cc)
-            .arg(&c_path)
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success(),
-        "cc failed:\n{c_src}"
+        compile.status.success(),
+        "cc failed:\n{}\n--- generated C ---\n{c_src}",
+        String::from_utf8_lossy(&compile.stderr)
     );
     let code = Command::new(&bin).status().unwrap().code().unwrap_or(-1);
     let _ = std::fs::remove_file(&c_path);
@@ -562,4 +576,69 @@ fn enum_with_an_rc_payload_gets_drop_glue() {
     );
 
     assert!(out.contains("switch ((*self).tag)"), "tag switch: {out}");
+}
+
+#[test]
+fn enum_drop_glue_handles_every_tag_value() {
+    let out = c("Node :: struct { value: int32 }\n\
+                 Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                 main :: proc() -> int32 {\n\
+                     a := alloc Node{ value: 1 };\n\
+                     m := Maybe(@Node).Some(a);\n\
+                     return 0;\n\
+                 }\n");
+    assert!(out.contains("void dray_drop_Maybe_rc_Node"), "{out}");
+    assert!(
+        out.contains("default:"),
+        "drop switch needs a default: {out}"
+    );
+}
+
+#[test]
+fn generated_functions_are_declared_before_use() {
+    let out = c("Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                 Node :: struct { value: int32, next: Maybe(@Node) }\n\
+                 main :: proc() -> int32 {\n\
+                     n := alloc Node{ value: 1 };\n\
+                     return n.value;\n\
+                 }\n");
+    let proto = out
+        .find("void dray_drop_Maybe_rc_Node(void *p);")
+        .expect("enum drop prototype");
+    let caller = out
+        .find("void dray_drop_Node(void *p) {")
+        .expect("struct drop definition");
+    assert!(proto < caller, "prototype must precede the caller: {out}");
+}
+
+#[test]
+fn an_unused_switch_binding_emits_no_local() {
+    let out = c("Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                 main :: proc() -> int32 {\n\
+                     m := Maybe(int32).Some(1);\n\
+                     switch m {\n\
+                     case Maybe.Some(x): return 7;\n\
+                     case Maybe.None: return 0;\n\
+                     }\n\
+                 }\n");
+    assert!(
+        !out.contains("int32_t x ="),
+        "unused binding materialized: {out}"
+    );
+}
+
+#[test]
+fn a_used_switch_binding_is_still_emitted() {
+    let out = c("Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                 main :: proc() -> int32 {\n\
+                     m := Maybe(int32).Some(1);\n\
+                     switch m {\n\
+                     case Maybe.Some(x): return x;\n\
+                     case Maybe.None: return 0;\n\
+                     }\n\
+                 }\n");
+    assert!(
+        out.contains("int32_t x ="),
+        "used binding must be bound: {out}"
+    );
 }
