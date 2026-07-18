@@ -136,6 +136,10 @@ pub enum Stmt {
     Break,
     Continue,
     Expr(Expr),
+    StaticAssert {
+        cond: Expr,
+        message: String,
+    },
     If {
         cond: Expr,
         then_branch: Vec<Stmt>,
@@ -240,6 +244,7 @@ pub enum ExprKind {
         variant: String,
         args: Vec<Expr>,
     },
+    SizeOf(Ty),
     Paren(Box<Expr>),
 }
 

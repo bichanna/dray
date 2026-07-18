@@ -27,6 +27,9 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
     scope = scope.global_statement(GlobalStatement::Include(
         IncludeBuilder::new_system_with_str("stdbool.h").build(),
     ));
+    scope = scope.global_statement(GlobalStatement::Include(
+        IncludeBuilder::new_system_with_str("stddef.h").build(),
+    ));
 
     if ir.uses_rc {
         scope = scope.new_line();
@@ -100,6 +103,10 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
         Stmt::Break => Statement::Break,
         Stmt::Continue => Statement::Continue,
         Stmt::Expr(e) => Statement::Expr(lower_expr(ir, e)?),
+        Stmt::StaticAssert { cond, message } => Statement::StaticAssert(tamago::StaticAssert::new(
+            lower_expr(ir, cond)?,
+            message.clone(),
+        )),
         Stmt::If {
             cond,
             then_branch,
@@ -305,6 +312,7 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             T::new_arr_index(lower_expr(ir, base)?, lower_expr(ir, index)?)
         }
         ExprKind::Cast { ty, operand } => T::new_cast(lower_ty(ty)?, lower_expr(ir, operand)?),
+        ExprKind::SizeOf(ty) => T::new_sizeof(lower_ty(ty)?),
         ExprKind::EnumInit {
             enum_name,
             variant,

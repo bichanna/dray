@@ -283,3 +283,54 @@ fn proc_call_arity_is_checked() {
         "{errs:?}"
     );
 }
+
+#[test]
+fn duplicate_declarations_are_errors() {
+    let field = resolve_errors("P :: struct {\n    x: int32,\n    x: bool,\n}\n");
+    assert!(
+        field.iter().any(|m| m.contains("duplicate field")),
+        "{field:?}"
+    );
+
+    let variant = resolve_errors("E :: enum {\n    A,\n    A,\n}\n");
+    assert!(
+        variant.iter().any(|m| m.contains("duplicate variant")),
+        "{variant:?}"
+    );
+
+    let param = resolve_errors("f :: proc(a: int32, a: int32) -> int32 {\n    return a;\n}\n");
+    assert!(
+        param.iter().any(|m| m.contains("duplicate parameter")),
+        "{param:?}"
+    );
+
+    let decl = resolve_errors(
+        "f :: proc() -> int32 {\n    return 1;\n}\n\nf :: proc() -> int32 {\n    return 2;\n}\n",
+    );
+    assert!(
+        decl.iter().any(|m| m.contains("declared more than once")),
+        "{decl:?}"
+    );
+}
+
+#[test]
+fn sizeof_and_static_assert_are_validated() {
+    let bad_sizeof = resolve_errors(
+        "main :: proc() -> int32 {\n    n := sizeof(int32, bool);\n    return 0;\n}\n",
+    );
+    assert!(
+        bad_sizeof
+            .iter()
+            .any(|m| m.contains("exactly 1 type argument")),
+        "{bad_sizeof:?}"
+    );
+
+    let bad_assert =
+        resolve_errors("main :: proc() -> int32 {\n    static_assert(true);\n    return 0;\n}\n");
+    assert!(
+        bad_assert
+            .iter()
+            .any(|m| m.contains("condition and a message")),
+        "{bad_assert:?}"
+    );
+}

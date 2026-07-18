@@ -1,23 +1,18 @@
-Node :: struct {
-    value: int32,
-    next: Maybe(@Node),
+P :: struct {
+    a: int32,
+    b: int32,
 }
 
-Maybe :: enum(comptime T: type) {
-    Some(T),
-    None,
+Box :: struct(comptime T: type) {
+    value: T,
 }
 
 main :: proc() -> int32 {
-    tail := alloc Node{ value: 2, next: Maybe(@Node).None };
-    head := alloc Node{ value: 40, next: Maybe(@Node).Some(tail, ) };
+    static_assert(sizeof(int32) == 4, "int32 must be 4 bytes");
+    static_assert(sizeof(P) == 8, "P must be two int32s");
 
-    total := head.value;
-    switch head.next {
-    case Maybe.Some(n):
-        total = total + n.value;   // n: @Node, auto-dereferenced
-    case Maybe.None:
-        total = total + 0;
-    }
-    return total;   // 40 + 2 = 42
+    static_assert(sizeof(Box(int32)) == 4, "Box(int32) wraps one int32");
+
+    total := sizeof(int32) + sizeof(P) + sizeof(Box(int32));
+    return cast(int32) total;   // 4 + 8 + 4 = 16
 }

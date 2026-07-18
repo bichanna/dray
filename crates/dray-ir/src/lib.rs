@@ -73,6 +73,10 @@ pub enum Stmt {
     Break,
     Continue,
     Expr(Expr),
+    StaticAssert {
+        cond: Expr,
+        message: String,
+    },
     If {
         cond: Expr,
         then_branch: Vec<Stmt>,
@@ -116,7 +120,7 @@ pub fn lower(hir: &Hir) -> Ir {
         temp: 0,
     };
     let items = hir.items.iter().filter_map(|it| lw.item(it)).collect();
-    let structs = hir
+    let structs: Vec<StructDef> = hir
         .items
         .iter()
         .filter_map(|it| match it {
@@ -132,12 +136,13 @@ pub fn lower(hir: &Hir) -> Ir {
             _ => None,
         })
         .collect();
+    let uses_rc = lw.uses_rc || !structs.is_empty();
     Ir {
         items,
         structs,
         enums,
         defs: lw.defs,
-        uses_rc: lw.uses_rc,
+        uses_rc,
     }
 }
 
@@ -222,6 +227,10 @@ impl Lowerer {
                 self.emit_field_retains(e, out);
                 out.push(Stmt::Expr(e.clone()));
             }
+            H::StaticAssert { cond, message } => out.push(Stmt::StaticAssert {
+                cond: cond.clone(),
+                message: message.clone(),
+            }),
             H::If {
                 cond,
                 then_branch,
@@ -395,6 +404,7 @@ impl Lowerer {
     fn emit_field_retains(&mut self, e: &Expr, out: &mut Vec<Stmt>) {
         match &e.kind {
             ExprKind::Alloc { fields, .. } => {
+                self.uses_rc = true;
                 for (_, val) in fields {
                     self.emit_field_retains(val, out);
                     if matches!(val.ty, Ty::Rc(_))

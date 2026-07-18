@@ -120,17 +120,21 @@ fn unresolved_name_never_reaches_valid_c() {
 
 fn compile_and_run(c_src: &str) -> Option<i32> {
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     if Command::new(&cc).arg("--version").output().is_err() {
         return None;
     }
+
+    // Tests run in parallel within one process, so the filename must be unique per
+    // call. a timestamp alone coud collide between threads, which would let one
+    // test run another's binary and read back the wrong exit code. A monotonic
+    // counter guarantees uniqueness :) Hehe I'm smart.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let stamp = format!(
         "dray_cg_{}_{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     let dir = std::env::temp_dir();
     let c_path = dir.join(format!("{stamp}.c"));
@@ -315,4 +319,40 @@ fn generic_enum_monomorphizes_to_concrete_c() {
         !out.contains("dray_new_Maybe_Some"),
         "template ctor leaked: {out}"
     );
+}
+
+#[test]
+fn sizeof_lowers_to_c_sizeof() {
+    let out = c("P :: struct { a: int32, b: int32 }\n\
+                 main :: proc() -> int32 { n := sizeof(P); return cast(int32) n; }\n");
+    assert!(out.contains("sizeof(struct P)"), "{out}");
+}
+
+#[test]
+fn sizeof_of_generic_uses_the_concrete_type() {
+    let out = c("Box :: struct(comptime T: type) { value: T }\n\
+                 main :: proc() -> int32 { n := sizeof(Box(int32)); return cast(int32) n; }\n");
+    assert!(out.contains("sizeof(struct Box_int32)"), "{out}");
+}
+
+#[test]
+fn static_assert_lowers_and_leaves_no_runtime_code() {
+    let out = c("main :: proc() -> int32 {\n\
+                     static_assert(sizeof(int32) == 4, \"int32 is 4 bytes\");\n\
+                     return 0;\n\
+                 }\n");
+    assert!(out.contains("_Static_assert("), "{out}");
+    assert!(out.contains("\"int32 is 4 bytes\""), "{out}");
+}
+
+#[test]
+fn e2e_sizeof_and_static_assert() {
+    let src = "P :: struct { a: int32, b: int32 }\n\
+               main :: proc() -> int32 {\n\
+                   static_assert(sizeof(P) == 8, \"P is two int32s\");\n\
+                   return cast(int32)(sizeof(int32) + sizeof(P));\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 12); // 4 + 8
+    }
 }

@@ -85,7 +85,7 @@ impl Lowerer {
                         self.proc_arity
                             .insert(name.clone(), runtime_param_count(decl));
                         let id = self.add_def(name.clone(), DefKind::Proc, ret);
-                        self.bind_module(name, id);
+                        self.bind_module(name, id, decl.span());
                     }
                 }
                 SyntaxKind::ExternProcDecl => {
@@ -95,7 +95,7 @@ impl Lowerer {
                         self.proc_arity
                             .insert(name.clone(), runtime_param_count(decl));
                         let id = self.add_def(name.clone(), DefKind::ExternProc { symbol }, ret);
-                        self.bind_module(name, id);
+                        self.bind_module(name, id, decl.span());
                     }
                 }
                 SyntaxKind::StructDef => {
@@ -103,7 +103,7 @@ impl Lowerer {
                         let fields = self.struct_fields(decl);
                         let id =
                             self.add_def(name.clone(), DefKind::Struct, Ty::Named(name.clone()));
-                        self.bind_module(name.clone(), id);
+                        self.bind_module(name.clone(), id, decl.span());
                         self.type_arity
                             .insert(name.clone(), comptime_type_params(decl).len());
                         self.structs.insert(name, fields);
@@ -113,7 +113,7 @@ impl Lowerer {
                     if let Some(name) = first_ident(decl) {
                         let variants = self.enum_variants(decl);
                         let id = self.add_def(name.clone(), DefKind::Enum, Ty::Named(name.clone()));
-                        self.bind_module(name.clone(), id);
+                        self.bind_module(name.clone(), id, decl.span());
                         let tps = comptime_type_params(decl);
                         self.type_arity.insert(name.clone(), tps.len());
                         self.enum_type_params.insert(name.clone(), tps);
@@ -158,7 +158,10 @@ impl Lowerer {
         id
     }
 
-    fn bind_module(&mut self, name: String, id: DefId) {
+    fn bind_module(&mut self, name: String, id: DefId, span: Span) {
+        if self.scopes[0].names.contains_key(&name) {
+            self.err(span, format!("`{name}` is declared more than once"));
+        }
         self.scopes[0].names.insert(name, id);
     }
 
@@ -268,6 +271,8 @@ impl Lowerer {
                 ty,
             });
         }
+        let names: Vec<String> = out.iter().map(|p| p.name.clone()).collect();
+        self.check_duplicates(names.iter().map(String::as_str), "parameter", list.span());
         out
     }
 
@@ -296,6 +301,11 @@ impl Lowerer {
             SyntaxKind::ContinueStmt => Some(Stmt::Continue),
             SyntaxKind::ExprStmt => {
                 let e = self.first_expr(node)?;
+                // `static_assert(cond, "msg")` is a compile-time builtin statement,
+                // not an ordinary call expression.
+                if let Some(st) = self.lower_static_assert(&e) {
+                    return Some(st);
+                }
                 Some(Stmt::Expr(self.lower_expr(&e)))
             }
             SyntaxKind::IfStmt => self.lower_if(node),
@@ -605,6 +615,13 @@ impl Lowerer {
             );
         }
 
+        if let Some(cn) = &callee_node
+            && cn.kind() == SyntaxKind::NameExpr
+            && ident_text(cn) == "sizeof"
+        {
+            return self.lower_sizeof(node);
+        }
+
         let callee = match callee_node {
             Some(c) => self.lower_expr(&c),
             None => return (ExprKind::Unresolved("call".into()), Ty::Infer),
@@ -716,6 +733,69 @@ impl Lowerer {
 
         self.enums.get(&enum_name)?;
         Some((enum_name, variant, type_args))
+    }
+
+    fn lower_static_assert(&mut self, e: &SyntaxNode) -> Option<Stmt> {
+        if e.kind() != SyntaxKind::CallExpr {
+            return None;
+        }
+        let callee = self.first_expr(e)?;
+        if callee.kind() != SyntaxKind::NameExpr || ident_text(&callee) != "static_assert" {
+            return None;
+        }
+        let args = self.call_args(e);
+        let [cond, message] = args.as_slice() else {
+            self.err(
+                e.span(),
+                format!(
+                    "`static_assert` takes a condition and a message, but {} argument(s) were given",
+                    args.len()
+                ),
+            );
+            return Some(Stmt::Expr(self.lower_expr(e)));
+        };
+        let ExprKind::Str(text) = &message.kind else {
+            self.err(
+                e.span(),
+                "`static_assert`'s second argument must be a string literal",
+            );
+            return Some(Stmt::Expr(self.lower_expr(e)));
+        };
+        Some(Stmt::StaticAssert {
+            cond: cond.clone(),
+            message: text.clone(),
+        })
+    }
+
+    fn lower_sizeof(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
+        let size_ty = Ty::Int {
+            bits: IntWidth::Size,
+            signed: false,
+        };
+        let args: Vec<SyntaxNode> = node
+            .child_of_kind(SyntaxKind::ArgList)
+            .map(|al| al.children())
+            .unwrap_or_default();
+        let [arg] = args.as_slice() else {
+            self.err(
+                node.span(),
+                format!(
+                    "`sizeof` takes exactly 1 type argument, but {} were given",
+                    args.len()
+                ),
+            );
+            return (ExprKind::Unresolved("sizeof".into()), size_ty);
+        };
+        match expr_as_type(arg) {
+            Some(ty) => {
+                self.check_type(&ty, &[], arg.span());
+                (ExprKind::SizeOf(ty), size_ty)
+            }
+            None => {
+                self.err(arg.span(), "`sizeof` expects a type argument");
+                (ExprKind::Unresolved("sizeof".into()), size_ty)
+            }
+        }
     }
 
     fn check_variant(&mut self, enum_name: &str, variant: &str, count: usize, span: Span) {
@@ -880,6 +960,22 @@ impl Lowerer {
         }
     }
 
+    fn check_duplicates<'n, I>(&mut self, names: I, what: &str, span: Span)
+    where
+        I: IntoIterator<Item = &'n str>,
+    {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut reported: Vec<String> = Vec::new();
+        for n in names {
+            if seen.contains(&n) && !reported.iter().any(|r| r == n) {
+                self.err(span, format!("duplicate {what} `{n}`"));
+                reported.push(n.to_string());
+            } else {
+                seen.push(n);
+            }
+        }
+    }
+
     fn lower_struct(&mut self, node: &SyntaxNode) {
         let name = match first_ident(node) {
             Some(n) => n,
@@ -889,6 +985,7 @@ impl Lowerer {
         let fields = self.structs.get(&name).cloned().unwrap_or_default();
         let type_params = comptime_type_params(node);
         self.validate_decl_types(node, &type_params);
+        self.check_duplicates(fields.iter().map(|f| f.name.as_str()), "field", node.span());
         for f in &fields {
             if type_params.contains(&f.name) {
                 self.err(
@@ -940,6 +1037,11 @@ impl Lowerer {
         let variants = self.enums.get(&name).cloned().unwrap_or_default();
         let type_params = comptime_type_params(node);
         self.validate_decl_types(node, &type_params);
+        self.check_duplicates(
+            variants.iter().map(|v| v.name.as_str()),
+            "variant",
+            node.span(),
+        );
 
         // A variant must not share a name with a comptime type parameter.
         for v in &variants {
@@ -971,6 +1073,17 @@ impl Lowerer {
             }
             arms.push(self.lower_case(&clause, &scrutinee.ty));
         }
+
+        let cases: Vec<String> = arms
+            .iter()
+            .filter_map(|a| match &a.pattern {
+                Pattern::Enum {
+                    enum_name, variant, ..
+                } => Some(format!("{enum_name}.{variant}")),
+                _ => None,
+            })
+            .collect();
+        self.check_duplicates(cases.iter().map(String::as_str), "case", node.span());
         Some(Stmt::Switch { scrutinee, arms })
     }
 
@@ -1451,10 +1564,10 @@ fn unquote(text: &str) -> String {
             Some('x') => {
                 let hi = chars.next();
                 let lo = chars.next();
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    if let Ok(byte) = u8::from_str_radix(&format!("{h}{l}"), 16) {
-                        out.push(byte as char);
-                    }
+                if let (Some(h), Some(l)) = (hi, lo)
+                    && let Ok(byte) = u8::from_str_radix(&format!("{h}{l}"), 16)
+                {
+                    out.push(byte as char);
                 }
             }
             // Unknown escape: keep it verbatim rather than dropping the backslash.

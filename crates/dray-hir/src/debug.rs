@@ -101,6 +101,9 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
         Stmt::Expr(e) => {
             let _ = writeln!(out, "{pad}{}", expr(e));
         }
+        Stmt::StaticAssert { cond, message } => {
+            let _ = writeln!(out, "{pad}static_assert({}, {message:?})", expr(cond));
+        }
         Stmt::If {
             cond,
             then_branch,
@@ -186,6 +189,7 @@ pub fn expr(e: &Expr) -> String {
         ExprKind::Bool(b) => b.to_string(),
         ExprKind::Name { def, name } => format!("{name}#{}", def.0),
         ExprKind::Unresolved(n) => format!("<unresolved {n}>"),
+        ExprKind::SizeOf(t) => format!("sizeof({})", ty(t)),
         ExprKind::Unary { op, operand } => format!("({}{})", un(*op), expr(operand)),
         ExprKind::Binary { op, lhs, rhs } => {
             format!("({} {} {})", expr(lhs), bin(*op), expr(rhs))

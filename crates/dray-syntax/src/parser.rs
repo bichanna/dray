@@ -434,6 +434,11 @@ impl<'a> Parser<'a> {
             if !self.eat(TokenKind::Comma) {
                 break;
             }
+            if self.at(TokenKind::RParen) {
+                let span = self.cur_span();
+                self.error_at(span, "expected a parameter after `,`");
+                break;
+            }
         }
         self.expect(TokenKind::RParen, "')'");
         self.finish_node();
@@ -920,6 +925,11 @@ impl<'a> Parser<'a> {
                 self.expr();
             }
             if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            if self.at(TokenKind::RParen) {
+                let span = self.cur_span();
+                self.error_at(span, "expected an argument after `,`");
                 break;
             }
         }

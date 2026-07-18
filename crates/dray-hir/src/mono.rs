@@ -296,6 +296,7 @@ fn each_ty_in_stmt(s: &mut Stmt, f: &mut impl FnMut(&mut Ty)) {
             each_ty_in_expr(value, f);
         }
         Stmt::Return(Some(e)) | Stmt::Expr(e) => each_ty_in_expr(e, f),
+        Stmt::StaticAssert { cond, .. } => each_ty_in_expr(cond, f),
         Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
         Stmt::If {
             cond,
@@ -349,6 +350,7 @@ fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
     f(&mut e.ty);
     match &mut e.kind {
         ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => each_ty_in_expr(operand, f),
+        ExprKind::SizeOf(ty) => f(ty),
         ExprKind::Binary { lhs, rhs, .. } => {
             each_ty_in_expr(lhs, f);
             each_ty_in_expr(rhs, f);

@@ -78,6 +78,10 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
         Stmt::Break => out.push_str(&format!("{pad}break\n")),
         Stmt::Continue => out.push_str(&format!("{pad}continue\n")),
         Stmt::Expr(e) => out.push_str(&format!("{pad}{}\n", expr_str(e))),
+        Stmt::StaticAssert { cond, message } => out.push_str(&format!(
+            "{pad}static_assert({}, {message:?})\n",
+            expr_str(cond)
+        )),
         Stmt::If {
             cond,
             then_branch,
