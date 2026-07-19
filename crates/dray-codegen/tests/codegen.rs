@@ -199,12 +199,17 @@ fn struct_emits_definition_constructor_and_drop() {
     let out = c(
         "Inner :: struct {\n    value: int32,\n}\n\nNode :: struct {\n    value: int32,\n    inner: @Inner,\n}\n\nmain :: proc() -> int32 {\n    i := alloc Inner{ value: 1 };\n    n := alloc Node{ value: 1, inner: i };\n    return n.value;\n}\n",
     );
-    assert!(out.contains("struct Node;"), "forward decl: {out}");
+
+    assert!(out.contains("struct Inner;"), "forward decl: {out}");
+    assert!(
+        !out.contains("struct Node;"),
+        "needless forward decl: {out}"
+    );
     assert!(out.contains("Node *dray_new_Node("), "constructor: {out}");
     // Node has an @Inner field, so it needs drop glue that releases it.
     assert!(out.contains("void dray_drop_Node"), "drop glue: {out}");
     assert!(
-        out.contains("dray_rc_release((*self).inner)"),
+        out.contains("dray_rc_release(self->inner)"),
         "field release: {out}"
     );
 }
@@ -228,7 +233,7 @@ fn field_access_through_pointer_uses_deref() {
     let out = c(
         "N :: struct {\n    v: int32,\n}\n\nmain :: proc() -> int32 {\n    n := alloc N{ v: 7 };\n    return n.v;\n}\n",
     );
-    assert!(out.contains("(*n).v"), "pointer field access: {out}");
+    assert!(out.contains("n->v"), "pointer field access: {out}");
 }
 
 #[test]
@@ -575,7 +580,7 @@ fn enum_with_an_rc_payload_gets_drop_glue() {
         "enum drop glue: {out}"
     );
 
-    assert!(out.contains("switch ((*self).tag)"), "tag switch: {out}");
+    assert!(out.contains("switch (self->tag)"), "tag switch: {out}");
 }
 
 #[test]
@@ -640,5 +645,51 @@ fn a_used_switch_binding_is_still_emitted() {
     assert!(
         out.contains("int32_t x ="),
         "used binding must be bound: {out}"
+    );
+}
+
+#[test]
+fn generated_c_has_no_duplicate_includes() {
+    let out = c("Node :: struct { value: int32 }\n\
+                 main :: proc() -> int32 { n := alloc Node{ value: 1 }; return n.value; }\n");
+    assert_eq!(out.matches("#include <stdint.h>").count(), 1, "{out}");
+    assert_eq!(out.matches("#include <stdlib.h>").count(), 1, "{out}");
+}
+
+#[test]
+fn main_gets_no_prototype() {
+    let out = c("main :: proc() -> int32 { return 0; }\n");
+    assert!(!out.contains("int32_t main(void);"), "{out}");
+    assert!(out.contains("int32_t main(void) {"), "{out}");
+}
+
+#[test]
+fn pointer_field_access_uses_the_arrow_operator() {
+    let out = c("Node :: struct { value: int32 }\n\
+                 main :: proc() -> int32 { n := alloc Node{ value: 1 }; return n.value; }\n");
+    assert!(out.contains("n->value"), "{out}");
+    assert!(!out.contains("(*n).value"), "{out}");
+}
+
+#[test]
+fn a_struct_without_rc_fields_passes_null_as_its_drop() {
+    let out = c("P :: struct { x: int32 }\n\
+                 main :: proc() -> int32 { p := alloc P{ x: 1 }; return p.x; }\n");
+    assert!(out.contains("sizeof(struct P), NULL"), "{out}");
+}
+
+#[test]
+fn only_pointed_to_aggregates_are_forward_declared() {
+    // A recursive type needs the stub; a standalone one does not.
+    let recursive = c("Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                       Node :: struct { value: int32, next: Maybe(@Node) }\n\
+                       main :: proc() -> int32 { n := alloc Node{ value: 1 }; return n.value; }\n");
+    assert!(recursive.contains("struct Node;"), "{recursive}");
+
+    let plain = c("P :: struct { x: int32 }\n\
+                   main :: proc() -> int32 { p := alloc P{ x: 1 }; return p.x; }\n");
+    assert!(
+        !plain.contains("struct P;"),
+        "needless forward decl: {plain}"
     );
 }

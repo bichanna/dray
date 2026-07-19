@@ -60,6 +60,10 @@ struct Lowerer {
     /// Each generic proc's declared runtime parameter types, still mentioning its
     /// type parameters — the patterns that argument types are matched against
     proc_param_types: HashMap<String, Vec<Ty>>,
+    /// Every proc's declared parameter types, for checking call arguments
+    proc_signatures: HashMap<String, Vec<Ty>>,
+    /// The declared return type of the proc being lowered, to check `return`.
+    current_ret: Ty,
     /// Struct names currently being zero-initialized, so a by-value cycle cannot
     /// drive `zero_aggregate` into unbounded recursion.
     zeroing: Vec<String>,
@@ -82,7 +86,9 @@ impl Lowerer {
             type_arity: HashMap::new(),
             proc_arity: HashMap::new(),
             proc_type_params: HashMap::new(),
+            proc_signatures: HashMap::new(),
             proc_param_types: HashMap::new(),
+            current_ret: Ty::Void,
             zeroing: Vec::new(),
             type_params_in_scope: Vec::new(),
         }
@@ -103,6 +109,8 @@ impl Lowerer {
                         let ret = self.return_type(decl);
                         self.proc_arity
                             .insert(name.clone(), runtime_param_count(decl));
+                        self.proc_signatures
+                            .insert(name.clone(), declared_param_types(decl));
                         let type_params = comptime_type_params(decl);
                         if !type_params.is_empty() {
                             self.proc_param_types
@@ -119,6 +127,8 @@ impl Lowerer {
                         let ret = self.return_type(decl);
                         self.proc_arity
                             .insert(name.clone(), runtime_param_count(decl));
+                        self.proc_signatures
+                            .insert(name.clone(), declared_param_types(decl));
                         let id = self.add_def(name.clone(), DefKind::ExternProc { symbol }, ret);
                         self.bind_module(name, id, decl.span());
                     }
@@ -227,6 +237,7 @@ impl Lowerer {
 
         self.push_scope();
         self.type_params_in_scope = type_params.clone();
+        self.current_ret = ret.clone();
         let params = self.lower_params(node);
         let body = match node.child_of_kind(SyntaxKind::Block) {
             Some(b) => self.lower_block(&b),
@@ -237,6 +248,7 @@ impl Lowerer {
         };
 
         self.type_params_in_scope.clear();
+        self.current_ret = Ty::Void;
         self.pop_scope();
 
         self.items.push(Item::Proc(Proc {
@@ -323,9 +335,7 @@ impl Lowerer {
         match node.kind() {
             SyntaxKind::VarDecl => self.lower_var_decl(node),
             SyntaxKind::AssignStmt => self.lower_assign(node),
-            SyntaxKind::ReturnStmt => Some(Stmt::Return(
-                self.first_expr(node).map(|e| self.lower_expr(&e)),
-            )),
+            SyntaxKind::ReturnStmt => self.lower_return(node),
             SyntaxKind::BreakStmt => Some(Stmt::Break),
             SyntaxKind::ContinueStmt => Some(Stmt::Continue),
             SyntaxKind::ExprStmt => {
@@ -357,6 +367,9 @@ impl Lowerer {
             .and_then(|t| self.checked_type(&t));
         let init_node = self.first_value_of(node)?;
         let init = self.lower_value(&init_node, declared.as_ref());
+        if let Some(d) = &declared {
+            self.check_assignable(d, &init, "this binding", init_node.span());
+        }
         let ty = declared.unwrap_or_else(|| default_ty(&init.ty));
         let id = self.add_def(name.clone(), DefKind::Local, ty.clone());
         self.bind_local(name.clone(), id);
@@ -368,6 +381,85 @@ impl Lowerer {
         })
     }
 
+    /// Check a call's arguments against the callee's declared parameter types.
+    /// Silently does nothing for a callee that isn't a known proc
+    fn check_call_args(&mut self, callee: &Expr, args: &[Expr], node: &SyntaxNode) {
+        let ExprKind::Name { name, .. } = &callee.kind else {
+            return;
+        };
+        let Some(params) = self.proc_signatures.get(name).cloned() else {
+            return;
+        };
+
+        let arg_nodes: Vec<SyntaxNode> = node
+            .child_of_kind(SyntaxKind::ArgList)
+            .map(|al| al.children())
+            .unwrap_or_default();
+
+        for (i, (param_ty, arg)) in params.iter().zip(args).enumerate() {
+            let span = arg_nodes.get(i).map_or_else(|| node.span(), |n| n.span());
+            self.check_assignable(
+                param_ty,
+                arg,
+                &format!("argument {} of `{name}`", i + 1),
+                span,
+            );
+        }
+    }
+
+    /// `return [expr];`
+    fn lower_return(&mut self, node: &SyntaxNode) -> Option<Stmt> {
+        let value = self
+            .first_expr(node)
+            .map(|e| (self.lower_expr(&e), e.span()));
+        let ret = self.current_ret.clone();
+        match &value {
+            Some((expr, span)) => {
+                if matches!(ret, Ty::Void) {
+                    self.err(
+                        *span,
+                        "this proc returns nothing, so `return` takes no value",
+                    );
+                } else {
+                    self.check_assignable(&ret, expr, "this `return`", *span);
+                }
+            }
+            None => {
+                if !matches!(ret, Ty::Void | Ty::Infer) {
+                    self.err(
+                        node.span(),
+                        format!(
+                            "this proc returns `{}`, so `return` needs a value",
+                            type_name(&ret)
+                        ),
+                    );
+                }
+            }
+        }
+        Some(Stmt::Return(value.map(|(e, _)| e)))
+    }
+
+    fn check_assign_target(&mut self, target: &Expr, span: Span) {
+        let describe = match &target.kind {
+            ExprKind::Name { def, name } => match self.defs.get(def.0 as usize).map(|d| &d.kind) {
+                Some(DefKind::Local | DefKind::Param) => return,
+                Some(DefKind::Proc | DefKind::ExternProc { .. }) => {
+                    format!("`{name}` is a proc")
+                }
+                Some(DefKind::Struct) => format!("`{name}` is a struct type"),
+                Some(DefKind::Enum) => format!("`{name}` is an enum type"),
+                None => return,
+            },
+            ExprKind::Field { .. } | ExprKind::Index { .. } => return,
+            ExprKind::Unary {
+                op: UnOp::Deref, ..
+            } => return,
+            ExprKind::Paren(inner) => return self.check_assign_target(inner, span),
+            _ => "this is not a place that can hold a value".to_string(),
+        };
+        self.err(span, format!("cannot assign to it: {describe}"));
+    }
+
     fn lower_assign(&mut self, node: &SyntaxNode) -> Option<Stmt> {
         let parts = self.expr_children(node);
         if parts.len() != 2 {
@@ -375,11 +467,11 @@ impl Lowerer {
             return None;
         }
         let op = assign_op(node)?;
-        Some(Stmt::Assign {
-            target: self.lower_expr(&parts[0]),
-            op,
-            value: self.lower_expr(&parts[1]),
-        })
+        let target = self.lower_expr(&parts[0]);
+        let value = self.lower_expr(&parts[1]);
+        self.check_assign_target(&target, parts[0].span());
+        self.check_assignable(&target.ty, &value, "this assignment", parts[1].span());
+        Some(Stmt::Assign { target, op, value })
     }
 
     fn lower_if(&mut self, node: &SyntaxNode) -> Option<Stmt> {
@@ -677,6 +769,7 @@ impl Lowerer {
                 ),
             );
         }
+        self.check_call_args(&callee, &args, node);
         let ty = callee.ty.clone();
         (
             ExprKind::Call {
@@ -877,6 +970,16 @@ impl Lowerer {
             }
         }
 
+        for ((param_ty, arg), arg_node) in param_types.iter().zip(&args).zip(value_nodes) {
+            let concrete = subst_type_params(param_ty, &type_params, &type_args);
+            self.check_assignable(
+                &concrete,
+                arg,
+                &format!("argument to `{proc_name}`"),
+                arg_node.span(),
+            );
+        }
+
         let ret = subst_type_params(&ret, &type_params, &type_args);
         (
             ExprKind::GenericCall {
@@ -1031,9 +1134,23 @@ impl Lowerer {
         }
     }
 
-    /// Report an error for any type reference that names an undeclared type uses
-    /// a generic type with the wrong number of arguments, or applies type
-    /// arguments to something that isn't generic.
+    fn check_assignable(&mut self, expected: &Ty, value: &Expr, what: &str, span: Span) {
+        if matches!(expected, Ty::Infer) || matches!(value.ty, Ty::Infer) {
+            return;
+        }
+        if expected == &value.ty || coerces_to(expected, value) {
+            return;
+        }
+        self.err(
+            span,
+            format!(
+                "{what} expects `{}`, but this is `{}`",
+                type_name(expected),
+                type_name(&value.ty)
+            ),
+        );
+    }
+
     fn check_type_in_scope(&mut self, ty: &Ty, span: Span) {
         let scoped = std::mem::take(&mut self.type_params_in_scope);
         self.check_type(ty, &scoped, span);
@@ -1514,6 +1631,14 @@ impl Lowerer {
                 continue;
             };
             let value = self.lower_value(&value_node, expected.as_ref());
+            if let Some(want) = &expected {
+                self.check_assignable(
+                    want,
+                    &value,
+                    &format!("field `{fname}` of `{struct_name}`"),
+                    value_node.span(),
+                );
+            }
             fields.push((fname, value));
         }
 
@@ -1757,7 +1882,72 @@ impl Lowerer {
 
 // ── free helpers ─────────────────────────────────────────────────────────────
 
-/// The int32 default for an inferred binding whose init type is unusable.
+fn coerces_to(expected: &Ty, value: &Expr) -> bool {
+    match expected {
+        Ty::Int { .. } => is_untyped_int_literal(value),
+        Ty::Float { .. } => is_untyped_float_literal(value),
+        _ => false,
+    }
+}
+
+/// An integer literal, seeing through parentheses and a leading sign
+fn is_untyped_int_literal(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) => true,
+        ExprKind::Paren(inner) => is_untyped_int_literal(inner),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            operand,
+        } => is_untyped_int_literal(operand),
+        _ => false,
+    }
+}
+
+fn is_untyped_float_literal(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Float(_) => true,
+        ExprKind::Paren(inner) => is_untyped_float_literal(inner),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            operand,
+        } => is_untyped_float_literal(operand),
+        _ => false,
+    }
+}
+
+/// A type as it is written in Dray source, for diagnostics
+fn type_name(ty: &Ty) -> String {
+    match ty {
+        Ty::Void => "void".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Int { bits, signed } => {
+            let prefix = if *signed { "int" } else { "uint" };
+            match bits {
+                IntWidth::Size => {
+                    if *signed {
+                        "isize".to_string()
+                    } else {
+                        "usize".to_string()
+                    }
+                }
+                IntWidth::W8 => format!("{prefix}8"),
+                IntWidth::W16 => format!("{prefix}16"),
+                IntWidth::W32 => format!("{prefix}32"),
+                IntWidth::W64 => format!("{prefix}64"),
+            }
+        }
+        Ty::Float { bits } => format!("float{bits}"),
+        Ty::Named(n) => n.clone(),
+        Ty::App(n, args) => {
+            let inner: Vec<String> = args.iter().map(type_name).collect();
+            format!("{n}({})", inner.join(", "))
+        }
+        Ty::Ptr(inner) => format!("*{}", type_name(inner)),
+        Ty::Rc(inner) => format!("@{}", type_name(inner)),
+        Ty::Infer => "?".to_string(),
+    }
+}
+
 fn default_ty(init_ty: &Ty) -> Ty {
     match init_ty {
         Ty::Infer | Ty::Void => Ty::i32(),

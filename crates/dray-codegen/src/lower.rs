@@ -32,6 +32,9 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
     ));
 
     if ir.uses_rc {
+        scope = scope.global_statement(GlobalStatement::Include(
+            IncludeBuilder::new_system_with_str("stdlib.h").build(),
+        ));
         scope = scope.new_line();
         scope = scope.global_statement(GlobalStatement::Raw(crate::RC_RUNTIME.to_string()));
     }
@@ -42,7 +45,9 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
     }
 
     for item in &ir.items {
-        if let Item::Proc(p) = item {
+        if let Item::Proc(p) = item
+            && p.name != "main"
+        {
             scope = scope.new_line();
             scope = scope.global_statement(GlobalStatement::Function(proc_prototype(p)?));
         }
@@ -409,12 +414,11 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
         }
         ExprKind::Field { recv, member } => {
             let base = lower_expr(ir, recv)?;
-            let base = if matches!(recv.ty, Ty::Rc(_) | Ty::Ptr(_)) {
-                T::new_parenthesized(T::new_unary(base, tamago::UnaryOp::Deref))
+            if matches!(recv.ty, Ty::Rc(_) | Ty::Ptr(_)) {
+                T::new_ptr_mem_access(base, member.clone())
             } else {
-                base
-            };
-            T::new_mem_access(base, member.clone())
+                T::new_mem_access(base, member.clone())
+            }
         }
         ExprKind::Index { base, index } => {
             T::new_arr_index(lower_expr(ir, base)?, lower_expr(ir, index)?)
@@ -576,13 +580,16 @@ fn assign_op(op: AssignOp) -> tamago::AssignOp {
 /// fields), and a constructor `dray_new_T`. Emitted ahead of the user's functions.
 pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
     let mut out = Vec::new();
+    let pointed_to = pointer_referenced_aggregates(ir);
 
     for sd in &ir.structs {
-        out.push(GlobalStatement::Struct(
-            StructBuilder::new_with_str(&sd.name)
-                .forward_declaration()
-                .build(),
-        ));
+        if pointed_to.contains(sd.name.as_str()) {
+            out.push(GlobalStatement::Struct(
+                StructBuilder::new_with_str(&sd.name)
+                    .forward_declaration()
+                    .build(),
+            ));
+        }
     }
     for ed in &ir.enums {
         let mut eb = EnumBuilder::new_with_str(&format!("{}_Tag", ed.name));
@@ -590,11 +597,13 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
             eb = eb.variant(VariantBuilder::new_with_str(&tag_const(&ed.name, &v.name)).build());
         }
         out.push(GlobalStatement::Enum(eb.build()));
-        out.push(GlobalStatement::Struct(
-            StructBuilder::new_with_str(&ed.name)
-                .forward_declaration()
-                .build(),
-        ));
+        if pointed_to.contains(ed.name.as_str()) {
+            out.push(GlobalStatement::Struct(
+                StructBuilder::new_with_str(&ed.name)
+                    .forward_declaration()
+                    .build(),
+            ));
+        }
     }
 
     // 2. Definitions in dependency order: a type embedded *by value* must be fully
@@ -652,6 +661,28 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
         }
     }
     Ok(out)
+}
+
+fn pointer_referenced_aggregates(ir: &Ir) -> HashSet<&str> {
+    fn note<'a>(ty: &'a Ty, out: &mut HashSet<&'a str>) {
+        if let Ty::Ptr(inner) | Ty::Rc(inner) = ty
+            && let Ty::Named(name) = &**inner
+        {
+            out.insert(name.as_str());
+        }
+    }
+    let mut out = HashSet::new();
+    for sd in &ir.structs {
+        for f in &sd.fields {
+            note(&f.ty, &mut out);
+        }
+    }
+    for ed in &ir.enums {
+        for ty in ed.variants.iter().flat_map(|v| v.payload.iter()) {
+            note(ty, &mut out);
+        }
+    }
+    out
 }
 
 /// `struct Name { fields };`
@@ -772,7 +803,7 @@ fn constructor_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> 
     let drop_arg = if has_rc_field(ir, sd) {
         tamago::Expr::new_ident(format!("dray_drop_{}", sd.name))
     } else {
-        tamago::Expr::Int(0)
+        tamago::Expr::new_null()
     };
     let alloc = tamago::Expr::new_cast(
         self_ty.clone(),
@@ -813,13 +844,7 @@ fn constructor_signature(sd: &dray_ir::StructDef) -> Result<FunctionBuilder> {
 
 /// `(*base).field` — field access through a struct pointer.
 fn self_field(base: &str, field: &str) -> tamago::Expr {
-    tamago::Expr::new_mem_access(
-        tamago::Expr::new_parenthesized(tamago::Expr::new_unary(
-            tamago::Expr::new_ident_with_str(base),
-            tamago::UnaryOp::Deref,
-        )),
-        field.to_string(),
-    )
+    tamago::Expr::new_ptr_mem_access(tamago::Expr::new_ident_with_str(base), field.to_string())
 }
 
 fn has_rc_field(ir: &Ir, sd: &dray_ir::StructDef) -> bool {

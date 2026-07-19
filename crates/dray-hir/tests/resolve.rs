@@ -491,3 +491,92 @@ fn a_switch_reports_all_missing_variants() {
     let msg = errs.join(" ");
     assert!(msg.contains("E.B") && msg.contains("E.C"), "{errs:?}");
 }
+
+#[test]
+fn a_value_must_match_the_type_of_its_location() {
+    let init =
+        resolve_errors("main :: proc() -> int32 {\n    x: int32 = true;\n    return x;\n}\n");
+    assert!(
+        init.iter().any(|m| m.contains("expects `int32`")),
+        "{init:?}"
+    );
+
+    let field = resolve_errors(
+        "P :: struct {\n    x: int32,\n}\n\nmain :: proc() -> int32 {\n    p := P{ x: true };\n    return p.x;\n}\n",
+    );
+    assert!(field.iter().any(|m| m.contains("field `x`")), "{field:?}");
+
+    let ret = resolve_errors("f :: proc() -> int32 {\n    return true;\n}\n");
+    assert!(ret.iter().any(|m| m.contains("`return`")), "{ret:?}");
+
+    let arg = resolve_errors(
+        "f :: proc(a: int32) -> int32 {\n    return a;\n}\n\nmain :: proc() -> int32 {\n    return f(true);\n}\n",
+    );
+    assert!(arg.iter().any(|m| m.contains("argument 1")), "{arg:?}");
+
+    let assign =
+        resolve_errors("main :: proc() -> int32 {\n    x := 1;\n    x = true;\n    return x;\n}\n");
+    assert!(
+        assign.iter().any(|m| m.contains("assignment")),
+        "{assign:?}"
+    );
+}
+
+#[test]
+fn an_untyped_literal_coerces_to_its_location() {
+    // §3.3: a literal takes the width of where it is stored, at no runtime cost.
+    let errs = resolve_errors(
+        "main :: proc() -> int32 {\n    a: int64 = 5;\n    b: uint8 = 42;\n    c: float32 = 1.5;\n    return 0;\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn widening_a_typed_value_needs_a_cast() {
+    // No implicit widening (§2.2) — unlike a literal, a typed value must be cast.
+    let errs = resolve_errors(
+        "f :: proc(a: int64) -> int64 {\n    return a;\n}\n\nmain :: proc() -> int32 {\n    x: int32 = 1;\n    return cast(int32) f(x);\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("expects `int64`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn return_value_presence_must_match_the_signature() {
+    let missing = resolve_errors("f :: proc() -> int32 {\n    return;\n}\n");
+    assert!(
+        missing.iter().any(|m| m.contains("needs a value")),
+        "{missing:?}"
+    );
+
+    let extra = resolve_errors("f :: proc() {\n    return 5;\n}\n");
+    assert!(
+        extra.iter().any(|m| m.contains("takes no value")),
+        "{extra:?}"
+    );
+}
+
+#[test]
+fn only_a_place_can_be_assigned_to() {
+    let proc_target = resolve_errors(
+        "f :: proc() -> int32 {\n    return 1;\n}\n\nmain :: proc() -> int32 {\n    f = 5;\n    return 0;\n}\n",
+    );
+    assert!(
+        proc_target
+            .iter()
+            .any(|m| m.contains("cannot assign to it")),
+        "{proc_target:?}"
+    );
+
+    let type_target = resolve_errors(
+        "P :: struct {\n    x: int32,\n}\n\nmain :: proc() -> int32 {\n    P = 5;\n    return 0;\n}\n",
+    );
+    assert!(
+        type_target
+            .iter()
+            .any(|m| m.contains("cannot assign to it")),
+        "{type_target:?}"
+    );
+}

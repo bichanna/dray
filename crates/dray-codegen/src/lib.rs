@@ -36,9 +36,6 @@ pub type Result<T> = std::result::Result<T, CodegenError>;
 /// `@T` value is an ordinary `T*` from C's point of view. `calloc`
 /// zero-initializes the payload, giving `alloc T` its zero value.
 pub(crate) const RC_RUNTIME: &str = "\
-#include <stdint.h>
-#include <stdlib.h>
-
 // Each allocation carries a drop function: for a struct with @T fields it releases
 // those fields (so freeing a node frees what it owns, recursively) and NULL otherwise.
 typedef void (*DrayDropFn)(void *);
