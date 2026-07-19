@@ -222,6 +222,12 @@ pub fn expr(e: &Expr) -> String {
                 format!("{enum_name}.{variant}({})", a.join(", "))
             }
         }
+        ExprKind::ArrayLit { ty: t, elements } => {
+            let es: Vec<String> = elements.iter().map(expr).collect();
+            format!("{}{{ {} }}", ty(t), es.join(", "))
+        }
+        ExprKind::ZeroValue(t) => format!("zero({})", ty(t)),
+        ExprKind::SliceAll { array } => format!("{}[:]", expr(array)),
         ExprKind::StructLit { ty: t, fields } => {
             let fs: Vec<String> = fields
                 .iter()
@@ -269,6 +275,8 @@ pub fn ty(t: &Ty) -> String {
         }
         Ty::Float { bits } => format!("float{bits}"),
         Ty::Ptr(inner) => format!("*{}", ty(inner)),
+        Ty::Array(elem, n) => format!("[{n}]{}", ty(elem)),
+        Ty::Slice(elem) => format!("[]{}", ty(elem)),
         Ty::Rc(inner) => format!("@{}", ty(inner)),
         Ty::Named(n) => n.clone(),
         Ty::App(n, args) => {

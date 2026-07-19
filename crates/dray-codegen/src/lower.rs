@@ -245,12 +245,15 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
         ExprKind::EnumInit { args, .. } | ExprKind::GenericCall { args, .. } => {
             args.iter().any(|a| expr_uses_name(a, name))
         }
+        ExprKind::ArrayLit { elements, .. } => elements.iter().any(|e| expr_uses_name(e, name)),
+        ExprKind::SliceAll { array } => expr_uses_name(array, name),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
         | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::SizeOf(_)
+        | ExprKind::ZeroValue(_)
         | ExprKind::Unresolved(_) => false,
     }
 }
@@ -421,10 +424,44 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             }
         }
         ExprKind::Index { base, index } => {
-            T::new_arr_index(lower_expr(ir, base)?, lower_expr(ir, index)?)
+            let indexable = match &base.ty {
+                Ty::Slice(_) => T::new_mem_access(lower_expr(ir, base)?, "ptr".to_string()),
+                _ => lower_expr(ir, base)?,
+            };
+            T::new_arr_index(indexable, lower_expr(ir, index)?)
         }
         ExprKind::Cast { ty, operand } => T::new_cast(lower_ty(ty)?, lower_expr(ir, operand)?),
         ExprKind::SizeOf(ty) => T::new_sizeof(lower_ty(ty)?),
+        ExprKind::ArrayLit { elements, .. } => {
+            let mut values = Vec::with_capacity(elements.len());
+            for e in elements {
+                values.push(lower_expr(ir, e)?);
+            }
+            T::new_init_struct_in_order(values)
+        }
+        ExprKind::ZeroValue(ty) => match ty {
+            Ty::Bool => T::Bool(false),
+            Ty::Float { .. } => T::Double(0.0),
+            Ty::Int { .. } | Ty::Ptr(_) | Ty::Rc(_) => T::Int(0),
+            _ => T::new_init_struct_in_order(vec![T::Int(0)]),
+        },
+        ExprKind::SliceAll { array } => {
+            let Ty::Array(elem, n) = &array.ty else {
+                // Already a slice: slicing the whole of it is the identity.
+                return lower_expr(ir, array);
+            };
+            let base = lower_expr(ir, array)?;
+            T::new_compound_literal(
+                Type::base(BaseType::Struct(slice_struct_name(elem))),
+                T::new_init_struct_designated(
+                    vec!["len".to_string(), "ptr".to_string()],
+                    vec![
+                        T::Int(*n as i64),
+                        T::new_unary(T::new_arr_index(base, T::Int(0)), tamago::UnaryOp::AddrOf),
+                    ],
+                ),
+            )
+        }
         ExprKind::StructLit { ty, fields } => {
             let mut names = Vec::with_capacity(fields.len());
             let mut values = Vec::with_capacity(fields.len());
@@ -499,6 +536,8 @@ fn lower_ty(t: &Ty) -> Result<Type> {
         // Both raw and RC pointers are a C `T*`; the RC bookkeeping is separate.
         Ty::Ptr(inner) | Ty::Rc(inner) => Type::ptr(lower_ty(inner)?),
         Ty::Named(n) => Type::base(B::Struct(n.clone())),
+        Ty::Array(elem, n) => Type::array(lower_ty(elem)?, Some(tamago::Expr::Int(*n as i64))),
+        Ty::Slice(elem) => Type::base(B::Struct(slice_struct_name(elem))),
         Ty::App(name, _) => {
             return Err(CodegenError::new(format!(
                 "internal: un-monomorphized generic `{name}` reached codegen"
@@ -580,6 +619,11 @@ fn assign_op(op: AssignOp) -> tamago::AssignOp {
 /// fields), and a constructor `dray_new_T`. Emitted ahead of the user's functions.
 pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
     let mut out = Vec::new();
+
+    for elem in slice_element_types(ir) {
+        out.push(GlobalStatement::Struct(slice_struct(&elem)?));
+    }
+
     let pointed_to = pointer_referenced_aggregates(ir);
 
     for sd in &ir.structs {
@@ -661,6 +705,110 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
         }
     }
     Ok(out)
+}
+
+/// `struct DraySlice_T { int32_t len; T *ptr; }` the fat pointer behind `[]T`
+fn slice_struct(elem: &Ty) -> Result<tamago::Struct> {
+    Ok(StructBuilder::new_with_str(&slice_struct_name(elem))
+        .field(FieldBuilder::new_with_str("len", Type::base(BaseType::Int32)).build())
+        .field(FieldBuilder::new_with_str("ptr", Type::ptr(lower_ty(elem)?)).build())
+        .define()
+        .build())
+}
+
+fn slice_element_types(ir: &Ir) -> Vec<Ty> {
+    let mut found: Vec<Ty> = Vec::new();
+    let mut note = |ty: &Ty| {
+        if let Ty::Slice(elem) = ty
+            && !found.contains(elem)
+        {
+            found.push((**elem).clone());
+        }
+    };
+    for sd in &ir.structs {
+        for f in &sd.fields {
+            note(&f.ty);
+        }
+    }
+    for ed in &ir.enums {
+        for ty in ed.variants.iter().flat_map(|v| v.payload.iter()) {
+            note(ty);
+        }
+    }
+    for item in &ir.items {
+        if let Item::Proc(p) = item {
+            note(&p.ret);
+            for param in &p.params {
+                note(&param.ty);
+            }
+            walk_stmt_types(&p.body, &mut note);
+        }
+    }
+    found
+}
+
+fn walk_stmt_types(stmts: &[Stmt], note: &mut impl FnMut(&Ty)) {
+    for s in stmts {
+        match s {
+            Stmt::Let { ty, init, .. } => {
+                note(ty);
+                note(&init.ty);
+            }
+            Stmt::Assign { target, value, .. } => {
+                note(&target.ty);
+                note(&value.ty);
+            }
+            Stmt::Return(Some(e)) | Stmt::Expr(e) => note(&e.ty),
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                walk_stmt_types(then_branch, note);
+                if let Some(b) = else_branch {
+                    walk_stmt_types(b, note);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Loop { body } => walk_stmt_types(body, note),
+            Stmt::CFor { body, .. } => walk_stmt_types(body, note),
+            Stmt::Switch { arms, .. } => {
+                for a in arms {
+                    walk_stmt_types(&a.body, note);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn slice_struct_name(elem: &Ty) -> String {
+    format!("DraySlice_{}", mangle_c_ty(elem))
+}
+
+fn mangle_c_ty(ty: &Ty) -> String {
+    match ty {
+        Ty::Void => "void".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Int { bits, signed } => format!(
+            "{}{}",
+            if *signed { "int" } else { "uint" },
+            match bits {
+                IntWidth::W8 => "8",
+                IntWidth::W16 => "16",
+                IntWidth::W32 => "32",
+                IntWidth::W64 => "64",
+                IntWidth::Size => "size",
+            }
+        ),
+        Ty::Float { bits } => format!("float{bits}"),
+        Ty::Named(n) => n.clone(),
+        Ty::Ptr(inner) => format!("ptr_{}", mangle_c_ty(inner)),
+        Ty::Rc(inner) => format!("rc_{}", mangle_c_ty(inner)),
+        Ty::Array(elem, n) => format!("arr{n}_{}", mangle_c_ty(elem)),
+        Ty::Slice(elem) => format!("slice_{}", mangle_c_ty(elem)),
+        // Generics are gone by codegen and `Infer` never reaches a real type.
+        Ty::App(..) | Ty::Infer => "unknown".to_string(),
+    }
 }
 
 fn pointer_referenced_aggregates(ir: &Ir) -> HashSet<&str> {

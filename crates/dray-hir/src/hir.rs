@@ -244,6 +244,14 @@ pub enum ExprKind {
         ty: Ty,
         fields: Vec<(String, Expr)>,
     },
+    ArrayLit {
+        ty: Ty,
+        elements: Vec<Expr>,
+    },
+    ZeroValue(Ty),
+    SliceAll {
+        array: Box<Expr>,
+    },
     EnumInit {
         enum_name: String,
         variant: String,
@@ -342,6 +350,8 @@ pub enum Ty {
     },
     Ptr(Box<Ty>),
     Rc(Box<Ty>),
+    Array(Box<Ty>, u64),
+    Slice(Box<Ty>),
     Named(String),
     App(String, Vec<Ty>),
     Infer,

@@ -923,11 +923,22 @@ impl<'a> Parser<'a> {
                     self.finish_node();
                 }
                 TokenKind::LBracket => {
-                    self.wrap_at(checkpoint, SyntaxKind::IndexExpr);
+                    // `xs[:]` takes a slice of the whole array, `xs[i]` indexes it
+                    let slicing = self.peek_nth(1) == TokenKind::Colon;
+                    let kind = if slicing {
+                        SyntaxKind::SliceExpr
+                    } else {
+                        SyntaxKind::IndexExpr
+                    };
+                    self.wrap_at(checkpoint, kind);
                     self.bump(); // [
-                    let saved = std::mem::replace(&mut self.no_struct_lit, false);
-                    self.expr();
-                    self.no_struct_lit = saved;
+                    if slicing {
+                        self.bump(); // :
+                    } else {
+                        let saved = std::mem::replace(&mut self.no_struct_lit, false);
+                        self.expr();
+                        self.no_struct_lit = saved;
+                    }
                     self.expect(TokenKind::RBracket, "']' after index");
                     self.finish_node();
                     type_shaped = false;

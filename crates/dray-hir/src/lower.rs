@@ -474,6 +474,18 @@ impl Lowerer {
         Some(Stmt::Assign { target, op, value })
     }
 
+    fn expect_bool(&mut self, value: &Expr, what: &str, span: Span) {
+        if !matches!(value.ty, Ty::Bool | Ty::Infer) {
+            self.err(
+                span,
+                format!(
+                    "{what} needs a `bool`, but this is `{}`",
+                    type_name(&value.ty)
+                ),
+            );
+        }
+    }
+
     fn lower_if(&mut self, node: &SyntaxNode) -> Option<Stmt> {
         if node.child_of_kind(SyntaxKind::VarDecl).is_some() {
             self.err(node.span(), "if-init clauses are not lowered yet");
@@ -599,6 +611,7 @@ impl Lowerer {
             SyntaxKind::CallExpr => self.lower_call(node),
             SyntaxKind::FieldExpr => self.lower_field(node),
             SyntaxKind::IndexExpr => self.lower_index(node),
+            SyntaxKind::SliceExpr => self.lower_slice_expr(node),
             SyntaxKind::CastExpr => self.lower_cast(node),
             SyntaxKind::AllocExpr => self.lower_alloc(node),
             SyntaxKind::CompositeLit => self.lower_struct_lit(node, None),
@@ -671,11 +684,24 @@ impl Lowerer {
         match (op, operand) {
             (Some(op), Some(operand)) => {
                 let ty = match op {
-                    UnOp::LogicNot => Ty::Bool,
+                    UnOp::LogicNot => {
+                        self.expect_bool(&operand, "`!`", node.span());
+                        Ty::Bool
+                    }
                     UnOp::AddrOf => Ty::Ptr(Box::new(operand.ty.clone())),
                     UnOp::Deref => match &operand.ty {
                         Ty::Ptr(inner) | Ty::Rc(inner) => (**inner).clone(),
-                        _ => Ty::Infer,
+                        Ty::Infer => Ty::Infer,
+                        other => {
+                            self.err(
+                                node.span(),
+                                format!(
+                                    "only a pointer can be dereferenced, not `{}`",
+                                    type_name(other)
+                                ),
+                            );
+                            Ty::Infer
+                        }
                     },
                     UnOp::Neg | UnOp::BitNot => operand.ty.clone(),
                 };
@@ -691,6 +717,14 @@ impl Lowerer {
         }
     }
 
+    /// `&&` and `||` take and produce `bool`
+    fn check_logical_operands(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        if matches!(op, BinOp::And | BinOp::Or) {
+            self.expect_bool(lhs, "this operator", span);
+            self.expect_bool(rhs, "this operator", span);
+        }
+    }
+
     fn lower_binary(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         let parts = self.expr_children(node);
         if parts.len() != 2 {
@@ -702,6 +736,7 @@ impl Lowerer {
         };
         let lhs = self.lower_expr(&parts[0]);
         let rhs = self.lower_expr(&parts[1]);
+        self.check_logical_operands(op, &lhs, &rhs, node.span());
         let ty = if op.is_boolean() {
             Ty::Bool
         } else {
@@ -813,6 +848,29 @@ impl Lowerer {
             .token_of_kind(SyntaxKind::Ident)
             .map(|t| t.text().to_string())
             .unwrap_or_default();
+        if let Ty::Slice(elem) = &recv.ty {
+            let ty = match member.as_str() {
+                "len" => Ty::Int {
+                    bits: IntWidth::W32,
+                    signed: true,
+                },
+                "ptr" => Ty::Ptr(elem.clone()),
+                _ => {
+                    self.err(
+                        node.span(),
+                        format!("a slice has only `len` and `ptr`, not `{member}`"),
+                    );
+                    Ty::Infer
+                }
+            };
+            return (
+                ExprKind::Field {
+                    recv: Box::new(recv),
+                    member,
+                },
+                ty,
+            );
+        }
         let ty = match struct_name_of(&recv.ty) {
             Some(sname) => match self.structs.get(&sname) {
                 Some(fields) => match fields.iter().find(|f| f.name == member) {
@@ -1051,6 +1109,37 @@ impl Lowerer {
         arg_list.children().iter().map(expr_as_type).collect()
     }
 
+    /// `xs[:]` a slice over the whole of an array, which is how a `[]T` value
+    /// comes into existence. The slice borrows; it does not own the elements.
+    fn lower_slice_expr(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
+        let Some(array_node) = self.first_expr(node) else {
+            return (ExprKind::Unresolved("slice".into()), Ty::Infer);
+        };
+        let array = self.lower_expr(&array_node);
+        let ty = match &array.ty {
+            Ty::Array(elem, _) => Ty::Slice(elem.clone()),
+            // Already a slice: `xs[:]` is then just `xs`.
+            Ty::Slice(elem) => Ty::Slice(elem.clone()),
+            Ty::Infer => Ty::Infer,
+            other => {
+                self.err(
+                    node.span(),
+                    format!(
+                        "only an array or slice can be sliced, not `{}`",
+                        type_name(other)
+                    ),
+                );
+                Ty::Infer
+            }
+        };
+        (
+            ExprKind::SliceAll {
+                array: Box::new(array),
+            },
+            ty,
+        )
+    }
+
     fn lower_index(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         let parts = self.expr_children(node);
         if parts.len() != 2 {
@@ -1058,9 +1147,27 @@ impl Lowerer {
         }
         let base = self.lower_expr(&parts[0]);
         let index = self.lower_expr(&parts[1]);
+        // Index has to be a number, anything else is a mistake
+        if !matches!(index.ty, Ty::Int { .. } | Ty::Infer) {
+            self.err(
+                parts[1].span(),
+                format!(
+                    "an index must be an integer, but this is `{}`",
+                    type_name(&index.ty)
+                ),
+            );
+        }
         let ty = match &base.ty {
-            Ty::Ptr(inner) => (**inner).clone(),
-            _ => Ty::Infer,
+            // A raw pointer, an array, and a slice all index to their element.
+            Ty::Ptr(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => (**inner).clone(),
+            Ty::Infer => Ty::Infer,
+            other => {
+                self.err(
+                    node.span(),
+                    format!("`{}` cannot be indexed", type_name(other)),
+                );
+                Ty::Infer
+            }
         };
         (
             ExprKind::Index {
@@ -1199,7 +1306,9 @@ impl Lowerer {
                     self.check_type(a, type_params, span);
                 }
             }
-            Ty::Ptr(inner) | Ty::Rc(inner) => self.check_type(inner, type_params, span),
+            Ty::Ptr(inner) | Ty::Rc(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => {
+                self.check_type(inner, type_params, span)
+            }
             Ty::Void | Ty::Bool | Ty::Int { .. } | Ty::Float { .. } | Ty::Infer => {}
         }
     }
@@ -1535,13 +1644,20 @@ impl Lowerer {
     /// then each `field: value` element (checking the field exists).
     fn lower_composite_alloc(&mut self, lit: &SyntaxNode) -> (ExprKind, Ty) {
         match self.lower_composite(lit, None) {
-            Some((ty, fields)) => (
+            Some(Composite::Struct { ty, fields }) => (
                 ExprKind::Alloc {
                     ty: ty.clone(),
                     fields,
                 },
                 Ty::Rc(Box::new(ty)),
             ),
+            Some(Composite::Array { ty, .. }) => {
+                self.err(
+                    lit.span(),
+                    format!("`alloc {}` is not supported yet", type_name(&ty)),
+                );
+                (ExprKind::Unresolved("composite".into()), Ty::Infer)
+            }
             None => (ExprKind::Unresolved("composite".into()), Ty::Infer),
         }
     }
@@ -1549,10 +1665,17 @@ impl Lowerer {
     /// `T{ ... }` or a bare `{ ... }` a by value struct literal.
     fn lower_struct_lit(&mut self, lit: &SyntaxNode, target: Option<&Ty>) -> (ExprKind, Ty) {
         match self.lower_composite(lit, target) {
-            Some((ty, fields)) => (
+            Some(Composite::Struct { ty, fields }) => (
                 ExprKind::StructLit {
                     ty: ty.clone(),
                     fields,
+                },
+                ty,
+            ),
+            Some(Composite::Array { ty, elements }) => (
+                ExprKind::ArrayLit {
+                    ty: ty.clone(),
+                    elements,
                 },
                 ty,
             ),
@@ -1560,11 +1683,43 @@ impl Lowerer {
         }
     }
 
-    fn lower_composite(
-        &mut self,
-        lit: &SyntaxNode,
-        target: Option<&Ty>,
-    ) -> Option<(Ty, Vec<(String, Expr)>)> {
+    fn array_elements(&mut self, lit: &SyntaxNode, elem: &Ty, len: u64) -> Vec<Expr> {
+        let mut out: Vec<Expr> = Vec::new();
+        for el in lit.children() {
+            if el.kind() != SyntaxKind::Element {
+                continue;
+            }
+            if el.token_of_kind(SyntaxKind::Ident).is_some() && self.first_value(&el).is_some() {
+                self.err(el.span(), "array elements are positional, not named");
+            }
+            let Some(value_node) = self.first_value(&el) else {
+                continue;
+            };
+            let value = self.lower_value(&value_node, Some(elem));
+            self.check_assignable(elem, &value, "this array element", value_node.span());
+            out.push(value);
+        }
+        if out.len() as u64 > len {
+            self.err(
+                lit.span(),
+                format!(
+                    "this array holds {len} element(s), but {} were given",
+                    out.len()
+                ),
+            );
+            out.truncate(len as usize);
+        }
+        while (out.len() as u64) < len {
+            out.push(Expr {
+                kind: ExprKind::ZeroValue(elem.clone()),
+                ty: elem.clone(),
+                span: lit.span(),
+            });
+        }
+        out
+    }
+
+    fn lower_composite(&mut self, lit: &SyntaxNode, target: Option<&Ty>) -> Option<Composite> {
         let ty = match self.composite_type(lit) {
             Some(t) => t,
             // A bare literal takes the type known from context.
@@ -1580,10 +1735,20 @@ impl Lowerer {
             },
         };
 
+        if let Ty::Array(elem, len) = &ty {
+            let elements = self.array_elements(lit, elem, *len);
+            return Some(Composite::Array {
+                ty: ty.clone(),
+                elements,
+            });
+        }
         let struct_name = match &ty {
             Ty::Named(n) | Ty::App(n, _) => n.clone(),
             _ => {
-                self.err(lit.span(), "only structs can be built with `{ ... }`");
+                self.err(
+                    lit.span(),
+                    format!("`{}` cannot be built with `{{ ... }}`", type_name(&ty)),
+                );
                 return None;
             }
         };
@@ -1658,7 +1823,7 @@ impl Lowerer {
                 .position(|f| &f.name == n)
                 .unwrap_or(usize::MAX)
         });
-        Some((ty, fields))
+        Some(Composite::Struct { ty, fields })
     }
 
     fn composite_type(&mut self, lit: &SyntaxNode) -> Option<Ty> {
@@ -1717,6 +1882,7 @@ impl Lowerer {
             Ty::Named(n) | Ty::App(n, _) => {
                 return self.zero_aggregate(ty, n, span, struct_name, field);
             }
+            Ty::Array(..) | Ty::Slice(_) => ExprKind::ZeroValue(ty.clone()),
             Ty::Void | Ty::Infer => {
                 self.err(
                     span,
@@ -1831,7 +1997,9 @@ impl Lowerer {
     fn condition(&mut self, node: &SyntaxNode) -> Option<Expr> {
         let cond = node.child_of_kind(SyntaxKind::Condition)?;
         let e = self.first_expr(&cond)?;
-        Some(self.lower_expr(&e))
+        let lowered = self.lower_expr(&e);
+        self.expect_bool(&lowered, "a condition", e.span());
+        Some(lowered)
     }
 
     fn return_type(&mut self, node: &SyntaxNode) -> Ty {
@@ -1943,6 +2111,8 @@ fn type_name(ty: &Ty) -> String {
             format!("{n}({})", inner.join(", "))
         }
         Ty::Ptr(inner) => format!("*{}", type_name(inner)),
+        Ty::Array(elem, n) => format!("[{n}]{}", type_name(elem)),
+        Ty::Slice(elem) => format!("[]{}", type_name(elem)),
         Ty::Rc(inner) => format!("@{}", type_name(inner)),
         Ty::Infer => "?".to_string(),
     }
@@ -1966,6 +2136,7 @@ fn is_expr(kind: SyntaxKind) -> bool {
             | SyntaxKind::CallExpr
             | SyntaxKind::FieldExpr
             | SyntaxKind::IndexExpr
+            | SyntaxKind::SliceExpr
             | SyntaxKind::CastExpr
             | SyntaxKind::AllocExpr
             | SyntaxKind::CompositeLit
@@ -1975,6 +2146,11 @@ fn is_expr(kind: SyntaxKind) -> bool {
 fn first_ident(node: &SyntaxNode) -> Option<String> {
     node.token_of_kind(SyntaxKind::Ident)
         .map(|t| t.text().to_string())
+}
+
+enum Composite {
+    Struct { ty: Ty, fields: Vec<(String, Expr)> },
+    Array { ty: Ty, elements: Vec<Expr> },
 }
 
 fn subst_type_params(ty: &Ty, params: &[String], args: &[Ty]) -> Ty {

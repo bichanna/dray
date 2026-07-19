@@ -39,10 +39,27 @@ pub(crate) fn lower_type(node: &SyntaxNode) -> Option<Ty> {
                 .unwrap_or_default();
             Some(Ty::App(name, args))
         }
-        // Not modeled yet.
-        SyntaxKind::SliceType | SyntaxKind::ArrayType => None,
+        SyntaxKind::SliceType => {
+            let elem = node.children().into_iter().find(|c| is_type(c.kind()))?;
+            Some(Ty::Slice(Box::new(lower_type(&elem)?)))
+        }
+        SyntaxKind::ArrayType => {
+            let elem = node.children().into_iter().find(|c| is_type(c.kind()))?;
+            let len = array_length(node)?;
+            Some(Ty::Array(Box::new(lower_type(&elem)?), len))
+        }
         _ => None,
     }
+}
+
+/// The literal length written in an `[N]T` type
+fn array_length(node: &SyntaxNode) -> Option<u64> {
+    let size = node
+        .children()
+        .into_iter()
+        .find(|c| c.kind() == SyntaxKind::LiteralExpr)?;
+    let text = size.token_of_kind(SyntaxKind::IntLit)?.text().to_string();
+    text.replace('_', "").parse().ok()
 }
 
 pub(crate) fn is_type(kind: SyntaxKind) -> bool {

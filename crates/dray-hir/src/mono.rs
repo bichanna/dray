@@ -304,7 +304,9 @@ fn collect_apps(ty: &Ty, out: &mut Vec<(String, Vec<Ty>)>) {
 /// Rewrite `Ty::App` in place to the `Ty::Named` of its mangled concrete type
 fn rewrite_ty(ty: &mut Ty) {
     match ty {
-        Ty::Ptr(inner) | Ty::Rc(inner) => rewrite_ty(inner),
+        Ty::Ptr(inner) | Ty::Rc(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => {
+            rewrite_ty(inner)
+        }
         Ty::App(name, args) => {
             for a in args.iter_mut() {
                 rewrite_ty(a);
@@ -335,6 +337,8 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::Float { bits } => format!("float{bits}"),
         Ty::Ptr(inner) => format!("ptr_{}", mangle_ty(inner)),
         Ty::Rc(inner) => format!("rc_{}", mangle_ty(inner)),
+        Ty::Array(elem, n) => format!("arr{n}_{}", mangle_ty(elem)),
+        Ty::Slice(elem) => format!("slice_{}", mangle_ty(elem)),
         Ty::Named(n) => n.clone(),
         Ty::App(n, args) => mangle(n, args),
         Ty::Infer => "infer".to_string(),
@@ -552,6 +556,12 @@ fn each_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
                 each_expr(fe, f);
             }
         }
+        ExprKind::ArrayLit { elements, .. } => {
+            for e in elements {
+                each_expr(e, f);
+            }
+        }
+        ExprKind::SliceAll { array } => each_expr(array, f),
         ExprKind::EnumInit { args, .. } | ExprKind::GenericCall { args, .. } => {
             for a in args {
                 each_expr(a, f);
@@ -563,6 +573,7 @@ fn each_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
         | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::SizeOf(_)
+        | ExprKind::ZeroValue(_)
         | ExprKind::Name { .. }
         | ExprKind::Unresolved(_) => {}
     }
@@ -598,6 +609,14 @@ fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
                 each_ty_in_expr(fe, f);
             }
         }
+        ExprKind::ArrayLit { ty, elements } => {
+            f(ty);
+            for e in elements {
+                each_ty_in_expr(e, f);
+            }
+        }
+        ExprKind::ZeroValue(ty) => f(ty),
+        ExprKind::SliceAll { array } => each_ty_in_expr(array, f),
         ExprKind::EnumInit { args, .. } => {
             for a in args {
                 each_ty_in_expr(a, f);

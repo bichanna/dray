@@ -385,6 +385,7 @@ pub fn kind_name(kind: SyntaxKind) -> &'static str {
         SyntaxKind::CallExpr => "CallExpr",
         SyntaxKind::FieldExpr => "FieldExpr",
         SyntaxKind::IndexExpr => "IndexExpr",
+        SyntaxKind::SliceExpr => "SliceExpr",
         SyntaxKind::ArgList => "ArgList",
         SyntaxKind::Error => "Error",
     }

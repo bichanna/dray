@@ -202,6 +202,8 @@ pub enum SyntaxKind {
     FieldExpr,
     /// A single-element index: `receiver [ Expression ]` (slice form deferred).
     IndexExpr,
+    /// `xs[:]` a slice over an entire array.
+    SliceExpr,
     /// `Expression { "," Expression }` inside a `Call`.
     ArgList,
 

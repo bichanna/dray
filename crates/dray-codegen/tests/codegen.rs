@@ -693,3 +693,66 @@ fn only_pointed_to_aggregates_are_forward_declared() {
         "needless forward decl: {plain}"
     );
 }
+
+#[test]
+fn a_fixed_array_lowers_to_a_c_array() {
+    let out = c("main :: proc() -> int32 { xs: [3]int32 = {1, 2, 3}; return xs[0]; }\n");
+    assert!(out.contains("int32_t xs[3] = {1, 2, 3}"), "{out}");
+    assert!(out.contains("xs[0]"), "{out}");
+}
+
+#[test]
+fn a_slice_lowers_to_a_len_ptr_struct() {
+    let out = c("f :: proc(xs: []int32) -> int32 { return xs.len; }\n\
+                 main :: proc() -> int32 { ys: [2]int32 = {1, 2}; return f(ys[:]); }\n");
+    assert!(out.contains("struct DraySlice_int32 {"), "{out}");
+    assert!(out.contains("int32_t len;"), "{out}");
+    assert!(out.contains("int32_t *ptr;"), "{out}");
+    assert!(out.contains(".len=2"), "{out}");
+    assert!(out.contains(".ptr=&ys[0]"), "{out}");
+}
+
+#[test]
+fn indexing_a_slice_goes_through_its_data_pointer() {
+    let out = c("f :: proc(xs: []int32) -> int32 { return xs[0]; }\n\
+                 main :: proc() -> int32 { return 0; }\n");
+    assert!(out.contains("xs.ptr[0]"), "{out}");
+}
+
+#[test]
+fn one_slice_struct_is_emitted_per_element_type() {
+    let out = c(
+        "f :: proc(a: []int32, b: []int32) -> int32 { return a.len + b.len; }\n\
+                 main :: proc() -> int32 { return 0; }\n",
+    );
+    assert_eq!(out.matches("struct DraySlice_int32 {").count(), 1, "{out}");
+}
+
+#[test]
+fn e2e_arrays_and_slices() {
+    let src = "sum :: proc(xs: []int32) -> int32 {\n\
+                   total := 0;\n\
+                   for i := 0; i < xs.len; i += 1 {\n\
+                       total = total + xs[i];\n\
+                   }\n\
+                   return total;\n\
+               }\n\
+               main :: proc() -> int32 {\n\
+                   nums: [3]int32 = { 20, 20, 2 };\n\
+                   return sum(nums[:]);\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn e2e_omitted_array_elements_are_zeroed() {
+    let src = "main :: proc() -> int32 {\n\
+                   xs: [4]int32 = { 42 };\n\
+                   return xs[0] + xs[1] + xs[2] + xs[3];\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}

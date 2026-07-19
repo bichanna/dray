@@ -580,3 +580,120 @@ fn only_a_place_can_be_assigned_to() {
         "{type_target:?}"
     );
 }
+
+#[test]
+fn array_and_slice_types_resolve() {
+    let errs = resolve_errors(
+        "sum :: proc(xs: []int32) -> int32 {\n    total := 0;\n    for i := 0; i < xs.len; i += 1 {\n        total = total + xs[i];\n    }\n    return total;\n}\n\nmain :: proc() -> int32 {\n    nums: [3]int32 = { 20, 20, 2 };\n    return sum(nums[:]);\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn array_literal_length_and_element_types_are_checked() {
+    let too_many = resolve_errors(
+        "main :: proc() -> int32 {\n    xs: [2]int32 = { 1, 2, 3 };\n    return xs[0];\n}\n",
+    );
+    assert!(
+        too_many.iter().any(|m| m.contains("holds 2 element")),
+        "{too_many:?}"
+    );
+
+    let wrong_elem = resolve_errors(
+        "main :: proc() -> int32 {\n    xs: [2]int32 = { 1, true };\n    return xs[0];\n}\n",
+    );
+    assert!(
+        wrong_elem.iter().any(|m| m.contains("array element")),
+        "{wrong_elem:?}"
+    );
+
+    let named = resolve_errors(
+        "main :: proc() -> int32 {\n    xs: [2]int32 = { a: 1, b: 2 };\n    return xs[0];\n}\n",
+    );
+    assert!(named.iter().any(|m| m.contains("positional")), "{named:?}");
+}
+
+#[test]
+fn arrays_and_slices_are_distinct_types() {
+    // A `[]T` parameter does not accept a `[N]T` — the array must be sliced first.
+    let errs = resolve_errors(
+        "f :: proc(xs: []int32) -> int32 {\n    return xs.len;\n}\n\nmain :: proc() -> int32 {\n    ys: [2]int32 = { 1, 2 };\n    return f(ys);\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("expects `[]int32`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_slice_has_only_len_and_ptr() {
+    let errs = resolve_errors("f :: proc(xs: []int32) -> int32 {\n    return xs.nope;\n}\n");
+    assert!(
+        errs.iter().any(|m| m.contains("only `len` and `ptr`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn indexing_and_slicing_require_the_right_types() {
+    let bad_base = resolve_errors("main :: proc() -> int32 {\n    x := 5;\n    return x[0];\n}\n");
+    assert!(
+        bad_base.iter().any(|m| m.contains("cannot be indexed")),
+        "{bad_base:?}"
+    );
+
+    let bad_index = resolve_errors(
+        "main :: proc() -> int32 {\n    xs: [2]int32 = { 1, 2 };\n    return xs[true];\n}\n",
+    );
+    assert!(
+        bad_index
+            .iter()
+            .any(|m| m.contains("index must be an integer")),
+        "{bad_index:?}"
+    );
+
+    let bad_slice = resolve_errors(
+        "main :: proc() -> int32 {\n    x := 5;\n    y := x[:];\n    return 0;\n}\n",
+    );
+    assert!(
+        bad_slice.iter().any(|m| m.contains("can be sliced")),
+        "{bad_slice:?}"
+    );
+}
+
+#[test]
+fn conditions_and_logical_operators_need_bools() {
+    let cond = resolve_errors(
+        "main :: proc() -> int32 {\n    if 5 {\n        return 1;\n    }\n    return 0;\n}\n",
+    );
+    assert!(
+        cond.iter().any(|m| m.contains("condition needs a `bool`")),
+        "{cond:?}"
+    );
+
+    let logical = resolve_errors(
+        "main :: proc() -> int32 {\n    if 1 && 2 {\n        return 1;\n    }\n    return 0;\n}\n",
+    );
+    assert!(
+        logical.iter().any(|m| m.contains("needs a `bool`")),
+        "{logical:?}"
+    );
+
+    let not = resolve_errors(
+        "main :: proc() -> int32 {\n    x := 5;\n    if !x {\n        return 1;\n    }\n    return 0;\n}\n",
+    );
+    assert!(
+        not.iter().any(|m| m.contains("`!` needs a `bool`")),
+        "{not:?}"
+    );
+}
+
+#[test]
+fn only_a_pointer_can_be_dereferenced() {
+    let errs = resolve_errors("main :: proc() -> int32 {\n    x := 5;\n    return *x;\n}\n");
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("only a pointer can be dereferenced")),
+        "{errs:?}"
+    );
+}
