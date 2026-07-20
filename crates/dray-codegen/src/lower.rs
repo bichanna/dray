@@ -61,6 +61,9 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
                     IncludeBuilder::new_system_with_str(h).build(),
                 ));
             }
+            Item::ExternProc(e) if e.variadic => {
+                scope = scope.global_statement(GlobalStatement::Raw(variadic_extern(e)?));
+            }
             Item::ExternProc(e) => {
                 scope = scope.global_statement(GlobalStatement::Function(lower_extern(e)?));
             }
@@ -70,6 +73,21 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
         }
     }
     Ok(scope.build())
+}
+
+/// `extern <ret> <symbol>(<params>, ...);`
+fn variadic_extern(e: &ExternProc) -> Result<String> {
+    let mut params = Vec::with_capacity(e.params.len() + 1);
+    for p in &e.params {
+        params.push(format!("{} {}", lower_ty(&p.ty)?, c_ident(&p.name)));
+    }
+    params.push("...".to_string());
+    Ok(format!(
+        "extern {} {}({});",
+        lower_ty(&e.ret)?,
+        e.symbol,
+        params.join(", ")
+    ))
 }
 
 fn lower_extern(e: &ExternProc) -> Result<tamago::Function> {

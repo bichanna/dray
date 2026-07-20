@@ -2,7 +2,7 @@
 
 //! CST → HIR lowering: name resolution + best-effort type inference in one pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dray_syntax::{Span, SyntaxElement, SyntaxKind, SyntaxNode};
 
@@ -62,6 +62,8 @@ struct Lowerer {
     proc_param_types: HashMap<String, Vec<Ty>>,
     /// Every proc's declared parameter types, for checking call arguments
     proc_signatures: HashMap<String, Vec<Ty>>,
+    /// C functions declared with `...`, which accept arguments beyond those
+    variadic_procs: HashSet<String>,
     /// The declared return type of the proc being lowered, to check `return`.
     current_ret: Ty,
     /// Counter for compiler-generated local names.
@@ -89,6 +91,7 @@ impl Lowerer {
             proc_arity: HashMap::new(),
             proc_type_params: HashMap::new(),
             proc_signatures: HashMap::new(),
+            variadic_procs: HashSet::new(),
             proc_param_types: HashMap::new(),
             current_ret: Ty::Void,
             temp: 0,
@@ -132,6 +135,9 @@ impl Lowerer {
                             .insert(name.clone(), runtime_param_count(decl));
                         self.proc_signatures
                             .insert(name.clone(), declared_param_types(decl));
+                        if declares_variadic(decl) {
+                            self.variadic_procs.insert(name.clone());
+                        }
                         let id = self.add_def(name.clone(), DefKind::ExternProc { symbol }, ret);
                         self.bind_module(name, id, decl.span());
                     }
@@ -299,6 +305,7 @@ impl Lowerer {
             name,
             symbol,
             params,
+            variadic: declares_variadic(node),
             ret,
         }));
     }
@@ -1018,12 +1025,17 @@ impl Lowerer {
         // If the callee names a known proc, its argument count must match.
         if let ExprKind::Name { name, .. } = &callee.kind
             && let Some(&arity) = self.proc_arity.get(name)
-            && args.len() != arity
+            && !fits_arity(args.len(), arity, self.variadic_procs.contains(name))
         {
             self.err(
                 node.span(),
                 format!(
-                    "proc `{name}` takes {arity} argument(s), but {} were given",
+                    "proc `{name}` takes {}{arity} argument(s), but {} were given",
+                    if self.variadic_procs.contains(name) {
+                        "at least "
+                    } else {
+                        ""
+                    },
                     args.len()
                 ),
             );
@@ -2492,6 +2504,22 @@ fn const_int(e: &Expr) -> Option<i64> {
             operand,
         } => const_int(operand).map(|v| -v),
         _ => None,
+    }
+}
+
+fn declares_variadic(node: &SyntaxNode) -> bool {
+    node.child_of_kind(SyntaxKind::ParamList).is_some_and(|pl| {
+        pl.children_with_tokens()
+            .iter()
+            .any(|el| matches!(el, SyntaxElement::Token(t) if t.kind() == SyntaxKind::DotDotDot))
+    })
+}
+
+fn fits_arity(given: usize, arity: usize, variadic: bool) -> bool {
+    if variadic {
+        given >= arity
+    } else {
+        given == arity
     }
 }
 

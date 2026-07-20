@@ -373,7 +373,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::KwExtern, "'extern'");
         self.expect(TokenKind::StringLit, "the C symbol name string");
         self.expect(TokenKind::KwProc, "'proc'");
-        self.param_list();
+        self.extern_param_list();
         if self.at(TokenKind::Arrow) {
             self.ret_type();
         }
@@ -427,7 +427,28 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `( [ Param { "," Param } ] )`
+    fn extern_param_list(&mut self) {
+        self.start(SyntaxKind::ParamList);
+        self.expect(TokenKind::LParen, "'('");
+        while !self.at(TokenKind::RParen) && !self.at_eof() {
+            if self.at(TokenKind::DotDotDot) {
+                self.bump(); // ...
+                break;
+            }
+            self.param();
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            if self.at(TokenKind::RParen) {
+                let span = self.cur_span();
+                self.error_at(span, "expected a parameter after `,`");
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "')'");
+        self.finish_node();
+    }
+
     fn param_list(&mut self) {
         self.start(SyntaxKind::ParamList);
         self.expect(TokenKind::LParen, "'('");

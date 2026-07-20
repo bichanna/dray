@@ -153,6 +153,7 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
         .arg("-Wextra")
         .arg("-Werror")
         .arg("-Wno-unused-parameter")
+        .arg("-Wno-pointer-sign")
         .arg(&c_path)
         .arg("-o")
         .arg(&bin)
@@ -853,4 +854,36 @@ fn an_extern_symbol_is_never_renamed() {
                  main :: proc() -> int32 { return 0; }\n");
     assert!(out.contains("free("), "{out}");
     assert!(!out.contains("free_("), "{out}");
+}
+
+#[test]
+fn a_variadic_extern_declares_its_ellipsis() {
+    let out = c(
+        "printf :: extern \"printf\" proc(fmt: *int8, ...) -> int32;\n\
+                 main :: proc() -> int32 { printf(\"hi\\n\"); return 0; }\n",
+    );
+    assert!(
+        out.contains("extern int32_t printf(int8_t * fmt, ...);"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_non_variadic_extern_is_unchanged() {
+    let out = c("puts :: extern \"puts\" proc(s: *int8) -> int32;\n\
+                 main :: proc() -> int32 { return 0; }\n");
+    assert!(out.contains("puts("), "{out}");
+    assert!(!out.contains("..."), "{out}");
+}
+
+#[test]
+fn e2e_calling_a_variadic_c_function() {
+    let src = "printf :: extern \"printf\" proc(fmt: *int8, ...) -> int32;\n\
+               main :: proc() -> int32 {\n\
+                   printf(\"%d and %s\\n\", 40, \"Hello\");\n\
+                   return 0;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 0);
+    }
 }

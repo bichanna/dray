@@ -1,4 +1,4 @@
-printf :: extern "printf" proc(fmt: *int8, value: int32) -> int32;
+printf :: extern "printf" proc(fmt: *int8, ...) -> int32;
 puts :: extern "puts" proc(text: *int8) -> int32;
 
 sum :: proc(xs: []int32) -> int32 {
@@ -9,7 +9,7 @@ sum :: proc(xs: []int32) -> int32 {
     return total;
 }
 
-weighted :: proc(xs: []int32) -> int32 {
+weighted :: proc(xs: []int32, ...) -> int32 {
     total := 0;
     for n, [i] in xs {
         total = total + n * i;

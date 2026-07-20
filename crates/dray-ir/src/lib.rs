@@ -89,6 +89,7 @@ pub struct ExternProc {
     pub name: String,
     pub symbol: String,
     pub params: Vec<Param>,
+    pub variadic: bool,
     pub ret: Ty,
 }
 
@@ -248,6 +249,7 @@ impl Lowerer {
                 name: e.name.clone(),
                 symbol: e.symbol.clone(),
                 params: e.params.iter().map(param).collect(),
+                variadic: e.variadic,
                 ret: e.ret.clone(),
             })),
             dray_hir::Item::Proc(p) => {

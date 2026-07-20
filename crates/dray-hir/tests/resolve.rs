@@ -769,3 +769,19 @@ fn an_array_literal_may_be_written_with_its_type() {
     );
     assert!(errs.is_empty(), "{errs:?}");
 }
+
+#[test]
+fn a_variadic_extern_accepts_extra_arguments() {
+    let errs = resolve_errors(
+        "printf :: extern \"printf\" proc(fmt: *int8, ...) -> int32;\n\nmain :: proc() -> int32 {\n    printf(\"a\");\n    printf(\"%d\", 1);\n    printf(\"%d %d\", 1, 2);\n    return 0;\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn a_variadic_extern_still_needs_its_fixed_arguments() {
+    let errs = resolve_errors(
+        "printf :: extern \"printf\" proc(fmt: *int8, ...) -> int32;\n\nmain :: proc() -> int32 {\n    printf();\n    return 0;\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("at least 1")), "{errs:?}");
+}

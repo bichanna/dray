@@ -108,6 +108,7 @@ pub struct ExternProc {
     /// The linked C symbol (from `extern "symbol"`).
     pub symbol: String,
     pub params: Vec<Param>,
+    pub variadic: bool,
     pub ret: Ty,
 }
 
