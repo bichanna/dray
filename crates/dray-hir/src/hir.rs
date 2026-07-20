@@ -137,6 +137,7 @@ pub enum Stmt {
     Break,
     Continue,
     Expr(Expr),
+    Block(Vec<Stmt>),
     StaticAssert {
         cond: Expr,
         message: String,
@@ -364,6 +365,22 @@ pub enum IntWidth {
     W32,
     W64,
     Size,
+}
+
+impl Stmt {
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            Stmt::Let { init, .. } => Some(init.span),
+            Stmt::Assign { target, .. } => Some(target.span),
+            Stmt::Return(Some(e)) | Stmt::Expr(e) => Some(e.span),
+            Stmt::StaticAssert { cond, .. } => Some(cond.span),
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } => Some(cond.span),
+            Stmt::Switch { scrutinee, .. } => Some(scrutinee.span),
+            Stmt::CFor { cond, .. } => cond.as_ref().map(|c| c.span),
+            Stmt::Block(body) => body.first().and_then(Stmt::span),
+            Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Loop { .. } => None,
+        }
+    }
 }
 
 impl Ty {

@@ -22,6 +22,45 @@ pub struct Ir {
     pub defs: Vec<DefInfo>,
     /// True once any RC op was emitted. Codegen only pulls in the RC runtime then.
     pub uses_rc: bool,
+    /// Where this program came from, so codegen can emit `#line` directives
+    /// `None` when the source is not a file on disk, like --emit-c.
+    pub source: Option<SourceMap>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceMap {
+    file: String,
+    line_starts: Vec<u32>,
+    is_space: Vec<bool>,
+}
+
+impl SourceMap {
+    pub fn new(file: impl Into<String>, src: &str) -> SourceMap {
+        let mut line_starts = vec![0];
+        let mut is_space = Vec::with_capacity(src.len());
+        for (i, b) in src.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i as u32 + 1);
+            }
+            is_space.push(b.is_ascii_whitespace());
+        }
+        SourceMap {
+            file: file.into(),
+            line_starts,
+            is_space,
+        }
+    }
+
+    pub fn locate(&self, offset: u32) -> Option<(String, u64)> {
+        let mut at = offset as usize;
+        while at < self.is_space.len() && self.is_space[at] {
+            at += 1;
+        }
+        let idx = self
+            .line_starts
+            .partition_point(|&start| start <= at as u32);
+        Some((self.file.clone(), idx as u64))
+    }
 }
 
 impl Ir {
@@ -75,6 +114,11 @@ pub enum Stmt {
     Break,
     Continue,
     Expr(Expr),
+    Block(Vec<Stmt>),
+    Located {
+        offset: u32,
+        stmt: Box<Stmt>,
+    },
     DropValue {
         name: String,
         ty: Ty,
@@ -173,6 +217,7 @@ pub fn lower(hir: &Hir) -> Ir {
         enums,
         defs: lw.defs,
         uses_rc,
+        source: None,
     }
 }
 
@@ -209,7 +254,7 @@ impl Lowerer {
                 let mut scopes: Scopes = vec![Vec::new()];
                 let mut body = Vec::new();
                 for s in &p.body {
-                    self.stmt(s, &mut scopes, &mut body);
+                    self.located_stmt(s, &mut scopes, &mut body);
                 }
                 // If control falls off the end (no trailing return), release the
                 // proc's top-level @T locals here.
@@ -284,6 +329,7 @@ impl Lowerer {
                 self.emit_field_retains(e, out);
                 out.push(Stmt::Expr(e.clone()));
             }
+            H::Block(body) => out.push(Stmt::Block(self.block(body, scopes))),
             H::StaticAssert { cond, message } => out.push(Stmt::StaticAssert {
                 cond: cond.clone(),
                 message: message.clone(),
@@ -346,11 +392,24 @@ impl Lowerer {
         }
     }
 
+    fn located_stmt(&mut self, s: &dray_hir::Stmt, scopes: &mut Scopes, out: &mut Vec<Stmt>) {
+        let before = out.len();
+        self.stmt(s, scopes, out);
+        let Some(span) = s.span() else { return };
+        for st in out.iter_mut().skip(before) {
+            let lowered = std::mem::replace(st, Stmt::Break);
+            *st = Stmt::Located {
+                offset: span.start as u32,
+                stmt: Box::new(lowered),
+            };
+        }
+    }
+
     fn block(&mut self, stmts: &[dray_hir::Stmt], scopes: &mut Scopes) -> Vec<Stmt> {
         scopes.push(Vec::new());
         let mut out = Vec::new();
         for s in stmts {
-            self.stmt(s, scopes, &mut out);
+            self.located_stmt(s, scopes, &mut out);
         }
 
         let scope = scopes.pop().unwrap_or_default();

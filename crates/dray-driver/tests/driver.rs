@@ -2,7 +2,7 @@
 
 //! Driver tests: the parse -> HIR -> codegen front pipeline.
 
-use dray_driver::{source_to_c, BuildError};
+use dray_driver::{BuildError, source_to_c};
 
 #[test]
 fn source_to_c_produces_c() {
@@ -35,4 +35,20 @@ fn inference_and_aliasing_flow_through() {
         c.contains("abs(v)") && !c.contains("my_abs"),
         "aliasing: {c}"
     );
+}
+
+#[test]
+fn line_directives_point_back_at_the_dray_source() {
+    let src = "main :: proc() -> int32 {\n    t := 0;\n    t = t + 1;\n    return t;\n}\n";
+    let c = dray_driver::source_to_c_from_file(src, "prog.dray").expect("compiles");
+    assert!(c.contains("#line 2 \"prog.dray\""), "{c}");
+    assert!(c.contains("#line 3 \"prog.dray\""), "{c}");
+    assert!(c.contains("#line 4 \"prog.dray\""), "{c}");
+}
+
+#[test]
+fn without_a_source_file_no_line_directives_are_emitted() {
+    let src = "main :: proc() -> int32 {\n    return 0;\n}\n";
+    let c = dray_driver::source_to_c(src).expect("compiles");
+    assert!(!c.contains("#line"), "{c}");
 }

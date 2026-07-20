@@ -101,6 +101,13 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
         Stmt::Expr(e) => {
             let _ = writeln!(out, "{pad}{}", expr(e));
         }
+        Stmt::Block(body) => {
+            let _ = writeln!(out, "{pad}{{");
+            for st in body {
+                dump_stmt(st, depth + 1, out);
+            }
+            let _ = writeln!(out, "{pad}}}");
+        }
         Stmt::StaticAssert { cond, message } => {
             let _ = writeln!(out, "{pad}static_assert({}, {message:?})", expr(cond));
         }

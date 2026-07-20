@@ -18,6 +18,10 @@ fn ir_of(src: &str) -> dray_ir::Ir {
 fn shapes(body: &[Stmt]) -> Vec<String> {
     let mut out = Vec::new();
     for s in body {
+        let s = match s {
+            Stmt::Located { stmt, .. } => stmt.as_ref(),
+            other => other,
+        };
         match s {
             Stmt::Let { name, .. } => out.push(format!("let {name}")),
             Stmt::Retain(n) => out.push(format!("retain {n}")),

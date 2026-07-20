@@ -72,5 +72,12 @@ int64_t dray_rc_live(void) { return dray_rc_live_count; }
 
 /// Lower a whole IR module to C source.
 pub fn ir_to_c(ir: &Ir) -> Result<String> {
-    Ok(lower_ir(ir)?.to_string())
+    let scope = lower_ir(ir)?;
+    Ok(tamago::render(
+        &scope,
+        tamago::RenderOptions {
+            line_directives: ir.source.is_some(),
+            ..Default::default()
+        },
+    ))
 }

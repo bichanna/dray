@@ -107,6 +107,12 @@ pub fn source_to_c(src: &str) -> Result<String, BuildError> {
     dray_codegen::ir_to_c(&ir).map_err(|e| BuildError::Codegen(e.to_string()))
 }
 
+pub fn source_to_c_from_file(src: &str, file: &str) -> Result<String, BuildError> {
+    let mut ir = source_to_ir(src)?;
+    ir.source = Some(dray_ir::SourceMap::new(file, src));
+    dray_codegen::ir_to_c(&ir).map_err(|e| BuildError::Codegen(e.to_string()))
+}
+
 /// Build a Dray source file into an executable at `out_path`. Returns the path
 /// to the generated C file.
 pub fn build_file(
@@ -115,7 +121,7 @@ pub fn build_file(
     opts: &BuildOptions,
 ) -> Result<PathBuf, BuildError> {
     let src = std::fs::read_to_string(src_path)?;
-    let c_code = source_to_c(&src)?;
+    let c_code = source_to_c_from_file(&src, &src_path.display().to_string())?;
 
     let c_path = c_output_path(out_path);
     std::fs::write(&c_path, &c_code)?;

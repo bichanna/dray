@@ -185,9 +185,25 @@ fn try_alloc_is_still_a_clean_error() {
 }
 
 #[test]
-fn range_for_is_a_clean_error() {
-    let errs = resolve_errors("f :: proc() {\n    for c in items {\n        use(c);\n    }\n}\n");
-    assert!(errs.iter().any(|m| m.contains("range")), "{errs:?}");
+fn for_in_over_an_array_or_slice_resolves() {
+    let errs = resolve_errors(
+        "f :: proc(xs: []int32) -> int32 {\n    total := 0;\n    for n in xs {\n        total = total + n;\n    }\n    return total;\n}\n\nmain :: proc() -> int32 {\n    ys: [2]int32 = { 1, 2 };\n    sum := 0;\n    for v, [i] in ys {\n        sum = sum + v + i;\n    }\n    return sum;\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn for_in_over_a_non_sequence_is_an_error() {
+    // custom iterables need receiver methods, which do not exist yet, so
+    // anything that is not an array or slice is rejected for now
+    let errs = resolve_errors(
+        "main :: proc() -> int32 {\n    x := 5;\n    for c in x {\n        return c;\n    }\n    return 0;\n}\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("array or slice can be iterated")),
+        "{errs:?}"
+    );
 }
 
 #[test]

@@ -100,6 +100,12 @@ fn lower_proc(ir: &Ir, p: &Proc) -> Result<tamago::Function> {
 fn lower_body(ir: &Ir, stmts: &[Stmt]) -> Result<Block> {
     let mut b = BlockBuilder::new();
     for s in stmts {
+        if let Stmt::Block(inner) = s {
+            for st in inner {
+                b = b.statement(lower_stmt(ir, st)?);
+            }
+            continue;
+        }
         b = b.statement(lower_stmt(ir, s)?);
     }
     Ok(b.build())
@@ -123,6 +129,19 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
         Stmt::Break => Statement::Break,
         Stmt::Continue => Statement::Continue,
         Stmt::Expr(e) => Statement::Expr(lower_expr(ir, e)?),
+        Stmt::Located { offset, stmt } => {
+            let inner = lower_stmt(ir, stmt)?;
+            return Ok(match ir.source.as_ref().and_then(|m| m.locate(*offset)) {
+                Some((file, line)) => inner.located(tamago::SourceLoc::new(file, line)),
+                None => inner,
+            });
+        }
+        Stmt::Block(_) => {
+            return Err(CodegenError::new(
+                "internal: a block statement reached codegen unflattened".to_string(),
+            ));
+        }
+
         Stmt::StaticAssert { cond, message } => Statement::StaticAssert(tamago::StaticAssert::new(
             lower_expr(ir, cond)?,
             message.clone(),
@@ -193,6 +212,8 @@ fn stmt_uses_name(s: &Stmt, name: &str) -> bool {
         }
         Stmt::Return(Some(e)) | Stmt::Expr(e) => expr_uses_name(e, name),
         Stmt::StaticAssert { cond, .. } => expr_uses_name(cond, name),
+        Stmt::Block(body) => block_uses_name(body, name),
+        Stmt::Located { stmt, .. } => stmt_uses_name(stmt, name),
         Stmt::DropValue { name: n, .. } => n == name,
         Stmt::Retain(n) | Stmt::Release(n) | Stmt::Free(n) => n == name,
         Stmt::Return(None) | Stmt::Break | Stmt::Continue => false,

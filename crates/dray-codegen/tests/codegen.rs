@@ -756,3 +756,46 @@ fn e2e_omitted_array_elements_are_zeroed() {
         assert_eq!(code, 42);
     }
 }
+
+#[test]
+fn for_in_over_a_slice_lowers_to_an_indexed_loop() {
+    let out = c("sum :: proc(xs: []int32) -> int32 {\n\
+                     total := 0;\n\
+                     for n in xs { total = total + n; }\n\
+                     return total;\n\
+                 }\n\
+                 main :: proc() -> int32 { return 0; }\n");
+    assert!(out.contains("< xs.len"), "{out}");
+    assert!(out.contains("= xs.ptr["), "{out}");
+}
+
+#[test]
+fn for_in_over_an_array_does_not_copy_it() {
+    // C has no array assignment, so the loop must index the original array
+    let out = c("main :: proc() -> int32 {\n\
+                     ys: [3]int32 = {1, 2, 3};\n\
+                     t := 0;\n\
+                     for v in ys { t = t + v; }\n\
+                     return t;\n\
+                 }\n");
+    assert!(out.contains("= ys["), "{out}");
+    assert!(!out.contains("__dray_seq"), "array was copied: {out}");
+}
+
+#[test]
+fn e2e_for_in_over_arrays_and_slices() {
+    let src = "sum :: proc(xs: []int32) -> int32 {\n\
+                   total := 0;\n\
+                   for n in xs { total = total + n; }\n\
+                   return total;\n\
+               }\n\
+               main :: proc() -> int32 {\n\
+                   nums: [4]int32 = { 10, 20, 4, 3 };\n\
+                   indexed := 0;\n\
+                   for v, [i] in nums { indexed = indexed + v + i; }\n\
+                   return sum(nums[:]) + indexed - 37 - 6;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 37);
+    }
+}

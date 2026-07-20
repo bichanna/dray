@@ -64,6 +64,8 @@ struct Lowerer {
     proc_signatures: HashMap<String, Vec<Ty>>,
     /// The declared return type of the proc being lowered, to check `return`.
     current_ret: Ty,
+    /// Counter for compiler-generated local names.
+    temp: u32,
     /// Struct names currently being zero-initialized, so a by-value cycle cannot
     /// drive `zero_aggregate` into unbounded recursion.
     zeroing: Vec<String>,
@@ -89,6 +91,7 @@ impl Lowerer {
             proc_signatures: HashMap::new(),
             proc_param_types: HashMap::new(),
             current_ret: Ty::Void,
+            temp: 0,
             zeroing: Vec::new(),
             type_params_in_scope: Vec::new(),
         }
@@ -511,11 +514,179 @@ impl Lowerer {
         })
     }
 
+    /// `for x in xs { ... }` and `for x, [i] in xs { ... }` over a built-in array
+    /// or slice (§14). The compiler knows their shape, so this lowers straight to
+    /// an indexed loop rather than just going through the iterator conventio
+    fn lower_for_in(&mut self, node: &SyntaxNode) -> Option<Stmt> {
+        let span = node
+            .child_of_kind(SyntaxKind::Condition)
+            .and_then(|c| self.first_expr(&c))
+            .map_or_else(|| node.span(), |e| e.span());
+        let names = loop_bindings(node);
+        let element_name = names.first()?.clone();
+        let index_name = names
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| self.fresh_name("idx"));
+
+        let seq_node = node
+            .child_of_kind(SyntaxKind::Condition)
+            .and_then(|c| self.first_expr(&c))?;
+        let sequence = self.lower_expr(&seq_node);
+        let elem_ty = match &sequence.ty {
+            Ty::Array(elem, _) | Ty::Slice(elem) => (**elem).clone(),
+            Ty::Infer => Ty::Infer,
+            other => {
+                self.err(
+                    seq_node.span(),
+                    format!(
+                        "only an array or slice can be iterated with `for ... in`, not `{}`",
+                        type_name(other)
+                    ),
+                );
+                return None;
+            }
+        };
+
+        let needs_temp =
+            matches!(sequence.ty, Ty::Slice(_)) && !matches!(sequence.kind, ExprKind::Name { .. });
+
+        self.push_scope();
+
+        let seq_ty = sequence.ty.clone();
+        let (seq_ref, bind_seq) = if needs_temp {
+            let seq_name = self.fresh_name("seq");
+            let def = self.add_def(seq_name.clone(), DefKind::Local, seq_ty.clone());
+            self.bind_local(seq_name.clone(), def);
+            let reference = Expr {
+                kind: ExprKind::Name {
+                    def,
+                    name: seq_name.clone(),
+                },
+                ty: seq_ty.clone(),
+                span,
+            };
+            let binding = Stmt::Let {
+                def,
+                name: seq_name,
+                ty: seq_ty.clone(),
+                init: sequence,
+            };
+            (reference, Some(binding))
+        } else {
+            (sequence, None)
+        };
+
+        // A fixed array's length is part of its typ, and a slice carries its own
+        let length = match &seq_ty {
+            Ty::Array(_, n) => *self.int_literal(*n as i64, span),
+            _ => Expr {
+                kind: ExprKind::Field {
+                    recv: Box::new(seq_ref.clone()),
+                    member: "len".to_string(),
+                },
+                ty: Ty::Int {
+                    bits: IntWidth::W32,
+                    signed: true,
+                },
+                span,
+            },
+        };
+
+        let int32 = Ty::Int {
+            bits: IntWidth::W32,
+            signed: true,
+        };
+        let idx_def = self.add_def(index_name.clone(), DefKind::Local, int32.clone());
+        self.bind_local(index_name.clone(), idx_def);
+        let idx_ref = Expr {
+            kind: ExprKind::Name {
+                def: idx_def,
+                name: index_name.clone(),
+            },
+            ty: int32.clone(),
+            span,
+        };
+
+        let init = Stmt::Let {
+            def: idx_def,
+            name: index_name.clone(),
+            ty: int32.clone(),
+            init: *self.int_literal(0, span),
+        };
+        let cond = Expr {
+            kind: ExprKind::Binary {
+                op: BinOp::Lt,
+                lhs: Box::new(idx_ref.clone()),
+                rhs: Box::new(length),
+            },
+            ty: Ty::Bool,
+            span,
+        };
+        let post = Stmt::Assign {
+            target: idx_ref.clone(),
+            op: AssignOp::Add,
+            value: *self.int_literal(1, span),
+        };
+
+        // The element binding is the first statement of the body, so the loop body
+        // sees it exactly as if the user had written it.
+        self.push_scope();
+        let elem_def = self.add_def(element_name.clone(), DefKind::Local, elem_ty.clone());
+        self.bind_local(element_name.clone(), elem_def);
+        let bind_elem = Stmt::Let {
+            def: elem_def,
+            name: element_name,
+            ty: elem_ty.clone(),
+            init: Expr {
+                kind: ExprKind::Index {
+                    base: Box::new(seq_ref.clone()),
+                    index: Box::new(idx_ref),
+                },
+                ty: elem_ty,
+                span,
+            },
+        };
+        let mut body = vec![bind_elem];
+        if let Some(b) = node.child_of_kind(SyntaxKind::Block) {
+            body.extend(self.lower_block(&b));
+        }
+        self.pop_scope();
+        self.pop_scope();
+
+        let loop_stmt = Stmt::CFor {
+            init: Some(Box::new(init)),
+            cond: Some(cond),
+            post: Some(Box::new(post)),
+            body,
+        };
+        Some(match bind_seq {
+            Some(binding) => Stmt::Block(vec![binding, loop_stmt]),
+            None => loop_stmt,
+        })
+    }
+
+    /// A compiler-generated local name that cannot collide with a user's.
+    fn fresh_name(&mut self, what: &str) -> String {
+        self.temp += 1;
+        format!("__dray_{what}_{}", self.temp)
+    }
+
+    /// An integer literal expression, for the pieces of a desugaring.
+    fn int_literal(&self, value: i64, span: Span) -> Box<Expr> {
+        Box::new(Expr {
+            kind: ExprKind::Int(value),
+            ty: Ty::Int {
+                bits: IntWidth::W32,
+                signed: true,
+            },
+            span,
+        })
+    }
+
     fn lower_for(&mut self, node: &SyntaxNode) -> Option<Stmt> {
-        let is_range = node.token_of_kind(SyntaxKind::KwIn).is_some();
-        if is_range {
-            self.err(node.span(), "for-in range loops are not lowered yet");
-            return None;
+        if node.token_of_kind(SyntaxKind::KwIn).is_some() {
+            return self.lower_for_in(node);
         }
         let has_semi = node
             .children_with_tokens()
@@ -2248,6 +2419,20 @@ fn infer_type_params(
         }
         _ => {}
     }
+}
+
+fn loop_bindings(node: &SyntaxNode) -> Vec<String> {
+    let mut out = Vec::new();
+    for el in node.children_with_tokens() {
+        match el {
+            SyntaxElement::Token(t) if t.kind() == SyntaxKind::KwIn => break,
+            SyntaxElement::Token(t) if t.kind() == SyntaxKind::Ident => {
+                out.push(t.text().to_string())
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn runtime_param_count(node: &SyntaxNode) -> usize {

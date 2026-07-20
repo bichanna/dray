@@ -393,6 +393,7 @@ fn each_ty_in_stmt(s: &mut Stmt, f: &mut impl FnMut(&mut Ty)) {
             each_ty_in_expr(value, f);
         }
         Stmt::Return(Some(e)) | Stmt::Expr(e) => each_ty_in_expr(e, f),
+        Stmt::Block(body) => each_ty_in_block(body, f),
         Stmt::StaticAssert { cond, .. } => each_ty_in_expr(cond, f),
         Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
         Stmt::If {
@@ -487,6 +488,7 @@ fn each_expr_in_stmt(s: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
             each_expr(value, f);
         }
         Stmt::Return(Some(e)) | Stmt::Expr(e) => each_expr(e, f),
+        Stmt::Block(body) => each_expr_in_block(body, f),
         Stmt::StaticAssert { cond, .. } => each_expr(cond, f),
         Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
         Stmt::If {
