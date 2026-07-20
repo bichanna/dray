@@ -5,7 +5,7 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use dray_driver::{BuildOptions, build_file, source_to_c, source_to_ir};
+use dray_driver::{BuildOptions, build_file, source_to_c, source_to_c_from_file, source_to_ir};
 use dray_hir::{dump_hir, lower};
 use dray_ir::dump_ir;
 use dray_syntax::{DumpOptions, dump_cst_with, dump_tokens, dump_tokens_no_trivia, parse};
@@ -162,8 +162,14 @@ fn emit_c_cmd(args: &[String]) -> Result<(), CliError> {
             }
         }
     }
-    let src = read_source(path.ok_or("no input file given")?)?;
-    match source_to_c(&src) {
+    let path = path.ok_or("no input file given")?;
+    let src = read_source(path)?;
+    let generated = if path == "-" {
+        source_to_c(&src)
+    } else {
+        source_to_c_from_file(&src, path)
+    };
+    match generated {
         Ok(c) => {
             print!("{c}");
             Ok(())

@@ -75,15 +75,17 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
 fn lower_extern(e: &ExternProc) -> Result<tamago::Function> {
     let mut fb = FunctionBuilder::new_with_str(&e.symbol, lower_ty(&e.ret)?).make_extern();
     for p in &e.params {
-        fb = fb.param(ParameterBuilder::new_with_str(&p.name, lower_ty(&p.ty)?).build());
+        fb = fb.param(ParameterBuilder::new_with_str(&c_ident(&p.name), lower_ty(&p.ty)?).build());
     }
     Ok(fb.build())
 }
 
 fn proc_signature(p: &Proc) -> Result<FunctionBuilder> {
-    let mut fb = FunctionBuilder::new_with_str(&p.name, lower_ty(&p.ret)?);
+    let mut fb = FunctionBuilder::new_with_str(&c_ident(&p.name), lower_ty(&p.ret)?);
     for param in &p.params {
-        fb = fb.param(ParameterBuilder::new_with_str(&param.name, lower_ty(&param.ty)?).build());
+        fb = fb.param(
+            ParameterBuilder::new_with_str(&c_ident(&param.name), lower_ty(&param.ty)?).build(),
+        );
     }
     Ok(fb)
 }
@@ -100,7 +102,11 @@ fn lower_proc(ir: &Ir, p: &Proc) -> Result<tamago::Function> {
 fn lower_body(ir: &Ir, stmts: &[Stmt]) -> Result<Block> {
     let mut b = BlockBuilder::new();
     for s in stmts {
-        if let Stmt::Block(inner) = s {
+        let unwrapped = match s {
+            Stmt::Located { stmt, .. } => stmt.as_ref(),
+            other => other,
+        };
+        if let Stmt::Block(inner) = unwrapped {
             for st in inner {
                 b = b.statement(lower_stmt(ir, st)?);
             }
@@ -115,7 +121,7 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
     use tamago::Statement;
     Ok(match s {
         Stmt::Let { name, ty, init } => Statement::Variable(
-            VariableBuilder::new_with_str(name, lower_ty(ty)?)
+            VariableBuilder::new_with_str(&c_ident(name), lower_ty(ty)?)
                 .value(lower_expr(ir, init)?)
                 .build(),
         ),
@@ -189,7 +195,7 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
             Statement::Expr(tamago::Expr::new_fn_call(
                 tamago::Expr::new_ident(format!("dray_drop_{type_name}")),
                 vec![tamago::Expr::new_unary(
-                    tamago::Expr::new_ident(name.clone()),
+                    tamago::Expr::new_ident(c_ident(name)),
                     tamago::UnaryOp::AddrOf,
                 )],
             ))
@@ -307,7 +313,7 @@ fn lower_switch(
                     let field =
                         T::new_mem_access(lower_expr(ir, scrutinee)?, payload_field(variant, i));
                     b = b.statement(tamago::Statement::Variable(
-                        VariableBuilder::new_with_str(bind, lower_ty(&ty)?)
+                        VariableBuilder::new_with_str(&c_ident(bind), lower_ty(&ty)?)
                             .value(field)
                             .build(),
                     ));
@@ -366,7 +372,7 @@ fn rc_call(func: &str, arg: &str) -> tamago::Expr {
     use tamago::Expr as T;
     T::new_fn_call(
         T::new_ident(func.to_string()),
-        vec![T::new_ident(arg.to_string())],
+        vec![T::new_ident(c_ident(arg))],
     )
 }
 
@@ -386,7 +392,7 @@ fn lower_if(
 fn lower_for_init(ir: &Ir, s: &Stmt) -> Result<ForInit> {
     Ok(match s {
         Stmt::Let { name, ty, init } => ForInit::Decl(
-            VariableBuilder::new_with_str(name, lower_ty(ty)?)
+            VariableBuilder::new_with_str(&c_ident(name), lower_ty(ty)?)
                 .value(lower_expr(ir, init)?)
                 .build(),
         ),
@@ -542,8 +548,9 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
 /// Dray name (which is the C name for procs, params, and locals).
 fn c_name(ir: &Ir, def: DefId, fallback: &str) -> String {
     match &ir.def(def).kind {
+        // An `extern` names a real C symbol, which must be spelled exactly.
         DefKind::ExternProc { symbol } => symbol.clone(),
-        _ => fallback.to_string(),
+        _ => c_ident(fallback),
     }
 }
 
@@ -770,7 +777,13 @@ fn slice_element_types(ir: &Ir) -> Vec<Ty> {
 
 fn walk_stmt_types(stmts: &[Stmt], note: &mut impl FnMut(&Ty)) {
     for s in stmts {
+        let s = match s {
+            Stmt::Located { stmt, .. } => stmt.as_ref(),
+            other => other,
+        };
+
         match s {
+            Stmt::Block(body) => walk_stmt_types(body, note),
             Stmt::Let { ty, init, .. } => {
                 note(ty);
                 note(&init.ty);
@@ -799,6 +812,65 @@ fn walk_stmt_types(stmts: &[Stmt], note: &mut impl FnMut(&Ty)) {
             }
             _ => {}
         }
+    }
+}
+
+/// Spell a Dray identifier so it is a legal C identifier
+fn c_ident(name: &str) -> String {
+    const C_KEYWORDS: &[&str] = &[
+        "auto",
+        "break",
+        "case",
+        "char",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extern",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "inline",
+        "int",
+        "long",
+        "register",
+        "restrict",
+        "return",
+        "short",
+        "signed",
+        "sizeof",
+        "static",
+        "struct",
+        "switch",
+        "typedef",
+        "union",
+        "unsigned",
+        "void",
+        "volatile",
+        "while",
+        "_Alignas",
+        "_Alignof",
+        "_Atomic",
+        "_Bool",
+        "_Complex",
+        "_Generic",
+        "_Imaginary",
+        "_Noreturn",
+        "_Static_assert",
+        "_Thread_local",
+        "bool",
+        "true",
+        "false",
+        "NULL",
+    ];
+    if C_KEYWORDS.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
     }
 }
 
@@ -858,7 +930,7 @@ fn pointer_referenced_aggregates(ir: &Ir) -> HashSet<&str> {
 fn struct_definition(sd: &dray_ir::StructDef) -> Result<tamago::Struct> {
     let mut sb = StructBuilder::new_with_str(&sd.name);
     for f in &sd.fields {
-        sb = sb.field(FieldBuilder::new_with_str(&f.name, lower_ty(&f.ty)?).build());
+        sb = sb.field(FieldBuilder::new_with_str(&c_ident(&f.name), lower_ty(&f.ty)?).build());
     }
     Ok(sb.define().build())
 }
@@ -1006,7 +1078,7 @@ fn constructor_signature(sd: &dray_ir::StructDef) -> Result<FunctionBuilder> {
     let self_ty = Type::ptr(Type::base(BaseType::Struct(sd.name.clone())));
     let mut fb = FunctionBuilder::new_with_str(&format!("dray_new_{}", sd.name), self_ty);
     for f in &sd.fields {
-        fb = fb.param(ParameterBuilder::new_with_str(&f.name, lower_ty(&f.ty)?).build());
+        fb = fb.param(ParameterBuilder::new_with_str(&c_ident(&f.name), lower_ty(&f.ty)?).build());
     }
     Ok(fb)
 }

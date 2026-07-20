@@ -713,3 +713,59 @@ fn only_a_pointer_can_be_dereferenced() {
         "{errs:?}"
     );
 }
+
+#[test]
+fn a_name_cannot_be_declared_twice_in_one_scope() {
+    let twice =
+        resolve_errors("main :: proc() -> int32 {\n    a := 1;\n    a := 2;\n    return a;\n}\n");
+    assert!(
+        twice.iter().any(|m| m.contains("already declared")),
+        "{twice:?}"
+    );
+
+    let param = resolve_errors("f :: proc(x: int32) -> int32 {\n    x := 5;\n    return x;\n}\n");
+    assert!(
+        param.iter().any(|m| m.contains("already declared")),
+        "{param:?}"
+    );
+}
+
+#[test]
+fn an_inner_block_may_still_shadow() {
+    let errs = resolve_errors(
+        "main :: proc() -> int32 {\n    x := 1;\n    if true {\n        x := 2;\n        return x;\n    }\n    return x;\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn a_constant_index_outside_a_fixed_array_is_an_error() {
+    let high = resolve_errors(
+        "main :: proc() -> int32 {\n    a: [2]int32 = { 1, 2 };\n    return a[5];\n}\n",
+    );
+    assert!(
+        high.iter().any(|m| m.contains("outside this array")),
+        "{high:?}"
+    );
+
+    let negative = resolve_errors(
+        "main :: proc() -> int32 {\n    a: [2]int32 = { 1, 2 };\n    return a[-1];\n}\n",
+    );
+    assert!(
+        negative.iter().any(|m| m.contains("outside this array")),
+        "{negative:?}"
+    );
+
+    let dynamic = resolve_errors(
+        "main :: proc() -> int32 {\n    a: [2]int32 = { 1, 2 };\n    t := 0;\n    for i := 0; i < 2; i += 1 {\n        t = t + a[i];\n    }\n    return t;\n}\n",
+    );
+    assert!(dynamic.is_empty(), "{dynamic:?}");
+}
+
+#[test]
+fn an_array_literal_may_be_written_with_its_type() {
+    let errs = resolve_errors(
+        "main :: proc() -> int32 {\n    nums := [4]int32{ 1, 2, 3, 4 };\n    return nums[0];\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}

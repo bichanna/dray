@@ -1,7 +1,5 @@
-Point :: struct {
-    x: int32,
-    y: int32,
-}
+printf :: extern "printf" proc(fmt: *int8, value: int32) -> int32;
+puts :: extern "puts" proc(text: *int8) -> int32;
 
 sum :: proc(xs: []int32) -> int32 {
     total := 0;
@@ -20,22 +18,27 @@ weighted :: proc(xs: []int32) -> int32 {
 }
 
 main :: proc() -> int32 {
-    nums: [4]int32 = { 1, 2, 3, 4 };
+    nums: [4]int32 = { 10, 20, 4, 3 };
+    partial: [4]int32 = { 5 };
 
-    doubled := 0;
-    for n in nums {
-        doubled = doubled + n + n;
+    puts("-- arrays --");
+    for n, [i] in nums {
+        printf("nums[%d] = ", i);
+        printf("%d\n", n);
     }
+    printf("partial[1] (omitted, so zeroed) = %d\n", partial[1]);
 
-    corners: [2]Point = { { x: 3, y: 4 }, { x: 5, y: 6 } };
-    perimeter := 0;
-    for c in corners {
-        perimeter = perimeter + c.x + c.y;
-    }
+    nums = { 1, 2, 3, 4 };
+    printf("after reassignment, nums[3] = %d\n", nums[3]);
 
-    return sum(cast([]int32)nums[:])          // 10
-        + weighted(cast([]int32)nums[:])      // 0 + 2 + 6 + 12 = 20
-        + doubled                // 20
-        + perimeter              // 18
-        - 26;                    // = 42
+    typed := [3]int32{ 7, 8, 9 };
+    printf("typed[2] = %d\n", typed[2]);
+
+    puts("-- slices --");
+    view := nums[:];
+    printf("view.len = %d\n", view.len);
+    printf("sum(view) = %d\n", sum(view));
+    printf("weighted(view) = %d\n", weighted(view));
+
+    return 0;
 }

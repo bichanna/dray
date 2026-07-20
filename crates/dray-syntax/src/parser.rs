@@ -637,7 +637,7 @@ impl<'a> Parser<'a> {
         if is_assign_op(self.peek()) {
             self.wrap_at(cp, SyntaxKind::AssignStmt);
             self.bump(); // the assignment operator
-            self.expr(); // right-hand side
+            self.expr_or_bare_composite();
             if want_semi {
                 self.expect(TokenKind::Semi, "';' after assignment");
             }
@@ -1000,6 +1000,12 @@ impl<'a> Parser<'a> {
                 self.finish_node();
             }
             TokenKind::KwAlloc | TokenKind::KwTryAlloc => self.alloc_expr(),
+            TokenKind::LBracket => {
+                self.start(SyntaxKind::CompositeLit);
+                self.type_ref();
+                self.composite_body();
+                self.finish_node();
+            }
             TokenKind::LParen => {
                 self.start(SyntaxKind::ParenExpr);
                 self.bump(); // (

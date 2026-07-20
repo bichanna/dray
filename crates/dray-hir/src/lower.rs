@@ -204,6 +204,25 @@ impl Lowerer {
         self.scopes[0].names.insert(name, id);
     }
 
+    fn declared_in_current_scope(&self, name: &str) -> bool {
+        let body_and_params = self.scopes.len().saturating_sub(2)..self.scopes.len();
+        self.scopes[body_and_params]
+            .iter()
+            .enumerate()
+            .any(|(depth, scope)| {
+                // Only the parameter scope is shared. an outer *block* may be
+                // shadowed legally
+                let is_param_scope = depth == 0;
+                scope.names.get(name).is_some_and(|id| {
+                    !is_param_scope
+                        || matches!(
+                            self.defs.get(id.0 as usize).map(|d| &d.kind),
+                            Some(DefKind::Param)
+                        )
+                })
+            })
+    }
+
     fn bind_local(&mut self, name: String, id: DefId) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.names.insert(name, id);
@@ -374,6 +393,12 @@ impl Lowerer {
             self.check_assignable(d, &init, "this binding", init_node.span());
         }
         let ty = declared.unwrap_or_else(|| default_ty(&init.ty));
+        if self.declared_in_current_scope(&name) {
+            self.err(
+                node.span(),
+                format!("`{name}` is already declared in this scope"),
+            );
+        }
         let id = self.add_def(name.clone(), DefKind::Local, ty.clone());
         self.bind_local(name.clone(), id);
         Some(Stmt::Let {
@@ -471,9 +496,37 @@ impl Lowerer {
         }
         let op = assign_op(node)?;
         let target = self.lower_expr(&parts[0]);
-        let value = self.lower_expr(&parts[1]);
+        let value = self.lower_value(&parts[1], Some(&target.ty));
+
         self.check_assign_target(&target, parts[0].span());
         self.check_assignable(&target.ty, &value, "this assignment", parts[1].span());
+
+        if let Ty::Array(elem_ty, len) = &target.ty {
+            let span = parts[0].span();
+            let elem_ty = (**elem_ty).clone();
+            let at = |this: &Self, base: &Expr, i: u64| Expr {
+                kind: ExprKind::Index {
+                    base: Box::new(base.clone()),
+                    index: Box::new(*this.int_literal(i as i64, span)),
+                },
+                ty: elem_ty.clone(),
+                span,
+            };
+            let sources: Vec<Expr> = match &value.kind {
+                ExprKind::ArrayLit { elements, .. } => elements.clone(),
+                _ => (0..*len).map(|i| at(self, &value, i)).collect(),
+            };
+            let stores = sources
+                .into_iter()
+                .enumerate()
+                .map(|(i, source)| Stmt::Assign {
+                    target: at(self, &target, i as u64),
+                    op: AssignOp::Assign,
+                    value: source,
+                })
+                .collect();
+            return Some(Stmt::Block(stores));
+        }
         Some(Stmt::Assign { target, op, value })
     }
 
@@ -1328,6 +1381,15 @@ impl Lowerer {
                 ),
             );
         }
+        if let (Ty::Array(_, len), Some(i)) = (&base.ty, const_int(&index))
+            && (i < 0 || i as u64 >= *len)
+        {
+            self.err(
+                parts[1].span(),
+                format!("index {i} is outside this array's {len} element(s)"),
+            );
+        }
+
         let ty = match &base.ty {
             // A raw pointer, an array, and a slice all index to their element.
             Ty::Ptr(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => (**inner).clone(),
@@ -2418,6 +2480,18 @@ fn infer_type_params(
             }
         }
         _ => {}
+    }
+}
+
+fn const_int(e: &Expr) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Int(v) => Some(*v),
+        ExprKind::Paren(inner) => const_int(inner),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            operand,
+        } => const_int(operand).map(|v| -v),
+        _ => None,
     }
 }
 

@@ -799,3 +799,58 @@ fn e2e_for_in_over_arrays_and_slices() {
         assert_eq!(code, 37);
     }
 }
+
+#[test]
+fn e2e_assigning_an_array() {
+    let src = "main :: proc() -> int32 {\n\
+                   a: [3]int32 = { 1, 2, 3 };\n\
+                   b: [3]int32 = { 20, 20, 2 };\n\
+                   a = { 10, 10, 1 };\n\
+                   a = b;\n\
+                   return a[0] + a[1] + a[2];\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn e2e_typed_array_literal_in_expression_position() {
+    let src = "main :: proc() -> int32 {\n\
+                   nums := [4]int32{ 20, 20, 2, 0 };\n\
+                   return nums[0] + nums[1] + nums[2];\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn a_slice_typed_local_gets_its_struct_emitted() {
+    let out = c("main :: proc() -> int32 {\n\
+                     n: [4]uint8 = { 1, 2, 3, 4 };\n\
+                     s := n[:];\n\
+                     return s.len;\n\
+                 }\n");
+    assert!(out.contains("struct DraySlice_uint8 {"), "{out}");
+}
+
+#[test]
+fn identifiers_that_are_c_keywords_are_renamed() {
+    let out = c("main :: proc() -> int32 {\n\
+                     inline := 1;\n\
+                     register := 2;\n\
+                     return inline + register;\n\
+                 }\n");
+    assert!(out.contains("int32_t inline_ = 1"), "{out}");
+    assert!(out.contains("int32_t register_ = 2"), "{out}");
+    assert!(out.contains("return inline_ + register_"), "{out}");
+}
+
+#[test]
+fn an_extern_symbol_is_never_renamed() {
+    let out = c("free :: extern \"free\" proc(p: *int8) -> void;\n\
+                 main :: proc() -> int32 { return 0; }\n");
+    assert!(out.contains("free("), "{out}");
+    assert!(!out.contains("free_("), "{out}");
+}
