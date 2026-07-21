@@ -453,6 +453,15 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::ParamList);
         self.expect(TokenKind::LParen, "'('");
         while !self.at(TokenKind::RParen) && !self.at_eof() {
+            if self.at(TokenKind::DotDotDot) {
+                let span = self.cur_span();
+                self.error_at(
+                    span,
+                    "`...` is not allowed in a Dray proc; it describes the arguments of a C function, so it belongs on an `extern` declaration",
+                );
+                self.bump(); // ...
+                break;
+            }
             self.param();
             if !self.eat(TokenKind::Comma) {
                 break;

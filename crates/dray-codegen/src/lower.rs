@@ -950,6 +950,11 @@ fn struct_definition(sd: &dray_ir::StructDef) -> Result<tamago::Struct> {
     for f in &sd.fields {
         sb = sb.field(FieldBuilder::new_with_str(&c_ident(&f.name), lower_ty(&f.ty)?).build());
     }
+    // Empty struct: `struct Unit {};`
+    if sd.fields.is_empty() {
+        sb =
+            sb.field(FieldBuilder::new_with_str("_dray_empty", Type::base(BaseType::Char)).build());
+    }
     Ok(sb.define().build())
 }
 

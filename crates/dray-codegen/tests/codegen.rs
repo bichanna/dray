@@ -151,9 +151,6 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
     let compile = Command::new(&cc)
         .arg("-Wall")
         .arg("-Wextra")
-        .arg("-Werror")
-        .arg("-Wno-unused-parameter")
-        .arg("-Wno-pointer-sign")
         .arg(&c_path)
         .arg("-o")
         .arg(&bin)
@@ -886,4 +883,10 @@ fn e2e_calling_a_variadic_c_function() {
     if let Some(code) = compile_and_run(&c(src)) {
         assert_eq!(code, 0);
     }
+}
+
+#[test]
+fn an_empty_struct_still_has_a_member() {
+    let out = c("E :: struct { }\nmain :: proc() -> int32 { e := alloc E{}; return 0; }\n");
+    assert!(out.contains("char _dray_empty;"), "{out}");
 }

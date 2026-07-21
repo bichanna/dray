@@ -717,3 +717,20 @@ fn enum_and_switch_parse() {
         debug_tree(&p.root)
     );
 }
+
+#[test]
+fn ellipsis_in_a_dray_proc_gets_one_clear_error() {
+    let p = parse("weighted :: proc(xs: []int32, ...) -> int32 {\n    return 0;\n}\n");
+    assert_eq!(p.errors.len(), 1, "{:?}", p.errors);
+    assert!(
+        p.errors[0].message.contains("not allowed in a Dray proc"),
+        "{:?}",
+        p.errors
+    );
+}
+
+#[test]
+fn ellipsis_is_accepted_on_an_extern() {
+    let p = parse("printf :: extern \"printf\" proc(fmt: *int8, ...) -> int32;\n");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+}

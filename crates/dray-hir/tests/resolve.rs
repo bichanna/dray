@@ -785,3 +785,32 @@ fn a_variadic_extern_still_needs_its_fixed_arguments() {
     );
     assert!(errs.iter().any(|m| m.contains("at least 1")), "{errs:?}");
 }
+
+#[test]
+fn an_rc_pointer_may_not_cross_into_c() {
+    let param = resolve_errors(
+        "N :: struct {\n    v: int32,\n}\n\nf :: extern \"f\" proc(p: @N) -> int32;\n",
+    );
+    assert!(
+        param.iter().any(|m| m.contains("cannot cross into C")),
+        "{param:?}"
+    );
+
+    let ret =
+        resolve_errors("N :: struct {\n    v: int32,\n}\n\nf :: extern \"f\" proc() -> @N;\n");
+    assert!(
+        ret.iter().any(|m| m.contains("cannot cross into C")),
+        "{ret:?}"
+    );
+
+    let nested = resolve_errors(
+        "N :: struct {\n    v: int32,\n}\n\nf :: extern \"f\" proc(p: *@N) -> int32;\n",
+    );
+    assert!(
+        nested.iter().any(|m| m.contains("cannot cross into C")),
+        "{nested:?}"
+    );
+
+    let raw = resolve_errors("f :: extern \"puts\" proc(s: *int8) -> int32;\n");
+    assert!(raw.is_empty(), "{raw:?}");
+}

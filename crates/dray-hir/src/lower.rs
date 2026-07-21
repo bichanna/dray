@@ -300,6 +300,16 @@ impl Lowerer {
         self.push_scope();
         let params = self.lower_params(node);
         self.pop_scope();
+        // `@T` may never appear in an `extern` signature.
+        for p in &params {
+            self.reject_rc_in_extern(
+                &p.ty,
+                &name,
+                &format!("parameter `{}`", p.name),
+                node.span(),
+            );
+        }
+        self.reject_rc_in_extern(&ret, &name, "return type", node.span());
         self.items.push(Item::ExternProc(ExternProc {
             def,
             name,
@@ -308,6 +318,20 @@ impl Lowerer {
             variadic: declares_variadic(node),
             ret,
         }));
+    }
+
+    fn reject_rc_in_extern(&mut self, ty: &Ty, proc_name: &str, where_: &str, span: Span) {
+        if !mentions_rc(ty) {
+            return;
+        }
+        self.err(
+            span,
+            format!(
+                "the {where_} of `{proc_name}` contains `{}`, and a counted pointer \
+                 cannot cross into C; use a raw pointer (`*T`) instead",
+                type_name(ty)
+            ),
+        );
     }
 
     fn lower_params(&mut self, node: &SyntaxNode) -> Vec<Param> {
@@ -2520,6 +2544,15 @@ fn fits_arity(given: usize, arity: usize, variadic: bool) -> bool {
         given >= arity
     } else {
         given == arity
+    }
+}
+
+fn mentions_rc(ty: &Ty) -> bool {
+    match ty {
+        Ty::Rc(_) => true,
+        Ty::Ptr(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => mentions_rc(inner),
+        Ty::App(_, args) => args.iter().any(mentions_rc),
+        _ => false,
     }
 }
 

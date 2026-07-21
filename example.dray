@@ -9,7 +9,7 @@ sum :: proc(xs: []int32) -> int32 {
     return total;
 }
 
-weighted :: proc(xs: []int32, ...) -> int32 {
+weighted :: proc(xs: []int32) -> int32 {
     total := 0;
     for n, [i] in xs {
         total = total + n * i;
