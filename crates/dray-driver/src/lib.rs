@@ -2,8 +2,10 @@
 
 //! Build orchestration for Dray
 
+mod backend;
+pub use backend::{Backend, CStandard, CcInvocation};
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use dray_hir::lower;
 use dray_syntax::parse;
@@ -59,6 +61,12 @@ pub struct BuildOptions {
     pub cc: String,
     /// Keep the generated `.c` file next to the output instead of removing it.
     pub emit_c: bool,
+    /// The C standard to compile against
+    pub standard: CStandard,
+    /// Forward the C compiler's warnings instead of silencing them
+    pub show_c_warnings: bool,
+    /// Extra flags handed to the C compiler untouched.
+    pub cflags: Vec<String>,
 }
 
 impl Default for BuildOptions {
@@ -66,6 +74,9 @@ impl Default for BuildOptions {
         BuildOptions {
             cc: std::env::var("CC").unwrap_or_else(|_| "cc".to_string()),
             emit_c: false,
+            standard: CStandard::default(),
+            show_c_warnings: false,
+            cflags: Vec::new(),
         }
     }
 }
@@ -126,10 +137,21 @@ pub fn build_file(
     let c_path = c_output_path(out_path);
     std::fs::write(&c_path, &c_code)?;
 
-    let status = Command::new(&opts.cc)
-        .arg(&c_path)
-        .arg("-o")
-        .arg(out_path)
+    let dir = c_path.parent().unwrap_or(Path::new("."));
+    let base_h = dir.join("draybase.h");
+    let base_c = dir.join("draybase.c");
+    std::fs::write(&base_h, dray_codegen::DRAYBASE_H)?;
+    std::fs::write(&base_c, dray_codegen::DRAYBASE_C)?;
+
+    let invocation = CcInvocation {
+        cc: &opts.cc,
+        backend: Backend::detect(&opts.cc),
+        standard: opts.standard,
+        show_warnings: opts.show_c_warnings,
+        extra: &opts.cflags,
+    };
+    let status = invocation
+        .command_multi(&[c_path.clone(), base_c.clone()], out_path)
         .status()
         .map_err(|e| {
             BuildError::CC(format!(

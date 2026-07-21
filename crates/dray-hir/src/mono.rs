@@ -331,6 +331,7 @@ fn mangle_ty(ty: &Ty) -> String {
     match ty {
         Ty::Void => "void".to_string(),
         Ty::Bool => "bool".to_string(),
+        Ty::CChar => "cchar".to_string(),
         Ty::Int { bits, signed } => {
             format!("{}{}", if *signed { "int" } else { "uint" }, width(bits))
         }

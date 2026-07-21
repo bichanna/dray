@@ -33,10 +33,8 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
 
     if ir.uses_rc {
         scope = scope.global_statement(GlobalStatement::Include(
-            IncludeBuilder::new_system_with_str("stdlib.h").build(),
+            IncludeBuilder::new_with_str("draybase.h").build(),
         ));
-        scope = scope.new_line();
-        scope = scope.global_statement(GlobalStatement::Raw(crate::RC_RUNTIME.to_string()));
     }
 
     for gs in aggregate_globals(ir)? {
@@ -577,6 +575,7 @@ fn lower_ty(t: &Ty) -> Result<Type> {
     Ok(match t {
         Ty::Void => Type::base(B::Void),
         Ty::Bool => Type::base(B::Bool),
+        Ty::CChar => Type::base(B::Char),
         Ty::Int { bits, signed } => Type::base(int_base(*bits, *signed)),
         Ty::Float { bits } => Type::base(if *bits == 32 { B::Float } else { B::Double }),
         // Both raw and RC pointers are a C `T*`; the RC bookkeeping is separate.
@@ -900,6 +899,7 @@ fn mangle_c_ty(ty: &Ty) -> String {
     match ty {
         Ty::Void => "void".to_string(),
         Ty::Bool => "bool".to_string(),
+        Ty::CChar => "cchar".to_string(),
         Ty::Int { bits, signed } => format!(
             "{}{}",
             if *signed { "int" } else { "uint" },

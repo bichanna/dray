@@ -67,7 +67,11 @@ dump-cst options:
 
 build options:
   -o <out>     output executable path (default: a.out)
-  --emit-c     keep the generated .c file next to the executable";
+  --emit-c            keep the generated .c file next to the executable
+  --show-c-warnings   forward the C compiler's own warnings (they are silenced
+                      by default, since they refer to generated code)
+  --cc <program>      C compiler to use (default: $CC, else cc)
+  --std <standard>    C standard to compile against: c99, c11 (default), c17";
 
 fn run(args: &[String]) -> Result<(), CliError> {
     let cmd = args.first().ok_or("expected a subcommand")?;
@@ -182,6 +186,9 @@ fn emit_c_cmd(args: &[String]) -> Result<(), CliError> {
 fn build_cmd(args: &[String]) -> Result<(), CliError> {
     let mut out = "a.out".to_string();
     let mut emit_c = false;
+    let mut show_c_warnings = false;
+    let mut cc: Option<String> = None;
+    let mut standard: Option<dray_driver::CStandard> = None;
     let mut path: Option<&str> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -190,6 +197,15 @@ fn build_cmd(args: &[String]) -> Result<(), CliError> {
                 out = it.next().ok_or("`-o` needs an output path")?.clone();
             }
             "--emit-c" => emit_c = true,
+            "--show-c-warnings" => show_c_warnings = true,
+            "--cc" => cc = Some(it.next().ok_or("`--cc` needs a compiler")?.clone()),
+            "--std" => {
+                let name = it.next().ok_or("`--std` needs a standard, e.g. c11")?;
+                standard =
+                    Some(dray_driver::CStandard::parse(name).ok_or_else(|| {
+                        format!("unknown C standard `{name}`; try c99, c11 or c17")
+                    })?);
+            }
             flag if flag.starts_with("--") || flag == "-o" => {
                 return Err(format!("unknown flag `{flag}` for build").into());
             }
@@ -205,9 +221,13 @@ fn build_cmd(args: &[String]) -> Result<(), CliError> {
         return Err("build needs a file path, not stdin".into());
     }
 
+    let defaults = BuildOptions::default();
     let opts = BuildOptions {
         emit_c,
-        ..Default::default()
+        show_c_warnings,
+        cc: cc.unwrap_or(defaults.cc),
+        standard: standard.unwrap_or(defaults.standard),
+        ..BuildOptions::default()
     };
     match build_file(
         std::path::Path::new(path),

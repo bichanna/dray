@@ -78,6 +78,7 @@ pub(crate) fn name_to_ty(name: &str) -> Ty {
     match name {
         "void" => Ty::Void,
         "bool" => Ty::Bool,
+        "cchar" => Ty::CChar,
         "int8" => int(IntWidth::W8, true),
         "int16" => int(IntWidth::W16, true),
         "int32" => int(IntWidth::W32, true),

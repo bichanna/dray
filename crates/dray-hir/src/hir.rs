@@ -350,6 +350,8 @@ pub enum Ty {
     Float {
         bits: u8,
     },
+    /// C's `char`, for interop only.
+    CChar,
     Ptr(Box<Ty>),
     Rc(Box<Ty>),
     Array(Box<Ty>, u64),

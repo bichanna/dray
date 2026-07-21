@@ -118,6 +118,17 @@ fn unresolved_name_never_reaches_valid_c() {
 
 // ── end-to-end: compile and run ──────────────────────────────────────────────
 
+/// The standard the generated C targets. Pinned so drift is caught by the test
+/// suite rather than by whoever happens to build on the least forgiving compiler.
+const C_STANDARD: &[&str] = &["-std=c11", "-pedantic"];
+
+/// Diagnostics about the *program's own* declarations rather than about the quality
+/// of what codegen emitted. Everything else here is an error.
+const TOLERATED_C_WARNINGS: &[&str] = &[
+    "-Wno-unused-parameter",
+    "-Wno-incompatible-library-redeclaration",
+];
+
 fn compile_and_run(c_src: &str) -> Option<i32> {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,18 +151,25 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
     let c_path = dir.join(format!("{stamp}.c"));
     let bin = dir.join(&stamp);
     std::fs::write(&c_path, c_src).unwrap();
+    let base_h = dir.join("draybase.h");
+    let base_c = dir.join(format!("{stamp}_draybase.c"));
+    std::fs::write(&base_h, dray_codegen::DRAYBASE_H).unwrap();
+    std::fs::write(&base_c, dray_codegen::DRAYBASE_C).unwrap();
 
     // Generated C must compile without diagnostics: a warning here (an unhandled
-    // switch value, an unused local, an implicit declaration) is a codegen bug,
-    // so treat warnings as errors to catch that class automatically.
-    //
-    // `unused-parameter` is excluded deliberately: a Dray proc may legitimately
-    // ignore one of its parameters, and the parameter still has to appear in the
-    // C signature, so that diagnostic reflects the user's code rather than ours.
+    // switch value, an unused local, an implicit declaration) is a codegen bug, so
+    // warnings are errors. `-pedantic` matters as much as `-std`, since without it
+    // a compiler quietly accepts its own extensions and the drift is only found by
+    // whoever builds with a different toolchain.
     let compile = Command::new(&cc)
+        .args(C_STANDARD)
         .arg("-Wall")
         .arg("-Wextra")
+        .arg("-Werror")
+        .args(TOLERATED_C_WARNINGS)
         .arg(&c_path)
+        .arg(&base_c)
+        .arg(format!("-I{}", dir.display()))
         .arg("-o")
         .arg(&bin)
         .output()
@@ -164,6 +182,7 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
     );
     let code = Command::new(&bin).status().unwrap().code().unwrap_or(-1);
     let _ = std::fs::remove_file(&c_path);
+    let _ = std::fs::remove_file(&base_c);
     let _ = std::fs::remove_file(&bin);
     Some(code)
 }
@@ -651,7 +670,10 @@ fn generated_c_has_no_duplicate_includes() {
     let out = c("Node :: struct { value: int32 }\n\
                  main :: proc() -> int32 { n := alloc Node{ value: 1 }; return n.value; }\n");
     assert_eq!(out.matches("#include <stdint.h>").count(), 1, "{out}");
-    assert_eq!(out.matches("#include <stdlib.h>").count(), 1, "{out}");
+    // `stdlib.h` belongs to the runtime, which now lives in its own header rather
+    // than being copied into every generated file.
+    assert_eq!(out.matches("#include <stdlib.h>").count(), 0, "{out}");
+    assert_eq!(out.matches("#include \"draybase.h\"").count(), 1, "{out}");
 }
 
 #[test]
@@ -856,18 +878,18 @@ fn an_extern_symbol_is_never_renamed() {
 #[test]
 fn a_variadic_extern_declares_its_ellipsis() {
     let out = c(
-        "printf :: extern \"printf\" proc(fmt: *int8, ...) -> int32;\n\
+        "printf :: extern \"printf\" proc(fmt: *cchar, ...) -> int32;\n\
                  main :: proc() -> int32 { printf(\"hi\\n\"); return 0; }\n",
     );
     assert!(
-        out.contains("extern int32_t printf(int8_t * fmt, ...);"),
+        out.contains("extern int32_t printf(char * fmt, ...);"),
         "{out}"
     );
 }
 
 #[test]
 fn a_non_variadic_extern_is_unchanged() {
-    let out = c("puts :: extern \"puts\" proc(s: *int8) -> int32;\n\
+    let out = c("puts :: extern \"puts\" proc(s: *cchar) -> int32;\n\
                  main :: proc() -> int32 { return 0; }\n");
     assert!(out.contains("puts("), "{out}");
     assert!(!out.contains("..."), "{out}");
@@ -875,7 +897,7 @@ fn a_non_variadic_extern_is_unchanged() {
 
 #[test]
 fn e2e_calling_a_variadic_c_function() {
-    let src = "printf :: extern \"printf\" proc(fmt: *int8, ...) -> int32;\n\
+    let src = "printf :: extern \"printf\" proc(fmt: *cchar, ...) -> int32;\n\
                main :: proc() -> int32 {\n\
                    printf(\"%d and %s\\n\", 40, \"Hello\");\n\
                    return 0;\n\

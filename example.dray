@@ -1,5 +1,16 @@
-printf :: extern "printf" proc(fmt: *int8, ...) -> int32;
-puts :: extern "puts" proc(text: *int8) -> int32;
+// Arrays, slices and `for ... in`, printing to the terminal.
+//
+//     dray build -o arrays_demo examples/arrays_demo.dray && ./arrays_demo
+//
+// `*cchar` is C's `char *`. C treats `char`, `signed char` and `unsigned char` as
+// three different types, so `*int8` would not match a real C signature.
+//
+// The `...` says printf is variadic. That is not cosmetic: on Apple Silicon
+// variadic arguments travel on the stack while fixed ones stay in registers, so a
+// fixed declaration compiles and then prints zeros.
+
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+puts :: extern "puts" proc(s: *cchar) -> int32;
 
 sum :: proc(xs: []int32) -> int32 {
     total := 0;
@@ -23,8 +34,7 @@ main :: proc() -> int32 {
 
     puts("-- arrays --");
     for n, [i] in nums {
-        printf("nums[%d] = ", i);
-        printf("%d\n", n);
+        printf("nums[%d] = %d\n", i, n);
     }
     printf("partial[1] (omitted, so zeroed) = %d\n", partial[1]);
 

@@ -68,6 +68,8 @@ struct Lowerer {
     current_ret: Ty,
     /// Counter for compiler-generated local names.
     temp: u32,
+    /// True while lowering an `extern` declaration, where `cchar` is allowed
+    in_extern: bool,
     /// Struct names currently being zero-initialized, so a by-value cycle cannot
     /// drive `zero_aggregate` into unbounded recursion.
     zeroing: Vec<String>,
@@ -95,6 +97,7 @@ impl Lowerer {
             proc_param_types: HashMap::new(),
             current_ret: Ty::Void,
             temp: 0,
+            in_extern: false,
             zeroing: Vec::new(),
             type_params_in_scope: Vec::new(),
         }
@@ -905,7 +908,7 @@ impl Lowerer {
                     (ExprKind::Unresolved(text.into()), Ty::f64())
                 }
             },
-            SyntaxKind::StringLit => (ExprKind::Str(unquote(text)), Ty::Ptr(Box::new(Ty::i8()))),
+            SyntaxKind::StringLit => (ExprKind::Str(unquote(text)), Ty::Ptr(Box::new(Ty::CChar))),
             SyntaxKind::RuneLit => match decode_rune(text) {
                 Ok(c) => (ExprKind::Char(c), Ty::i8()),
                 Err(m) => {
@@ -1578,6 +1581,14 @@ impl Lowerer {
             Ty::Ptr(inner) | Ty::Rc(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => {
                 self.check_type(inner, type_params, span)
             }
+            Ty::CChar => {
+                if !self.in_extern {
+                    self.err(
+                        span,
+                        "`cchar` is only for `extern` declarations, where it matches C's `char`; use `int8` elsewhere",
+                    );
+                }
+            }
             Ty::Void | Ty::Bool | Ty::Int { .. } | Ty::Float { .. } | Ty::Infer => {}
         }
     }
@@ -2135,6 +2146,7 @@ impl Lowerer {
     fn zero_value(&mut self, ty: &Ty, span: Span, struct_name: &str, field: &str) -> Option<Expr> {
         let kind = match ty {
             Ty::Bool => ExprKind::Bool(false),
+            Ty::CChar => ExprKind::Int(0),
             Ty::Int { .. } => ExprKind::Int(0),
             Ty::Float { .. } => ExprKind::Float(0.0),
             // Non-nullable by construction: there is no "absent" value to use.
@@ -2357,6 +2369,7 @@ fn type_name(ty: &Ty) -> String {
     match ty {
         Ty::Void => "void".to_string(),
         Ty::Bool => "bool".to_string(),
+        Ty::CChar => "cchar".to_string(),
         Ty::Int { bits, signed } => {
             let prefix = if *signed { "int" } else { "uint" };
             match bits {

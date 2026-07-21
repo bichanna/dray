@@ -270,6 +270,7 @@ pub fn ty(t: &Ty) -> String {
     match t {
         Ty::Void => "void".into(),
         Ty::Bool => "bool".into(),
+        Ty::CChar => "cchar".into(),
         Ty::Int { bits, signed } => {
             let w = match bits {
                 IntWidth::W8 => "8",
