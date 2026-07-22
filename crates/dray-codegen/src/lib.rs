@@ -31,13 +31,11 @@ impl std::error::Error for CodegenError {}
 
 pub type Result<T> = std::result::Result<T, CodegenError>;
 
-/// `draybase.h` — the hand-written C
-/// The analogue of Nim's `nimbase.h`: fixed-width integer typedefs, the RC header
-/// layout, and the portability macros whose spelling differs between compilers.
-pub const DRAYBASE_H: &str = include_str!("../runtime/draybase.h");
+/// `draybase.h` — the hand-written C that is not worth generating.
+pub const DRAYBASE_H: &str = include_str!("../../../lib/system/draybase.h");
 
 /// The runtime's definitions, to be compiled exactly once per program.
-pub const DRAYBASE_C: &str = include_str!("../runtime/draybase.c");
+pub const DRAYBASE_C: &str = include_str!("../../../lib/system/draybase.c");
 
 /// Lower a whole IR module to C source.
 pub fn ir_to_c(ir: &Ir) -> Result<String> {

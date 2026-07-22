@@ -1,16 +1,10 @@
-// Arrays, slices and `for ... in`, printing to the terminal.
-//
-//     dray build -o arrays_demo examples/arrays_demo.dray && ./arrays_demo
-//
-// `*cchar` is C's `char *`. C treats `char`, `signed char` and `unsigned char` as
-// three different types, so `*int8` would not match a real C signature.
-//
-// The `...` says printf is variadic. That is not cosmetic: on Apple Silicon
-// variadic arguments travel on the stack while fixed ones stay in registers, so a
-// fixed declaration compiles and then prints zeros.
-
 printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
 puts :: extern "puts" proc(s: *cchar) -> int32;
+
+say :: proc(text: []uint8) -> void {
+    puts(cast(*cchar) text.ptr);
+    return;
+}
 
 sum :: proc(xs: []int32) -> int32 {
     total := 0;
@@ -20,35 +14,18 @@ sum :: proc(xs: []int32) -> int32 {
     return total;
 }
 
-weighted :: proc(xs: []int32) -> int32 {
-    total := 0;
-    for n, [i] in xs {
-        total = total + n * i;
-    }
-    return total;
-}
-
 main :: proc() -> int32 {
+    greeting := "-- strings are slices --";
+    say(greeting);
+    printf(cast(*cchar) "the greeting is %d bytes\n".ptr, greeting.len);
+
     nums: [4]int32 = { 10, 20, 4, 3 };
-    partial: [4]int32 = { 5 };
-
-    puts("-- arrays --");
+    say("-- arrays and slices --");
     for n, [i] in nums {
-        printf("nums[%d] = %d\n", i, n);
+        printf(cast(*cchar) "nums[%d] = %d\n".ptr, i, n);
     }
-    printf("partial[1] (omitted, so zeroed) = %d\n", partial[1]);
 
-    nums = { 1, 2, 3, 4 };
-    printf("after reassignment, nums[3] = %d\n", nums[3]);
-
-    typed := [3]int32{ 7, 8, 9 };
-    printf("typed[2] = %d\n", typed[2]);
-
-    puts("-- slices --");
     view := nums[:];
-    printf("view.len = %d\n", view.len);
-    printf("sum(view) = %d\n", sum(view));
-    printf("weighted(view) = %d\n", weighted(view));
-
+    printf(cast(*cchar) "view.len = %d, sum = %d\n".ptr, view.len, sum(view));
     return 0;
 }

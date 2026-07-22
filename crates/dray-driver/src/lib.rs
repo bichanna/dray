@@ -3,7 +3,7 @@
 //! Build orchestration for Dray
 
 mod backend;
-pub use backend::{Backend, CStandard, CcInvocation};
+pub use backend::{Backend, CcInvocation};
 
 use std::path::{Path, PathBuf};
 
@@ -61,12 +61,12 @@ pub struct BuildOptions {
     pub cc: String,
     /// Keep the generated `.c` file next to the output instead of removing it.
     pub emit_c: bool,
-    /// The C standard to compile against
-    pub standard: CStandard,
     /// Forward the C compiler's warnings instead of silencing them
     pub show_c_warnings: bool,
     /// Extra flags handed to the C compiler untouched.
     pub cflags: Vec<String>,
+    /// Where to put generated C. Defaults to `build/<program>/`.
+    pub build_dir: Option<PathBuf>,
 }
 
 impl Default for BuildOptions {
@@ -74,9 +74,9 @@ impl Default for BuildOptions {
         BuildOptions {
             cc: std::env::var("CC").unwrap_or_else(|_| "cc".to_string()),
             emit_c: false,
-            standard: CStandard::default(),
             show_c_warnings: false,
             cflags: Vec::new(),
+            build_dir: None,
         }
     }
 }
@@ -126,6 +126,21 @@ pub fn source_to_c_from_file(src: &str, file: &str) -> Result<String, BuildError
 
 /// Build a Dray source file into an executable at `out_path`. Returns the path
 /// to the generated C file.
+fn build_dir(opts: &BuildOptions, out_path: &Path) -> PathBuf {
+    if let Some(dir) = &opts.build_dir {
+        return dir.clone();
+    }
+    let name = out_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "dray".to_string());
+    out_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("build")
+        .join(name)
+}
+
 pub fn build_file(
     src_path: &Path,
     out_path: &Path,
@@ -134,10 +149,16 @@ pub fn build_file(
     let src = std::fs::read_to_string(src_path)?;
     let c_code = source_to_c_from_file(&src, &src_path.display().to_string())?;
 
-    let c_path = c_output_path(out_path);
+    let dir = build_dir(opts, out_path);
+    std::fs::create_dir_all(&dir)?;
+
+    let stem = src_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "main".to_string());
+    let c_path = dir.join(format!("{stem}.c"));
     std::fs::write(&c_path, &c_code)?;
 
-    let dir = c_path.parent().unwrap_or(Path::new("."));
     let base_h = dir.join("draybase.h");
     let base_c = dir.join("draybase.c");
     std::fs::write(&base_h, dray_codegen::DRAYBASE_H)?;
@@ -146,7 +167,6 @@ pub fn build_file(
     let invocation = CcInvocation {
         cc: &opts.cc,
         backend: Backend::detect(&opts.cc),
-        standard: opts.standard,
         show_warnings: opts.show_c_warnings,
         extra: &opts.cflags,
     };
@@ -169,14 +189,5 @@ pub fn build_file(
         )));
     }
 
-    if !opts.emit_c {
-        let _ = std::fs::remove_file(&c_path);
-    }
     Ok(c_path)
-}
-
-fn c_output_path(out_path: &Path) -> PathBuf {
-    let mut s = out_path.as_os_str().to_os_string();
-    s.push(".c");
-    PathBuf::from(s)
 }

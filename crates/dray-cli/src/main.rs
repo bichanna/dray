@@ -71,7 +71,8 @@ build options:
   --show-c-warnings   forward the C compiler's own warnings (they are silenced
                       by default, since they refer to generated code)
   --cc <program>      C compiler to use (default: $CC, else cc)
-  --std <standard>    C standard to compile against: c99, c11 (default), c17";
+  --build-dir <dir>   where to put generated C (default: build/<program>/)
+";
 
 fn run(args: &[String]) -> Result<(), CliError> {
     let cmd = args.first().ok_or("expected a subcommand")?;
@@ -188,7 +189,7 @@ fn build_cmd(args: &[String]) -> Result<(), CliError> {
     let mut emit_c = false;
     let mut show_c_warnings = false;
     let mut cc: Option<String> = None;
-    let mut standard: Option<dray_driver::CStandard> = None;
+    let mut build_dir: Option<std::path::PathBuf> = None;
     let mut path: Option<&str> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -198,14 +199,12 @@ fn build_cmd(args: &[String]) -> Result<(), CliError> {
             }
             "--emit-c" => emit_c = true,
             "--show-c-warnings" => show_c_warnings = true,
-            "--cc" => cc = Some(it.next().ok_or("`--cc` needs a compiler")?.clone()),
-            "--std" => {
-                let name = it.next().ok_or("`--std` needs a standard, e.g. c11")?;
-                standard =
-                    Some(dray_driver::CStandard::parse(name).ok_or_else(|| {
-                        format!("unknown C standard `{name}`; try c99, c11 or c17")
-                    })?);
+            "--build-dir" => {
+                build_dir = Some(std::path::PathBuf::from(
+                    it.next().ok_or("`--build-dir` needs a path")?,
+                ));
             }
+            "--cc" => cc = Some(it.next().ok_or("`--cc` needs a compiler")?.clone()),
             flag if flag.starts_with("--") || flag == "-o" => {
                 return Err(format!("unknown flag `{flag}` for build").into());
             }
@@ -226,7 +225,7 @@ fn build_cmd(args: &[String]) -> Result<(), CliError> {
         emit_c,
         show_c_warnings,
         cc: cc.unwrap_or(defaults.cc),
-        standard: standard.unwrap_or(defaults.standard),
+        build_dir,
         ..BuildOptions::default()
     };
     match build_file(

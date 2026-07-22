@@ -5,41 +5,8 @@
 use std::path::Path;
 use std::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CStandard {
-    C99,
-    #[default]
-    C11,
-    C17,
-}
-
-impl CStandard {
-    /// The spelling used by gcc and clang.
-    fn gnu_flag(self) -> &'static str {
-        match self {
-            CStandard::C99 => "-std=c99",
-            CStandard::C11 => "-std=c11",
-            CStandard::C17 => "-std=c17",
-        }
-    }
-
-    fn msvc_flag(self) -> Option<&'static str> {
-        match self {
-            CStandard::C99 => None,
-            CStandard::C11 => Some("/std:c11"),
-            CStandard::C17 => Some("/std:c17"),
-        }
-    }
-
-    pub fn parse(text: &str) -> Option<CStandard> {
-        match text {
-            "c99" | "C99" => Some(CStandard::C99),
-            "c11" | "C11" => Some(CStandard::C11),
-            "c17" | "c18" | "C17" | "C18" => Some(CStandard::C17),
-            _ => None,
-        }
-    }
-}
+const C_STANDARD_GNU: &str = "-std=c11";
+const C_STANDARD_MSVC: &str = "/std:c11";
 
 /// Which flag dialect a C compiler speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +42,6 @@ impl Backend {
 pub struct CcInvocation<'a> {
     pub cc: &'a str,
     pub backend: Backend,
-    pub standard: CStandard,
     pub show_warnings: bool,
     pub extra: &'a [String],
 }
@@ -89,7 +55,7 @@ impl CcInvocation<'_> {
         let mut cmd = Command::new(self.cc);
         match self.backend {
             Backend::Gnu => {
-                cmd.arg(self.standard.gnu_flag());
+                cmd.arg(C_STANDARD_GNU);
                 if !self.show_warnings {
                     cmd.arg("-w");
                 }
@@ -97,9 +63,7 @@ impl CcInvocation<'_> {
                 cmd.args(sources).arg("-o").arg(output);
             }
             Backend::Msvc => {
-                if let Some(flag) = self.standard.msvc_flag() {
-                    cmd.arg(flag);
-                }
+                cmd.arg(C_STANDARD_MSVC);
                 if !self.show_warnings {
                     cmd.arg("/w");
                 }
@@ -127,7 +91,6 @@ mod tests {
         let inv = CcInvocation {
             cc: "clang",
             backend: Backend::Gnu,
-            standard: CStandard::C11,
             show_warnings: false,
             extra: &[],
         };
@@ -142,7 +105,6 @@ mod tests {
         let inv = CcInvocation {
             cc: "cl",
             backend: Backend::Msvc,
-            standard: CStandard::C11,
             show_warnings: false,
             extra: &[],
         };
@@ -157,7 +119,6 @@ mod tests {
         let inv = CcInvocation {
             cc: "gcc",
             backend: Backend::Gnu,
-            standard: CStandard::C11,
             show_warnings: true,
             extra: &[],
         };

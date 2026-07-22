@@ -908,7 +908,13 @@ impl Lowerer {
                     (ExprKind::Unresolved(text.into()), Ty::f64())
                 }
             },
-            SyntaxKind::StringLit => (ExprKind::Str(unquote(text)), Ty::Ptr(Box::new(Ty::CChar))),
+            SyntaxKind::StringLit => (
+                ExprKind::Str(unquote(text)),
+                Ty::Slice(Box::new(Ty::Int {
+                    bits: IntWidth::W8,
+                    signed: false,
+                })),
+            ),
             SyntaxKind::RuneLit => match decode_rune(text) {
                 Ok(c) => (ExprKind::Char(c), Ty::i8()),
                 Err(m) => {
@@ -1451,6 +1457,13 @@ impl Lowerer {
     }
 
     fn lower_cast(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
+        let outer = std::mem::replace(&mut self.in_extern, true);
+        let result = self.lower_cast_inner(node);
+        self.in_extern = outer;
+        result
+    }
+
+    fn lower_cast_inner(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         let ty_node = node.children().into_iter().find(|c| is_type(c.kind()));
         let operand = node
             .children()
@@ -1506,9 +1519,12 @@ impl Lowerer {
         }
         let mut type_nodes = Vec::new();
         collect_type_nodes(node, &mut type_nodes);
-        for tn in type_nodes {
+        for (tn, at_boundary) in type_nodes {
             if let Some(ty) = lower_type(&tn) {
+                let outer = self.in_extern;
+                self.in_extern = outer || at_boundary;
                 self.check_type(&ty, type_params, tn.span());
+                self.in_extern = outer;
             }
         }
     }
@@ -1585,7 +1601,7 @@ impl Lowerer {
                 if !self.in_extern {
                     self.err(
                         span,
-                        "`cchar` is only for `extern` declarations, where it matches C's `char`; use `int8` elsewhere",
+                        "`cchar` is only for the C boundary: an `extern` signature or a `cast`; use `int8` elsewhere",
                     );
                 }
             }
@@ -2615,7 +2631,15 @@ fn comptime_type_params(node: &SyntaxNode) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn collect_type_nodes(node: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
+fn collect_type_nodes(node: &SyntaxNode, out: &mut Vec<(SyntaxNode, bool)>) {
+    collect_type_nodes_inner(node, false, out)
+}
+
+fn collect_type_nodes_inner(
+    node: &SyntaxNode,
+    at_boundary: bool,
+    out: &mut Vec<(SyntaxNode, bool)>,
+) {
     for child in node.children() {
         if child.kind() == SyntaxKind::Param
             && child.token_of_kind(SyntaxKind::KwComptime).is_some()
@@ -2623,9 +2647,10 @@ fn collect_type_nodes(node: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
             continue;
         }
         if is_type(child.kind()) {
-            out.push(child);
+            out.push((child, at_boundary));
         } else {
-            collect_type_nodes(&child, out);
+            let boundary = at_boundary || child.kind() == SyntaxKind::CastExpr;
+            collect_type_nodes_inner(&child, boundary, out);
         }
     }
 }

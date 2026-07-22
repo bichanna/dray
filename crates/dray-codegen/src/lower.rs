@@ -438,7 +438,23 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
     Ok(match &e.kind {
         ExprKind::Int(v) => T::Int(*v),
         ExprKind::Float(v) => T::Double(*v),
-        ExprKind::Str(s) => T::Str(s.clone()),
+        ExprKind::Str(text) => {
+            let byte_len = text.len() as i64;
+            let elem = Ty::Int {
+                bits: dray_hir::IntWidth::W8,
+                signed: false,
+            };
+            T::new_compound_literal(
+                Type::base(BaseType::Struct(slice_struct_name(&elem))),
+                T::new_init_struct_designated(
+                    vec!["len".to_string(), "ptr".to_string()],
+                    vec![
+                        T::Int(byte_len),
+                        T::new_cast(Type::ptr(lower_ty(&elem)?), T::Str(text.clone())),
+                    ],
+                ),
+            )
+        }
         ExprKind::Char(c) => T::Char(*c),
         ExprKind::Bool(b) => T::Bool(*b),
         ExprKind::Name { def, name } => T::new_ident(c_name(ir, *def, name)),
@@ -762,7 +778,10 @@ fn slice_struct(elem: &Ty) -> Result<tamago::Struct> {
 }
 
 fn slice_element_types(ir: &Ir) -> Vec<Ty> {
-    let mut found: Vec<Ty> = Vec::new();
+    let mut found: Vec<Ty> = vec![Ty::Int {
+        bits: dray_hir::IntWidth::W8,
+        signed: false,
+    }];
     let mut note = |ty: &Ty| {
         if let Ty::Slice(elem) = ty
             && !found.contains(elem)
