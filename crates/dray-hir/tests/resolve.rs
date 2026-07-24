@@ -1103,3 +1103,96 @@ fn only_arrays_and_slices_can_be_sliced() {
     let errs = resolve_errors("f :: proc(n: int32) {\n    v := n[0:1];\n}\n");
     assert!(errs.iter().any(|e| e.contains("can be sliced")), "{errs:?}");
 }
+
+const MAYBE: &str = "Maybe :: enum(comptime T: type) {\n    Some(T),\n    None,\n}\n\n";
+
+#[test]
+fn weak_of_an_rc_pointer_is_a_type_of_its_own() {
+    let h = hir("N :: struct {\n    v: int32,\n}\n\nf :: proc(w: Weak(@N)) {\n}\n");
+    let Item::Proc(p) = &h.items[1] else { panic!() };
+    assert_eq!(
+        p.params[0].ty,
+        Ty::Weak(Box::new(Ty::Named("N".to_string())))
+    );
+}
+
+#[test]
+fn weak_needs_an_rc_pointer() {
+    for bad in ["Weak(int32)", "Weak(*int32)"] {
+        let errs = resolve_errors(&format!("f :: proc(w: {bad}) {{\n}}\n"));
+        assert!(
+            errs.iter().any(|e| e.contains("`Weak` takes one `@T`")),
+            "{bad}: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn downgrade_turns_a_strong_reference_into_a_weak_one() {
+    let src = "N :: struct {\n    v: int32,\n}\n\nf :: proc(n: @N) -> Weak(@N) {\n    return downgrade(n);\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn downgrade_needs_a_strong_reference() {
+    let errs = resolve_errors("f :: proc(n: int32) {\n    w := downgrade(n);\n}\n");
+    assert!(
+        errs.iter().any(|e| e.contains("`downgrade` takes an `@T`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn upgrade_produces_a_maybe_of_the_strong_reference() {
+    let src = format!(
+        "{MAYBE}N :: struct {{\n    v: int32,\n}}\n\nf :: proc(w: Weak(@N)) {{\n    m := upgrade(w);\n}}\n"
+    );
+    assert!(
+        resolve_errors(&src).is_empty(),
+        "{:?}",
+        resolve_errors(&src)
+    );
+    let h = hir(&src);
+    let Item::Proc(p) = &h.items[2] else { panic!() };
+    let Stmt::Let { ty, .. } = &p.body[0] else {
+        panic!("expected a let")
+    };
+    assert_eq!(
+        *ty,
+        Ty::App(
+            "Maybe".to_string(),
+            vec![Ty::Rc(Box::new(Ty::Named("N".to_string())))]
+        )
+    );
+}
+
+#[test]
+fn upgrade_needs_a_weak_reference() {
+    let src = format!(
+        "{MAYBE}N :: struct {{\n    v: int32,\n}}\n\nf :: proc(n: @N) {{\n    m := upgrade(n);\n}}\n"
+    );
+    let errs = resolve_errors(&src);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`upgrade` takes a `Weak(@T)`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn upgrade_says_so_when_maybe_is_not_declared() {
+    let src =
+        "N :: struct {\n    v: int32,\n}\n\nf :: proc(w: Weak(@N)) {\n    m := upgrade(w);\n}\n";
+    let errs = resolve_errors(src);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("no `Maybe` enum is declared")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn an_omitted_weak_field_is_the_empty_reference() {
+    let src = "P :: struct {\n    v: int32,\n}\n\nC :: struct {\n    v: int32,\n    parent: Weak(@P),\n}\n\nf :: proc() -> @C {\n    return alloc C{ v: 1 };\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}

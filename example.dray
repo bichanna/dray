@@ -1,4 +1,5 @@
 printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+rc_live :: extern "dray_rc_live" proc() -> int64;
 puts :: extern "puts" proc(s: *cchar) -> int32;
 
 say :: proc(text: []uint8) -> void {
@@ -12,6 +13,37 @@ sum :: proc(xs: []int32) -> int32 {
         total = total + n;
     }
     return total;
+}
+
+Maybe :: enum(comptime T: type) {
+    Some(T),
+    None,
+}
+
+Parent :: struct {
+    id: int32,
+    child: @Child,
+}
+
+Child :: struct {
+    id: int32,
+    parent: Weak(@Parent),
+}
+
+cycle_demo :: proc() -> int32 {
+    c := alloc Child{ id: 2 };
+    p := alloc Parent{ id: 1, child: c };
+    c.parent = downgrade(p);
+
+    printf(cast(*cchar) "allocations while linked: %d\n".ptr, rc_live());
+    switch upgrade(c.parent) {
+    case Maybe.Some(up):
+        printf(cast(*cchar) "child can reach parent %d\n".ptr, up.id);
+        return 0;
+    case Maybe.None:
+        printf(cast(*cchar) "parent already gone\n".ptr);
+        return 1;
+    }
 }
 
 main :: proc() -> int32 {
@@ -35,5 +67,8 @@ main :: proc() -> int32 {
     lo := 1;
     printf(cast(*cchar) "view[lo:] sum = %d\n".ptr, sum(view[lo:]));
 
-    return 0;
+    say("-- weak references --");
+    n := cycle_demo();
+    printf(cast(*cchar) "allocations after:        %d\n".ptr, rc_live());
+    return n;
 }

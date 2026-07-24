@@ -206,6 +206,8 @@ pub fn expr(e: &Expr) -> String {
             format!("{proc_name}[{}]({})", ts.join(", "), as_.join(", "))
         }
         ExprKind::SizeOf(t) => format!("sizeof({})", ty(t)),
+        ExprKind::Downgrade(inner) => format!("downgrade({})", expr(inner)),
+        ExprKind::Upgrade(inner) => format!("upgrade({})", expr(inner)),
         ExprKind::Unary { op, operand } => format!("({}{})", un(*op), expr(operand)),
         ExprKind::Binary { op, lhs, rhs } => {
             format!("({} {} {})", expr(lhs), bin(*op), expr(rhs))
@@ -289,6 +291,7 @@ pub fn ty(t: &Ty) -> String {
         Ty::Array(elem, n) => format!("[{n}]{}", ty(elem)),
         Ty::Slice(elem) => format!("[]{}", ty(elem)),
         Ty::Rc(inner) => format!("@{}", ty(inner)),
+        Ty::Weak(inner) => format!("Weak(@{})", ty(inner)),
         Ty::Named(n) => n.clone(),
         Ty::App(n, args) => {
             let a: Vec<String> = args.iter().map(ty).collect();

@@ -27,7 +27,7 @@ pub(crate) fn lower_type(node: &SyntaxNode) -> Option<Ty> {
             let name = node
                 .token_of_kind(SyntaxKind::Ident)
                 .map(|t| t.text().to_string())?;
-            let args = node
+            let args: Vec<Ty> = node
                 .child_of_kind(SyntaxKind::TypeArgList)
                 .map(|al| {
                     al.children()
@@ -37,7 +37,10 @@ pub(crate) fn lower_type(node: &SyntaxNode) -> Option<Ty> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(Ty::App(name, args))
+            match (name.as_str(), args.as_slice()) {
+                ("Weak", [Ty::Rc(pointee)]) => Some(Ty::Weak(pointee.clone())),
+                _ => Some(Ty::App(name, args)),
+            }
         }
         SyntaxKind::SliceType => {
             let elem = node.children().into_iter().find(|c| is_type(c.kind()))?;

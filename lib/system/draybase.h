@@ -95,4 +95,31 @@ void dray_rc_retain(void *p);
 void dray_rc_release(void *p);
 DrayI64 dray_rc_live(void);
 
+/* Weak references. A weak reference does not keep the payload alive. it keeps
+ * the *header* alive, so that an upgrade can ask whether the payload is still
+ * there. That is the two-phase free: the payload dies when the last strong
+ * reference goes, the header when the last weak one does. */
+void *dray_rc_downgrade(void *p);
+void dray_rc_weak_release(void *p);
+
+/* NULL when the payload is gone. On success the strong count is incremented,
+ * so the caller receives an owning reference like any other. */
+void *dray_rc_upgrade(void *p);
+
+/* Both print to stderr and abort. They are the only way a Dray program stops
+ * on a bad index, so they say which index and which length, not just that
+ * something went wrong. */
+DRAY_NORETURN void dray_index_fail(DrayI64 index, DrayI64 len);
+DRAY_NORETURN void dray_range_fail(DrayI64 lo, DrayI64 hi, DrayI64 len);
+DRAY_NORETURN void dray_range_from_fail(DrayI64 lo, DrayI64 len);
+
+/* Returns `index` when it is in range. Used where the length is a compile-time
+ * constant, so the generated C reads `arr[dray_check_index(i, 4)]`. */
+DrayI64 dray_check_index(DrayI64 index, DrayI64 len);
+
+/* Closes a proc whose every path returns in a way C cannot see—an exhaustive
+ * `switch`, say. Dray has already proved this is unreachable. Saying so keeps
+ * `-Werror=return-type` quiet without inventing a return value. */
+DRAY_NORETURN void dray_unreachable(void);
+
 #endif /* DRAYBASE_H */

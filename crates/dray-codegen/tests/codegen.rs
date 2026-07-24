@@ -712,7 +712,8 @@ fn only_pointed_to_aggregates_are_forward_declared() {
 fn a_fixed_array_lowers_to_a_c_array() {
     let out = c("main :: proc() -> int32 { xs: [3]int32 = {1, 2, 3}; return xs[0]; }\n");
     assert!(out.contains("DrayI32 xs[3] = {1, 2, 3}"), "{out}");
-    assert!(out.contains("xs[0]"), "{out}");
+    // The array's length is a constant, so the check needs nothing else.
+    assert!(out.contains("xs[dray_check_index((DrayI64)0, 3)]"), "{out}");
 }
 
 #[test]
@@ -727,10 +728,12 @@ fn a_slice_lowers_to_a_len_ptr_struct() {
 }
 
 #[test]
-fn indexing_a_slice_goes_through_its_data_pointer() {
+fn indexing_a_slice_goes_through_its_bounds_checked_helper() {
     let out = c("f :: proc(xs: []int32) -> int32 { return xs[0]; }\n\
                  main :: proc() -> int32 { return 0; }\n");
-    assert!(out.contains("xs.ptr[0]"), "{out}");
+    // The helper takes the whole fat pointer, so `xs` is evaluated once, and
+    // returns a pointer so the result stays assignable.
+    assert!(out.contains("*dray_index_int32(xs, (DrayI64)0)"), "{out}");
 }
 
 #[test]
@@ -780,7 +783,7 @@ fn for_in_over_a_slice_lowers_to_an_indexed_loop() {
                  }\n\
                  main :: proc() -> int32 { return 0; }\n");
     assert!(out.contains("< xs.len"), "{out}");
-    assert!(out.contains("= xs.ptr["), "{out}");
+    assert!(out.contains("*dray_index_int32(xs, "), "{out}");
 }
 
 #[test]
@@ -1005,5 +1008,190 @@ fn e2e_an_empty_range_is_a_zero_length_slice() {
     let src = "main :: proc() -> int32 {\n    a: [6]int32 = { 1, 2, 3, 4, 5, 6 };\n    v := a[3:3];\n    return v.len;\n}\n";
     if let Some(code) = compile_and_run(&c(src)) {
         assert_eq!(code, 0);
+    }
+}
+
+#[test]
+fn indexing_an_array_checks_against_its_constant_length() {
+    let out = c(
+        "f :: proc(i: int32) -> int32 {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    return a[i];\n}\n",
+    );
+    assert!(out.contains("a[dray_check_index((DrayI64)i, 4)]"), "{out}");
+}
+
+#[test]
+fn indexing_a_raw_pointer_is_not_checked() {
+    // There is no length to check against.
+    let out = c("f :: proc(p: *int32, i: int32) -> int32 {\n    return p[i];\n}\n");
+    assert!(out.contains("p[(DrayI64)i]"), "{out}");
+    assert!(!out.contains("dray_check_index"), "{out}");
+}
+
+#[test]
+fn the_slice_helpers_carry_the_bounds_checks() {
+    let out = c("f :: proc(xs: []int32) -> int32 {\n    return xs.len;\n}\n");
+    assert!(out.contains("dray_index_fail"), "{out}");
+    assert!(out.contains("dray_range_fail"), "{out}");
+    assert!(out.contains("dray_range_from_fail"), "{out}");
+}
+
+#[test]
+fn e2e_an_index_in_range_still_works() {
+    let src = "main :: proc() -> int32 {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    v := a[:];\n    i := 2;\n    return a[i] + v[i];\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 6);
+    }
+}
+
+#[test]
+fn e2e_assigning_through_a_checked_index_still_writes_through() {
+    let src = "main :: proc() -> int32 {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    v := a[:];\n    i := 1;\n    v[i] = 40;\n    return a[1];\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 40, "the slice must alias the array, not copy it");
+    }
+}
+
+#[test]
+fn e2e_an_out_of_range_index_aborts() {
+    let src = "main :: proc() -> int32 {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    i := 9;\n    return a[i];\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_ne!(code, 0, "an out-of-range index must not succeed");
+    }
+}
+
+#[test]
+fn e2e_an_out_of_range_slice_range_aborts() {
+    let src = "main :: proc() -> int32 {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    hi := 9;\n    v := a[1:hi];\n    return v.len;\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_ne!(code, 0);
+    }
+}
+
+#[test]
+fn e2e_the_empty_tail_range_is_legal() {
+    let src = "main :: proc() -> int32 {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    lo := 4;\n    v := a[lo:];\n    return v.len;\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 0);
+    }
+}
+
+const WEAK_PRELUDE: &str = "rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+    Maybe :: enum(comptime T: type) { Some(T), None }\n\
+    Parent :: struct { name: int32, child: @Child }\n\
+    Child :: struct { name: int32, parent: Weak(@Parent) }\n";
+
+#[test]
+fn a_weak_reference_is_a_plain_pointer_in_c() {
+    let out = c(&format!(
+        "{WEAK_PRELUDE}main :: proc() -> int32 {{ return 0; }}\n"
+    ));
+    assert!(out.contains("struct Parent *parent;"), "{out}");
+}
+
+#[test]
+fn drop_glue_lets_go_of_a_weak_field() {
+    let out = c(&format!(
+        "{WEAK_PRELUDE}main :: proc() -> int32 {{ return 0; }}\n"
+    ));
+    assert!(out.contains("dray_rc_weak_release(self->parent)"), "{out}");
+}
+
+#[test]
+fn downgrade_and_upgrade_call_the_runtime() {
+    let src = format!(
+        "{WEAK_PRELUDE}\
+        f :: proc(p: @Parent) -> int32 {{\n\
+            w := downgrade(p);\n\
+            switch upgrade(w) {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
+        }}\n\
+        main :: proc() -> int32 {{ return 0; }}\n"
+    );
+    let out = c(&src);
+    assert!(out.contains("dray_rc_downgrade(p)"), "{out}");
+    assert!(out.contains("dray_rc_upgrade("), "{out}");
+    assert!(out.contains("dray_upgrade_Maybe_rc_Parent"), "{out}");
+}
+
+#[test]
+fn a_switch_evaluates_its_scrutinee_once() {
+    let src = format!(
+        "{WEAK_PRELUDE}\
+        f :: proc(w: Weak(@Parent)) -> int32 {{\n\
+            switch upgrade(w) {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
+        }}\n\
+        main :: proc() -> int32 {{ return 0; }}\n"
+    );
+    let out = c(&src);
+    assert_eq!(out.matches("dray_rc_upgrade(").count(), 1, "{out}");
+}
+
+#[test]
+fn a_proc_ending_in_an_exhaustive_switch_closes_with_unreachable() {
+    let src = format!(
+        "{WEAK_PRELUDE}\
+        f :: proc(w: Weak(@Parent)) -> int32 {{\n\
+            switch upgrade(w) {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
+        }}\n\
+        main :: proc() -> int32 {{ return 0; }}\n"
+    );
+    assert!(c(&src).contains("dray_unreachable()"), "{}", c(&src));
+}
+
+/// The whole point of `Weak`: without it the parent and child keep each other alive forever.
+#[test]
+fn e2e_a_parent_child_cycle_is_collected() {
+    let src = format!(
+        "{WEAK_PRELUDE}\
+        build :: proc() -> int32 {{\n\
+            c := alloc Child{{ name: 2 }};\n\
+            p := alloc Parent{{ name: 1, child: c }};\n\
+            c.parent = downgrade(p);\n\
+            return cast(int32) rc_live();\n\
+        }}\n\
+        main :: proc() -> int32 {{\n\
+            live_inside := build();\n\
+            return live_inside * 10 + cast(int32) rc_live();\n\
+        }}\n"
+    );
+    if let Some(code) = compile_and_run(&c(&src)) {
+        assert_eq!(code, 20, "two allocations alive inside, none after");
+    }
+}
+
+#[test]
+fn e2e_upgrade_succeeds_while_the_owner_is_alive() {
+    let src = format!(
+        "{WEAK_PRELUDE}\
+        main :: proc() -> int32 {{\n\
+            c := alloc Child{{ name: 2 }};\n\
+            p := alloc Parent{{ name: 7, child: c }};\n\
+            c.parent = downgrade(p);\n\
+            switch upgrade(c.parent) {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
+        }}\n"
+    );
+    if let Some(code) = compile_and_run(&c(&src)) {
+        assert_eq!(code, 7);
+    }
+}
+
+#[test]
+fn e2e_upgrade_fails_once_the_owner_is_gone() {
+    let src = format!(
+        "{WEAK_PRELUDE}\
+        orphan :: proc() -> Weak(@Parent) {{\n\
+            c := alloc Child{{ name: 2 }};\n\
+            p := alloc Parent{{ name: 7, child: c }};\n\
+            return downgrade(p);\n\
+        }}\n\
+        main :: proc() -> int32 {{\n\
+            w := orphan();\n\
+            switch upgrade(w) {{ case Maybe.Some(up): return 1; case Maybe.None: return 0; }}\n\
+        }}\n"
+    );
+    if let Some(code) = compile_and_run(&c(&src)) {
+        assert_eq!(
+            code, 0,
+            "the payload is gone, so the upgrade must not succeed"
+        );
     }
 }

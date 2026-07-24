@@ -262,6 +262,8 @@ pub enum ExprKind {
         args: Vec<Expr>,
     },
     SizeOf(Ty),
+    Downgrade(Box<Expr>),
+    Upgrade(Box<Expr>),
     GenericCall {
         proc_name: String,
         type_args: Vec<Ty>,
@@ -356,6 +358,7 @@ pub enum Ty {
     CChar,
     Ptr(Box<Ty>),
     Rc(Box<Ty>),
+    Weak(Box<Ty>),
     Array(Box<Ty>, u64),
     Slice(Box<Ty>),
     Named(String),

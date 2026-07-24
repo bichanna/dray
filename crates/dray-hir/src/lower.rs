@@ -1266,6 +1266,13 @@ impl Lowerer {
 
         if let Some(cn) = &callee_node
             && cn.kind() == SyntaxKind::NameExpr
+            && matches!(ident_text(cn).as_str(), "downgrade" | "upgrade")
+        {
+            return self.lower_weak_op(node, &ident_text(cn));
+        }
+
+        if let Some(cn) = &callee_node
+            && cn.kind() == SyntaxKind::NameExpr
             && self.proc_type_params.contains_key(&ident_text(cn))
         {
             return self.lower_generic_call(node, &ident_text(cn));
@@ -1539,6 +1546,61 @@ impl Lowerer {
         )
     }
 
+    /// `downgrade(p)` and `upgrade(w)`, the two halves of a weak reference
+    fn lower_weak_op(&mut self, node: &SyntaxNode, op: &str) -> (ExprKind, Ty) {
+        let args: Vec<SyntaxNode> = node
+            .child_of_kind(SyntaxKind::ArgList)
+            .map(|al| al.children())
+            .unwrap_or_default();
+        let [arg] = args.as_slice() else {
+            self.err(
+                node.span(),
+                format!(
+                    "`{op}` takes exactly 1 argument, but {} were given",
+                    args.len()
+                ),
+            );
+            return (ExprKind::Unresolved(op.into()), Ty::Infer);
+        };
+        let value = self.lower_expr(arg);
+
+        if op == "downgrade" {
+            let Ty::Rc(pointee) = &value.ty else {
+                self.err(
+                    node.span(),
+                    format!(
+                        "`downgrade` takes an `@T`, but this is `{}`",
+                        type_name(&value.ty)
+                    ),
+                );
+                return (ExprKind::Unresolved(op.into()), Ty::Infer);
+            };
+            let ty = Ty::Weak(pointee.clone());
+            return (ExprKind::Downgrade(Box::new(value)), ty);
+        }
+
+        let Ty::Weak(pointee) = &value.ty else {
+            self.err(
+                node.span(),
+                format!(
+                    "`upgrade` takes a `Weak(@T)`, but this is `{}`",
+                    type_name(&value.ty)
+                ),
+            );
+            return (ExprKind::Unresolved(op.into()), Ty::Infer);
+        };
+        let ty = Ty::App("Maybe".to_string(), vec![Ty::Rc(pointee.clone())]);
+
+        if !self.enums.contains_key("Maybe") {
+            self.err(
+                node.span(),
+                "`upgrade` produces a `Maybe(@T)`, but no `Maybe` enum is declared",
+            );
+            return (ExprKind::Unresolved(op.into()), Ty::Infer);
+        }
+        (ExprKind::Upgrade(Box::new(value)), ty)
+    }
+
     fn lower_sizeof(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         let size_ty = Ty::Int {
             bits: IntWidth::Size,
@@ -1718,13 +1780,13 @@ impl Lowerer {
                 ),
             );
         }
-        if let (Ty::Array(_, len), Some(i)) = (&base.ty, const_int(&index))
-            && (i < 0 || i as u64 >= *len)
-        {
-            self.err(
-                parts[1].span(),
-                format!("index {i} is outside this array's {len} element(s)"),
-            );
+        if let (Ty::Array(_, len), Some(i)) = (&base.ty, const_int(&index)) {
+            if i < 0 || i as u64 >= *len {
+                self.err(
+                    parts[1].span(),
+                    format!("index {i} is outside this array's {len} element(s)"),
+                );
+            }
         }
 
         let ty = match &base.ty {
@@ -1861,6 +1923,15 @@ impl Lowerer {
                     None => self.err(span, format!("unknown type `{n}`")),
                 }
             }
+            Ty::App(name, args) if name == "Weak" => {
+                self.err(
+                    span,
+                    format!(
+                        "`Weak` takes one `@T`, but this is `Weak({})`",
+                        args.iter().map(type_name).collect::<Vec<_>>().join(", ")
+                    ),
+                );
+            }
             Ty::App(name, args) => {
                 if type_params.iter().any(|p| p == name) {
                     self.err(
@@ -1888,9 +1959,11 @@ impl Lowerer {
                     self.check_type(a, type_params, span);
                 }
             }
-            Ty::Ptr(inner) | Ty::Rc(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => {
-                self.check_type(inner, type_params, span)
-            }
+            Ty::Ptr(inner)
+            | Ty::Rc(inner)
+            | Ty::Weak(inner)
+            | Ty::Array(inner, _)
+            | Ty::Slice(inner) => self.check_type(inner, type_params, span),
             Ty::CChar => {
                 if !self.in_extern {
                     self.err(
@@ -2473,7 +2546,7 @@ impl Lowerer {
             Ty::Named(n) | Ty::App(n, _) => {
                 return self.zero_aggregate(ty, n, span, struct_name, field);
             }
-            Ty::Array(..) | Ty::Slice(_) => ExprKind::ZeroValue(ty.clone()),
+            Ty::Array(..) | Ty::Slice(_) | Ty::Weak(_) => ExprKind::ZeroValue(ty.clone()),
             Ty::Void | Ty::Infer => {
                 self.err(
                     span,
@@ -2733,6 +2806,7 @@ fn type_name(ty: &Ty) -> String {
         Ty::Array(elem, n) => format!("[{n}]{}", type_name(elem)),
         Ty::Slice(elem) => format!("[]{}", type_name(elem)),
         Ty::Rc(inner) => format!("@{}", type_name(inner)),
+        Ty::Weak(inner) => format!("Weak(@{})", type_name(inner)),
         Ty::Infer => "?".to_string(),
     }
 }

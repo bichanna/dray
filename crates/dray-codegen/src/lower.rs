@@ -100,7 +100,22 @@ fn proc_prototype(p: &Proc) -> Result<tamago::Function> {
 }
 
 fn lower_proc(ir: &Ir, p: &Proc) -> Result<tamago::Function> {
-    Ok(proc_signature(p)?.body(lower_body(ir, &p.body)?).build())
+    let mut body = lower_body(ir, &p.body)?;
+    if !matches!(p.ret, Ty::Void) && !ends_in_return(&p.body) {
+        let call =
+            tamago::Expr::new_fn_call(tamago::Expr::new_ident_with_str("dray_unreachable"), vec![]);
+        body.stmts.push(tamago::Statement::Expr(call));
+    }
+    Ok(proc_signature(p)?.body(body).build())
+}
+
+fn ends_in_return(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Located { stmt, .. }) => ends_in_return(std::slice::from_ref(stmt)),
+        Some(Stmt::Return(_)) => true,
+        Some(Stmt::Block(inner)) => ends_in_return(inner),
+        _ => false,
+    }
 }
 
 fn lower_body(ir: &Ir, stmts: &[Stmt]) -> Result<Block> {
@@ -206,6 +221,8 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
         }
         Stmt::Retain(name) => Statement::Expr(rc_call("dray_rc_retain", name)),
         Stmt::Release(name) | Stmt::Free(name) => Statement::Expr(rc_call("dray_rc_release", name)),
+        Stmt::WeakRetain(name) => Statement::Expr(rc_call("dray_rc_downgrade", name)),
+        Stmt::WeakRelease(name) => Statement::Expr(rc_call("dray_rc_weak_release", name)),
         Stmt::Switch { scrutinee, arms } => lower_switch(ir, scrutinee, arms)?,
     })
 }
@@ -225,7 +242,11 @@ fn stmt_uses_name(s: &Stmt, name: &str) -> bool {
         Stmt::Block(body) => block_uses_name(body, name),
         Stmt::Located { stmt, .. } => stmt_uses_name(stmt, name),
         Stmt::DropValue { name: n, .. } => n == name,
-        Stmt::Retain(n) | Stmt::Release(n) | Stmt::Free(n) => n == name,
+        Stmt::Retain(n)
+        | Stmt::Release(n)
+        | Stmt::Free(n)
+        | Stmt::WeakRetain(n)
+        | Stmt::WeakRelease(n) => n == name,
         Stmt::Return(None) | Stmt::Break | Stmt::Continue => false,
         Stmt::If {
             cond,
@@ -270,6 +291,7 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
             expr_uses_name(base, name) || expr_uses_name(index, name)
         }
         ExprKind::Cast { operand, .. } => expr_uses_name(operand, name),
+        ExprKind::Downgrade(inner) | ExprKind::Upgrade(inner) => expr_uses_name(inner, name),
         ExprKind::Alloc { fields, .. } | ExprKind::StructLit { fields, .. } => {
             fields.iter().any(|(_, v)| expr_uses_name(v, name))
         }
@@ -474,14 +496,40 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             }
         }
         ExprKind::Index { base, index } => {
-            let indexable = match &base.ty {
-                Ty::Slice(_) => T::new_mem_access(lower_expr(ir, base)?, "ptr".to_string()),
-                _ => lower_expr(ir, base)?,
-            };
-            T::new_arr_index(indexable, lower_expr(ir, index)?)
+            let i = as_index(lower_expr(ir, index)?);
+            match &base.ty {
+                // An array's length is a compile-time constant, so the check
+                // needs nothing but the index and that constant
+                Ty::Array(_, len) => {
+                    let checked = T::new_fn_call(
+                        T::new_ident_with_str("dray_check_index"),
+                        vec![i, T::Int(*len as i64)],
+                    );
+                    T::new_arr_index(lower_expr(ir, base)?, checked)
+                }
+                Ty::Slice(elem) => {
+                    let call = T::new_fn_call(
+                        T::new_ident(index_fn_name(elem)),
+                        vec![lower_expr(ir, base)?, i],
+                    );
+                    T::new_unary(call, tamago::UnaryOp::Deref)
+                }
+                _ => T::new_arr_index(lower_expr(ir, base)?, i),
+            }
         }
         ExprKind::Cast { ty, operand } => T::new_cast(lower_ty(ty)?, lower_expr(ir, operand)?),
         ExprKind::SizeOf(ty) => T::new_sizeof(lower_ty(ty)?),
+        ExprKind::Downgrade(inner) => T::new_fn_call(
+            T::new_ident_with_str("dray_rc_downgrade"),
+            vec![lower_expr(ir, inner)?],
+        ),
+        ExprKind::Upgrade(inner) => {
+            let live = T::new_fn_call(
+                T::new_ident_with_str("dray_rc_upgrade"),
+                vec![lower_expr(ir, inner)?],
+            );
+            T::new_fn_call(T::new_ident(upgrade_fn_name(&e.ty)), vec![live])
+        }
         ExprKind::ArrayLit { elements, .. } => {
             let mut values = Vec::with_capacity(elements.len());
             for e in elements {
@@ -492,7 +540,7 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
         ExprKind::ZeroValue(ty) => match ty {
             Ty::Bool => T::Bool(false),
             Ty::Float { .. } => T::Double(0.0),
-            Ty::Int { .. } | Ty::Ptr(_) | Ty::Rc(_) => T::Int(0),
+            Ty::Int { .. } | Ty::Ptr(_) | Ty::Rc(_) | Ty::Weak(_) => T::Int(0),
             _ => T::new_init_struct_in_order(vec![T::Int(0)]),
         },
         ExprKind::Slice { array, lo, hi } => {
@@ -522,12 +570,7 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
                 _ => lower_expr(ir, array)?,
             };
 
-            let index = |e: &Expr| -> Result<tamago::Expr> {
-                Ok(T::new_cast(
-                    Type::base(BaseType::TypeDef(SLICE_LEN_TYPE.to_string())),
-                    lower_expr(ir, e)?,
-                ))
-            };
+            let index = |e: &Expr| -> Result<tamago::Expr> { Ok(as_index(lower_expr(ir, e)?)) };
             match (lo, hi) {
                 (None, None) => whole,
                 (Some(lo), None) => T::new_fn_call(
@@ -621,7 +664,7 @@ fn lower_ty(t: &Ty) -> Result<Type> {
         Ty::Float { bits } => Type::base(B::TypeDef(
             if *bits == 32 { "DrayF32" } else { "DrayF64" }.to_string(),
         )),
-        Ty::Ptr(inner) | Ty::Rc(inner) => Type::ptr(lower_ty(inner)?),
+        Ty::Ptr(inner) | Ty::Rc(inner) | Ty::Weak(inner) => Type::ptr(lower_ty(inner)?),
         Ty::Named(n) => Type::base(B::Struct(n.clone())),
         Ty::Array(elem, n) => Type::array(lower_ty(elem)?, Some(tamago::Expr::Int(*n as i64))),
         Ty::Slice(elem) => Type::base(B::Struct(slice_struct_name(elem))),
@@ -775,6 +818,10 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
                 enum_ctor_signature(ed, v)?.build(),
             ));
         }
+    }
+
+    for maybe in upgrade_result_types(ir) {
+        out.push(upgrade_helper(&maybe)?);
     }
 
     // 4. The definitions themselves.
@@ -949,52 +996,316 @@ fn c_ident(name: &str) -> String {
 /// The type of a slice's `len`, and so of the bounds indexing into one
 pub(crate) const SLICE_LEN_TYPE: &str = "DrayI32";
 
-fn slice_helpers(elem: &Ty) -> Result<Vec<GlobalStatement>> {
-    use tamago::Expr as T;
+/// The type indices and lengths are compared in. Wider than `len` so that an
+/// `int64` index is checked at its own width rather than truncated first
+pub(crate) const INDEX_TYPE: &str = "DrayI64";
 
-    let slice_ty = Type::base(BaseType::Struct(slice_struct_name(elem)));
-    let len_ty = Type::base(BaseType::TypeDef(SLICE_LEN_TYPE.to_string()));
-    let ptr_plus_lo = T::new_binary(
+fn slice_helpers(elem: &Ty) -> Result<Vec<GlobalStatement>> {
+    Ok(vec![
+        index_helper(elem)?,
+        slice_helper(elem)?,
+        slice_from_helper(elem)?,
+    ])
+}
+
+fn slice_len() -> tamago::Expr {
+    let len =
+        tamago::Expr::new_mem_access(tamago::Expr::new_ident_with_str("s"), "len".to_string());
+    tamago::Expr::new_cast(Type::base(BaseType::TypeDef(INDEX_TYPE.to_string())), len)
+}
+
+/// `if (<cond>) <fail>(<args>);` the whole body of every bounds check
+fn bail_when(cond: tamago::Expr, fail: &str, args: Vec<tamago::Expr>) -> tamago::Statement {
+    let call = tamago::Expr::new_fn_call(tamago::Expr::new_ident_with_str(fail), args);
+    let then = BlockBuilder::new()
+        .statement(tamago::Statement::Expr(call))
+        .build();
+    tamago::Statement::If(tamago::IfBuilder::new_with_then(cond, then).build())
+}
+
+fn or(left: tamago::Expr, right: tamago::Expr) -> tamago::Expr {
+    tamago::Expr::new_binary(left, tamago::BinOp::Or, right)
+}
+
+fn cmp(left: tamago::Expr, op: tamago::BinOp, right: tamago::Expr) -> tamago::Expr {
+    tamago::Expr::new_binary(left, op, right)
+}
+
+fn helper_signature(name: String, ret: Type, elem: &Ty) -> FunctionBuilder {
+    FunctionBuilder::new(name, ret)
+        .make_static()
+        .raw_attr("DRAY_INLINE")
+        .raw_attr("DRAY_UNUSED")
+        .param(
+            ParameterBuilder::new_with_str(
+                "s",
+                Type::base(BaseType::Struct(slice_struct_name(elem))),
+            )
+            .build(),
+        )
+}
+
+/// `dray_index_T(s, i)` returns `&s.ptr[i]`, so `xs[i]` stays assignable
+fn index_helper(elem: &Ty) -> Result<GlobalStatement> {
+    use tamago::Expr as T;
+    let index_ty = Type::base(BaseType::TypeDef(INDEX_TYPE.to_string()));
+    let i = T::new_ident_with_str("i");
+
+    let out_of_range = or(
+        cmp(i.clone(), tamago::BinOp::LT, T::Int(0)),
+        cmp(i.clone(), tamago::BinOp::GTE, slice_len()),
+    );
+    let check = bail_when(
+        out_of_range,
+        "dray_index_fail",
+        vec![i.clone(), slice_len()],
+    );
+
+    let ptr = T::new_mem_access(T::new_ident_with_str("s"), "ptr".to_string());
+    let elem_ptr = T::new_binary(ptr, tamago::BinOp::Add, i);
+
+    let f = helper_signature(index_fn_name(elem), Type::ptr(lower_ty(elem)?), elem)
+        .param(ParameterBuilder::new_with_str("i", index_ty).build())
+        .body(
+            BlockBuilder::new()
+                .statement(check)
+                .statement(tamago::Statement::Return(Some(elem_ptr)))
+                .build(),
+        )
+        .build();
+    Ok(GlobalStatement::Function(f))
+}
+
+fn slice_helper(elem: &Ty) -> Result<GlobalStatement> {
+    use tamago::Expr as T;
+    let index_ty = Type::base(BaseType::TypeDef(INDEX_TYPE.to_string()));
+    let (lo, hi) = (T::new_ident_with_str("lo"), T::new_ident_with_str("hi"));
+
+    let bad = or(
+        or(
+            cmp(lo.clone(), tamago::BinOp::LT, T::Int(0)),
+            cmp(hi.clone(), tamago::BinOp::LT, lo.clone()),
+        ),
+        cmp(hi.clone(), tamago::BinOp::GT, slice_len()),
+    );
+    let check = bail_when(
+        bad,
+        "dray_range_fail",
+        vec![lo.clone(), hi.clone(), slice_len()],
+    );
+
+    let f = helper_signature(
+        slice_fn_name(elem),
+        Type::base(BaseType::Struct(slice_struct_name(elem))),
+        elem,
+    )
+    .param(ParameterBuilder::new_with_str("lo", index_ty.clone()).build())
+    .param(ParameterBuilder::new_with_str("hi", index_ty).build())
+    .body(
+        BlockBuilder::new()
+            .statement(check)
+            .statement(narrowed_return(
+                elem,
+                T::new_binary(hi, tamago::BinOp::Sub, lo),
+            ))
+            .build(),
+    )
+    .build();
+    Ok(GlobalStatement::Function(f))
+}
+
+fn slice_from_helper(elem: &Ty) -> Result<GlobalStatement> {
+    use tamago::Expr as T;
+    let index_ty = Type::base(BaseType::TypeDef(INDEX_TYPE.to_string()));
+    let lo = T::new_ident_with_str("lo");
+
+    let bad = or(
+        cmp(lo.clone(), tamago::BinOp::LT, T::Int(0)),
+        cmp(lo.clone(), tamago::BinOp::GT, slice_len()),
+    );
+    let check = bail_when(bad, "dray_range_from_fail", vec![lo.clone(), slice_len()]);
+
+    let len = T::new_binary(slice_len(), tamago::BinOp::Sub, lo);
+    let f = helper_signature(
+        slice_from_fn_name(elem),
+        Type::base(BaseType::Struct(slice_struct_name(elem))),
+        elem,
+    )
+    .param(ParameterBuilder::new_with_str("lo", index_ty).build())
+    .body(
+        BlockBuilder::new()
+            .statement(check)
+            .statement(narrowed_return(elem, len))
+            .build(),
+    )
+    .build();
+    Ok(GlobalStatement::Function(f))
+}
+
+/// `return (struct DraySlice_T){ .len = <len>, .ptr = s.ptr + lo };`
+fn narrowed_return(elem: &Ty, len: tamago::Expr) -> tamago::Statement {
+    use tamago::Expr as T;
+    let ptr = T::new_binary(
         T::new_mem_access(T::new_ident_with_str("s"), "ptr".to_string()),
         tamago::BinOp::Add,
         T::new_ident_with_str("lo"),
     );
+    let len = T::new_cast(
+        Type::base(BaseType::TypeDef(SLICE_LEN_TYPE.to_string())),
+        len,
+    );
+    tamago::Statement::Return(Some(T::new_compound_literal(
+        Type::base(BaseType::Struct(slice_struct_name(elem))),
+        T::new_init_struct_designated(vec!["len".to_string(), "ptr".to_string()], vec![len, ptr]),
+    )))
+}
 
-    // `(struct DraySlice_T){ .len = <len>, .ptr = s.ptr + lo }`
-    let narrowed = |len: tamago::Expr| {
-        tamago::Statement::Return(Some(T::new_compound_literal(
-            slice_ty.clone(),
-            T::new_init_struct_designated(
-                vec!["len".to_string(), "ptr".to_string()],
-                vec![len, ptr_plus_lo.clone()],
-            ),
-        )))
+/// widen an index or bound to the type the bounds checks work in
+fn as_index(e: tamago::Expr) -> tamago::Expr {
+    tamago::Expr::new_cast(Type::base(BaseType::TypeDef(INDEX_TYPE.to_string())), e)
+}
+
+fn upgrade_fn_name(maybe: &Ty) -> String {
+    format!("dray_upgrade_{}", mangle_c_ty(maybe))
+}
+
+fn upgrade_helper(maybe: &Ty) -> Result<GlobalStatement> {
+    use tamago::Expr as T;
+
+    let name = match maybe {
+        Ty::Named(n) => n.clone(),
+        // Never generic by this point: monomorphization has already run.
+        other => {
+            return Err(CodegenError::new(format!(
+                "`upgrade` produced a non-enum type: {other:?}"
+            )));
+        }
     };
+    let p = T::new_ident_with_str("p");
+    let some = T::new_fn_call(T::new_ident(enum_ctor_name(&name, "Some")), vec![p.clone()]);
+    let none = T::new_fn_call(T::new_ident(enum_ctor_name(&name, "None")), vec![]);
 
-    let build = |name: String, takes_hi: bool| -> Result<GlobalStatement> {
-        let mut f = FunctionBuilder::new(name, slice_ty.clone())
-            .make_static()
-            .raw_attr("DRAY_INLINE")
-            .raw_attr("DRAY_UNUSED")
-            .param(ParameterBuilder::new_with_str("s", slice_ty.clone()).build())
-            .param(ParameterBuilder::new_with_str("lo", len_ty.clone()).build());
-        let end = if takes_hi {
-            f = f.param(ParameterBuilder::new_with_str("hi", len_ty.clone()).build());
-            T::new_ident_with_str("hi")
-        } else {
-            T::new_mem_access(T::new_ident_with_str("s"), "len".to_string())
-        };
-        let len = T::new_binary(end, tamago::BinOp::Sub, T::new_ident_with_str("lo"));
-        Ok(GlobalStatement::Function(
-            f.body(BlockBuilder::new().statement(narrowed(len)).build())
+    let then = BlockBuilder::new()
+        .statement(tamago::Statement::Return(Some(some)))
+        .build();
+    let f = FunctionBuilder::new(upgrade_fn_name(maybe), Type::base(BaseType::Struct(name)))
+        .make_static()
+        .raw_attr("DRAY_INLINE")
+        .raw_attr("DRAY_UNUSED")
+        .param(ParameterBuilder::new_with_str("p", Type::ptr(Type::base(BaseType::Void))).build())
+        .body(
+            BlockBuilder::new()
+                .statement(tamago::Statement::If(
+                    tamago::IfBuilder::new_with_then(p, then).build(),
+                ))
+                .statement(tamago::Statement::Return(Some(none)))
                 .build(),
-        ))
-    };
+        )
+        .build();
+    Ok(GlobalStatement::Function(f))
+}
 
-    Ok(vec![
-        build(slice_fn_name(elem), true)?,
-        build(slice_from_fn_name(elem), false)?,
-    ])
+fn upgrade_result_types(ir: &Ir) -> Vec<Ty> {
+    let mut found: Vec<Ty> = Vec::new();
+    for item in &ir.items {
+        if let Item::Proc(p) = item {
+            walk_stmt_exprs(&p.body, &mut |e| {
+                if matches!(e.kind, ExprKind::Upgrade(_)) && !found.contains(&e.ty) {
+                    found.push(e.ty.clone());
+                }
+            });
+        }
+    }
+    found
+}
+
+fn walk_stmt_exprs(stmts: &[Stmt], f: &mut impl FnMut(&Expr)) {
+    for s in stmts {
+        let s = match s {
+            Stmt::Located { stmt, .. } => stmt.as_ref(),
+            other => other,
+        };
+        match s {
+            Stmt::Block(body)
+            | Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::CFor { body, .. } => walk_stmt_exprs(body, f),
+            Stmt::Let { init, .. } => walk_exprs(init, f),
+            Stmt::Assign { target, value, .. } => {
+                walk_exprs(target, f);
+                walk_exprs(value, f);
+            }
+            Stmt::Return(Some(e)) | Stmt::Expr(e) => walk_exprs(e, f),
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                walk_exprs(cond, f);
+                walk_stmt_exprs(then_branch, f);
+                if let Some(b) = else_branch {
+                    walk_stmt_exprs(b, f);
+                }
+            }
+            Stmt::Switch { scrutinee, arms } => {
+                walk_exprs(scrutinee, f);
+                for a in arms {
+                    walk_stmt_exprs(&a.body, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(e);
+    match &e.kind {
+        ExprKind::Unary { operand, .. } => walk_exprs(operand, f),
+        ExprKind::Paren(inner) | ExprKind::Cast { operand: inner, .. } => walk_exprs(inner, f),
+        ExprKind::Downgrade(inner) | ExprKind::Upgrade(inner) => walk_exprs(inner, f),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            walk_exprs(lhs, f);
+            walk_exprs(rhs, f);
+        }
+        ExprKind::Field { recv, .. } => walk_exprs(recv, f),
+        ExprKind::Index { base, index } => {
+            walk_exprs(base, f);
+            walk_exprs(index, f);
+        }
+        ExprKind::Slice { array, lo, hi } => {
+            walk_exprs(array, f);
+            for b in lo.iter().chain(hi.iter()) {
+                walk_exprs(b, f);
+            }
+        }
+        ExprKind::Call { callee, args } => {
+            walk_exprs(callee, f);
+            for a in args {
+                walk_exprs(a, f);
+            }
+        }
+        ExprKind::EnumInit { args, .. } | ExprKind::GenericCall { args, .. } => {
+            for a in args {
+                walk_exprs(a, f);
+            }
+        }
+        ExprKind::ArrayLit { elements, .. } => {
+            for el in elements {
+                walk_exprs(el, f);
+            }
+        }
+        ExprKind::Alloc { fields, .. } | ExprKind::StructLit { fields, .. } => {
+            for (_, v) in fields {
+                walk_exprs(v, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn index_fn_name(elem: &Ty) -> String {
+    format!("dray_index_{}", mangle_c_ty(elem))
 }
 
 fn slice_fn_name(elem: &Ty) -> String {
@@ -1029,6 +1340,7 @@ fn mangle_c_ty(ty: &Ty) -> String {
         Ty::Named(n) => n.clone(),
         Ty::Ptr(inner) => format!("ptr_{}", mangle_c_ty(inner)),
         Ty::Rc(inner) => format!("rc_{}", mangle_c_ty(inner)),
+        Ty::Weak(inner) => format!("weak_{}", mangle_c_ty(inner)),
         Ty::Array(elem, n) => format!("arr{n}_{}", mangle_c_ty(elem)),
         Ty::Slice(elem) => format!("slice_{}", mangle_c_ty(elem)),
         // Generics are gone by codegen and `Infer` never reaches a real type.
@@ -1158,6 +1470,12 @@ fn drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
                     vec![self_field("self", &f.name)],
                 )));
             }
+            Ty::Weak(_) => {
+                body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
+                    tamago::Expr::new_ident_with_str("dray_rc_weak_release"),
+                    vec![self_field("self", &f.name)],
+                )));
+            }
             Ty::Named(inner) if ty_holds_rc(ir, &f.ty) => {
                 body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
                     tamago::Expr::new_ident(format!("dray_drop_{inner}")),
@@ -1232,7 +1550,7 @@ fn has_rc_field(ir: &Ir, sd: &dray_ir::StructDef) -> bool {
 fn ty_holds_rc(ir: &Ir, ty: &Ty) -> bool {
     fn walk<'a>(ir: &'a Ir, ty: &'a Ty, seen: &mut Vec<&'a str>) -> bool {
         match ty {
-            Ty::Rc(_) => true,
+            Ty::Rc(_) | Ty::Weak(_) => true,
             Ty::Named(name) => {
                 if seen.contains(&name.as_str()) {
                     return false;

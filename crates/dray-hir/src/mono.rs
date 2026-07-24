@@ -338,6 +338,7 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::Float { bits } => format!("float{bits}"),
         Ty::Ptr(inner) => format!("ptr_{}", mangle_ty(inner)),
         Ty::Rc(inner) => format!("rc_{}", mangle_ty(inner)),
+        Ty::Weak(inner) => format!("weak_{}", mangle_ty(inner)),
         Ty::Array(elem, n) => format!("arr{n}_{}", mangle_ty(elem)),
         Ty::Slice(elem) => format!("slice_{}", mangle_ty(elem)),
         Ty::Named(n) => n.clone(),
@@ -554,6 +555,7 @@ fn each_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
             each_expr(index, f);
         }
         ExprKind::Cast { operand, .. } => each_expr(operand, f),
+        ExprKind::Downgrade(inner) | ExprKind::Upgrade(inner) => each_expr(inner, f),
         ExprKind::Alloc { fields, .. } | ExprKind::StructLit { fields, .. } => {
             for (_, fe) in fields {
                 each_expr(fe, f);
@@ -592,6 +594,7 @@ fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
     match &mut e.kind {
         ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => each_ty_in_expr(operand, f),
         ExprKind::SizeOf(ty) => f(ty),
+        ExprKind::Downgrade(inner) | ExprKind::Upgrade(inner) => each_ty_in_expr(inner, f),
         ExprKind::Binary { lhs, rhs, .. } => {
             each_ty_in_expr(lhs, f);
             each_ty_in_expr(rhs, f);

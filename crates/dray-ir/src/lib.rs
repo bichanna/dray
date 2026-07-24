@@ -154,6 +154,10 @@ pub enum Stmt {
     Retain(String),
     /// strong -= 1, free at zero
     Release(String),
+    /// one more weak reference to what this local points at
+    WeakRetain(String),
+    /// one fewer
+    WeakRelease(String),
     /// manual `free` (spec §4.6); emitted like a release for now
     Free(String),
 }
@@ -232,9 +236,19 @@ struct Lowerer {
 }
 
 #[derive(Debug, Clone)]
-struct Cleanup {
-    name: String,
-    by_value: Option<Ty>,
+enum Cleanup {
+    Strong(String),
+    Weak(String),
+    ByValue { name: String, ty: Ty },
+}
+
+impl Cleanup {
+    fn name(&self) -> &str {
+        match self {
+            Cleanup::Strong(name) | Cleanup::Weak(name) => name,
+            Cleanup::ByValue { name, .. } => name,
+        }
+    }
 }
 
 type Scopes = Vec<Vec<Cleanup>>;
@@ -298,21 +312,31 @@ impl Lowerer {
                     // A by- value struct/enum that contains `@T` fields: those
                     // references must be dropped when the value dies
                     if let Some(scope) = scopes.last_mut() {
-                        scope.push(Cleanup {
+                        scope.push(Cleanup::ByValue {
                             name: name.clone(),
-                            by_value: Some(ty.clone()),
+                            ty: ty.clone(),
                         });
                     }
 
                     self.uses_rc = true;
                 }
 
+                if matches!(ty, Ty::Weak(_)) {
+                    if let Some(scope) = scopes.last_mut() {
+                        scope.push(Cleanup::Weak(name.clone()));
+                    }
+                    // `downgrade(p)` hands back a reference this binding owns.
+                    // Anything else is a copy of a weak reference someone else
+                    // owns, so this binding needs one of its own.
+                    if !matches!(init.kind, dray_hir::ExprKind::Downgrade(_)) {
+                        self.uses_rc = true;
+                        out.push(Stmt::WeakRetain(name.clone()));
+                    }
+                }
+
                 if matches!(ty, Ty::Rc(_)) {
                     if let Some(scope) = scopes.last_mut() {
-                        scope.push(Cleanup {
-                            name: name.clone(),
-                            by_value: None,
-                        });
+                        scope.push(Cleanup::Strong(name.clone()));
                     }
                     if is_rc_borrow(init) {
                         // rule 2: a borrowed @T (Name, Field, …) → retain the
@@ -379,6 +403,31 @@ impl Lowerer {
                 });
             }
             H::Switch { scrutinee, arms } => {
+                // Codegen reads the tag once and each arm reads the payload
+                // again, so a scrutinee written inline would be evaluated more
+                // than once. `upgrade(w)` makes that a real bug rather than
+                // just waste: it increments the strong count every time it
+                // runs. Naming it also gives it a lifetime, so a `Maybe(@T)`
+                // produced right here is released when the switch ends instead
+                // of leaking the reference it holds.
+                let name = self.fresh_temp(scrutinee.ty.clone());
+                out.push(Stmt::Let {
+                    name: name.clone(),
+                    ty: scrutinee.ty.clone(),
+                    init: scrutinee.clone(),
+                });
+
+                let mut scope = Vec::new();
+                if self.holds_rc(&scrutinee.ty) {
+                    self.uses_rc = true;
+                    scope.push(Cleanup::ByValue {
+                        name: name.clone(),
+                        ty: scrutinee.ty.clone(),
+                    });
+                }
+                scopes.push(scope);
+
+                let bound = self.name_expr(&name, scrutinee.ty.clone(), scrutinee.span);
                 let arms = arms
                     .iter()
                     .map(|a| SwitchArm {
@@ -387,9 +436,12 @@ impl Lowerer {
                     })
                     .collect();
                 out.push(Stmt::Switch {
-                    scrutinee: scrutinee.clone(),
+                    scrutinee: bound,
                     arms,
                 });
+
+                let scope = scopes.pop().unwrap_or_default();
+                self.release(&scope, out);
             }
         }
     }
@@ -401,7 +453,7 @@ impl Lowerer {
         for st in out.iter_mut().skip(before) {
             let lowered = std::mem::replace(st, Stmt::Break);
             *st = Stmt::Located {
-                offset: span.start as u32,
+                offset: span.start,
                 stmt: Box::new(lowered),
             };
         }
@@ -431,7 +483,7 @@ impl Lowerer {
         let transferred = expr.and_then(|e| transferred_local(scopes, e));
         let mut live: Vec<Cleanup> = scopes.iter().flatten().cloned().collect();
         if let Some(t) = &transferred
-            && let Some(idx) = live.iter().rposition(|c| &c.name == t)
+            && let Some(idx) = live.iter().rposition(|c| c.name() == t)
         {
             live.remove(idx);
         }
@@ -596,7 +648,7 @@ impl Lowerer {
         match inner {
             Some(types) => types
                 .iter()
-                .any(|t| matches!(t, Ty::Rc(_)) || self.holds_rc_inner(t, seen)),
+                .any(|t| matches!(t, Ty::Rc(_) | Ty::Weak(_)) || self.holds_rc_inner(t, seen)),
             None => false,
         }
     }
@@ -604,12 +656,13 @@ impl Lowerer {
     fn release(&mut self, locals: &[Cleanup], out: &mut Vec<Stmt>) {
         for local in locals.iter().rev() {
             self.uses_rc = true;
-            match &local.by_value {
-                Some(ty) => out.push(Stmt::DropValue {
-                    name: local.name.clone(),
+            match local {
+                Cleanup::ByValue { name, ty } => out.push(Stmt::DropValue {
+                    name: name.clone(),
                     ty: ty.clone(),
                 }),
-                None => out.push(Stmt::Release(local.name.clone())),
+                Cleanup::Strong(name) => out.push(Stmt::Release(name.clone())),
+                Cleanup::Weak(name) => out.push(Stmt::WeakRelease(name.clone())),
             }
         }
     }
@@ -652,9 +705,11 @@ fn is_rc_borrow(e: &Expr) -> bool {
 }
 
 fn is_live_rc_local(scopes: &Scopes, name: &str) -> bool {
-    scopes
-        .iter()
-        .any(|scope| scope.iter().any(|c| c.name == name && c.by_value.is_none()))
+    scopes.iter().any(|scope| {
+        scope
+            .iter()
+            .any(|c| matches!(c, Cleanup::Strong(n) if n == name))
+    })
 }
 
 fn transferred_local(scopes: &Scopes, e: &Expr) -> Option<String> {
