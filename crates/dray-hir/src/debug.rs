@@ -234,7 +234,10 @@ pub fn expr(e: &Expr) -> String {
             format!("{}{{ {} }}", ty(t), es.join(", "))
         }
         ExprKind::ZeroValue(t) => format!("zero({})", ty(t)),
-        ExprKind::SliceAll { array } => format!("{}[:]", expr(array)),
+        ExprKind::Slice { array, lo, hi } => {
+            let bound = |b: &Option<Box<Expr>>| b.as_ref().map(|e| expr(e)).unwrap_or_default();
+            format!("{}[{}:{}]", expr(array), bound(lo), bound(hi))
+        }
         ExprKind::StructLit { ty: t, fields } => {
             let fs: Vec<String> = fields
                 .iter()

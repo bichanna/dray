@@ -868,3 +868,238 @@ fn some_operators_are_defined_only_for_some_types() {
         "{ordered:?}"
     );
 }
+
+#[test]
+fn a_proc_that_falls_off_the_end_is_rejected() {
+    let errs = resolve_errors("f :: proc() -> int32 {\n    x := 1;\n}\n");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("control can reach the end of `f`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_void_proc_needs_no_return() {
+    assert!(resolve_errors("f :: proc() {\n    x := 1;\n}\n").is_empty());
+}
+
+#[test]
+fn both_branches_returning_is_enough() {
+    let src = "f :: proc(c: bool) -> int32 {\n    if c {\n        return 1;\n    } else {\n        return 2;\n    }\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn an_if_without_an_else_is_not_enough() {
+    let src = "f :: proc(c: bool) -> int32 {\n    if c {\n        return 1;\n    }\n}\n";
+    assert_eq!(resolve_errors(src).len(), 1);
+}
+
+#[test]
+fn a_loop_with_no_break_never_falls_out() {
+    let src = "f :: proc() -> int32 {\n    for {\n        return 1;\n    }\n}\n";
+    assert!(resolve_errors(src).is_empty());
+}
+
+#[test]
+fn a_loop_that_can_break_can_fall_out() {
+    let src = "f :: proc() -> int32 {\n    for {\n        break;\n    }\n}\n";
+    assert_eq!(resolve_errors(src).len(), 1);
+}
+
+#[test]
+fn a_conditional_loop_is_not_enough() {
+    let src = "f :: proc(c: bool) -> int32 {\n    for c {\n        return 1;\n    }\n}\n";
+    assert_eq!(resolve_errors(src).len(), 1);
+}
+
+#[test]
+fn an_exhaustive_switch_with_returning_arms_is_enough() {
+    let src = "E :: enum { A, B }\nf :: proc(e: E) -> int32 {\n    switch e {\n    case E.A:\n        return 1;\n    case E.B:\n        return 2;\n    }\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn a_switch_arm_that_only_breaks_is_not_enough() {
+    let src = "E :: enum { A, B }\nf :: proc(e: E) -> int32 {\n    switch e {\n    case E.A:\n        return 1;\n    case E.B:\n        break;\n    }\n}\n";
+    assert_eq!(resolve_errors(src).len(), 1);
+}
+
+#[test]
+fn a_break_inside_a_switch_does_not_escape_the_loop() {
+    let src = "E :: enum { A }\nf :: proc(e: E) -> int32 {\n    for {\n        switch e {\n        case E.A:\n            break;\n        }\n    }\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn negation_needs_a_number() {
+    let errs = resolve_errors("f :: proc(b: bool) -> int32 {\n    x := -b;\n    return 0;\n}\n");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`-` is only defined for numbers")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn bitwise_not_needs_an_integer() {
+    let errs = resolve_errors("f :: proc(r: float64) -> int32 {\n    x := ~r;\n    return 0;\n}\n");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`~` is only defined for integers")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn address_of_needs_a_place() {
+    let errs = resolve_errors("f :: proc() -> int32 {\n    p := &(1 + 2);\n    return 0;\n}\n");
+    assert!(
+        errs.iter().any(|e| e.contains("`&` needs a variable")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn address_of_a_local_or_field_is_fine() {
+    let src = "P :: struct {\n    x: int32,\n}\n\nf :: proc(p: P) -> int32 {\n    a := &p.x;\n    n := 1;\n    b := &n;\n    return 0;\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn operators_on_a_comptime_type_parameter_are_left_alone() {
+    let src = "add :: proc(comptime T: type, a: T, b: T) -> T {\n    return a + b;\n}\n\nneg :: proc(comptime T: type, a: T) -> T {\n    return -a;\n}\n\nmain :: proc() -> int32 {\n    return add(1, neg(2));\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+fn cast_errors(from: &str, to: &str) -> Vec<String> {
+    let src = format!("f :: proc(v: {from}) {{\n    x := cast({to}) v;\n}}\n");
+    resolve_errors(&src)
+}
+
+#[test]
+fn numbers_convert_to_each_other() {
+    for (from, to) in [
+        ("int32", "int64"),
+        ("int32", "float64"),
+        ("float64", "int8"),
+        ("uint8", "int32"),
+    ] {
+        assert!(cast_errors(from, to).is_empty(), "{from} -> {to}");
+    }
+}
+
+#[test]
+fn bool_converts_to_and_from_integers_but_not_floats() {
+    assert!(cast_errors("bool", "int32").is_empty());
+    assert!(cast_errors("int32", "bool").is_empty());
+    assert!(!cast_errors("bool", "float64").is_empty());
+    assert!(!cast_errors("float64", "bool").is_empty());
+}
+
+#[test]
+fn raw_pointers_convert_to_each_other_and_to_a_pointer_sized_integer() {
+    assert!(cast_errors("*int32", "*int8").is_empty());
+    assert!(cast_errors("*int32", "usize").is_empty());
+    assert!(cast_errors("usize", "*int32").is_empty());
+}
+
+#[test]
+fn a_pointer_does_not_convert_to_a_narrow_integer() {
+    let errs = cast_errors("*int32", "int32");
+    assert!(errs.iter().any(|e| e.contains("cannot cast")), "{errs:?}");
+}
+
+#[test]
+fn an_rc_pointer_converts_down_to_the_raw_pointer_it_holds() {
+    let src = "N :: struct {\n    v: int32,\n}\n\nf :: proc(n: @N) {\n    p := cast(*N) n;\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn nothing_converts_up_into_an_rc_pointer() {
+    let src = "N :: struct {\n    v: int32,\n}\n\nf :: proc(p: *N) {\n    n := cast(@N) p;\n}\n";
+    let errs = resolve_errors(src);
+    assert!(errs.iter().any(|e| e.contains("cannot cast")), "{errs:?}");
+}
+
+#[test]
+fn aggregates_do_not_convert() {
+    let src = "P :: struct {\n    x: int32,\n}\n\nf :: proc(p: P) {\n    n := cast(int32) p;\n}\n";
+    assert!(!resolve_errors(src).is_empty());
+    assert!(!cast_errors("[4]int32", "[]int32").is_empty());
+    assert!(!cast_errors("[]int32", "int32").is_empty());
+}
+
+#[test]
+fn a_cast_in_a_generic_body_is_left_to_monomorphization() {
+    let src = "f :: proc(comptime T: type, v: T) -> int32 {\n    return cast(int32) v;\n}\n\nmain :: proc() -> int32 {\n    return f(1);\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn a_slice_range_yields_a_slice_of_the_element_type() {
+    let h = hir("f :: proc(a: [6]int32) {\n    v := a[1:4];\n}\n");
+    let Item::Proc(p) = &h.items[0] else { panic!() };
+    let Stmt::Let { ty, .. } = &p.body[0] else {
+        panic!("expected a let")
+    };
+    assert_eq!(*ty, Ty::Slice(Box::new(Ty::i32())));
+}
+
+#[test]
+fn slice_bounds_are_optional_and_kept_in_order() {
+    let h = hir("f :: proc(a: [6]int32) {\n    v := a[2:];\n    w := a[:2];\n    x := a[:];\n}\n");
+    let Item::Proc(p) = &h.items[0] else { panic!() };
+    let bounds = |i: usize| {
+        let Stmt::Let { init, .. } = &p.body[i] else {
+            panic!("expected a let")
+        };
+        let ExprKind::Slice { lo, hi, .. } = &init.kind else {
+            panic!("expected a slice")
+        };
+        (lo.is_some(), hi.is_some())
+    };
+    assert_eq!(bounds(0), (true, false), "a[2:]");
+    assert_eq!(bounds(1), (false, true), "a[:2]");
+    assert_eq!(bounds(2), (false, false), "a[:]");
+}
+
+#[test]
+fn a_slice_bound_must_be_an_integer() {
+    let errs = resolve_errors("f :: proc(a: [6]int32) {\n    v := a[0:true];\n}\n");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("slice bound must be an integer")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn constant_bounds_are_checked_against_each_other() {
+    let errs = resolve_errors("f :: proc(a: [6]int32) {\n    v := a[4:2];\n}\n");
+    assert!(
+        errs.iter().any(|e| e.contains("starts at 4 but ends at 2")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn constant_bounds_are_checked_against_an_arrays_length() {
+    let errs = resolve_errors("f :: proc(a: [6]int32) {\n    v := a[0:9];\n}\n");
+    assert!(errs.iter().any(|e| e.contains("past the end")), "{errs:?}");
+    // one past the last element is the empty-tail slice, not an error
+    assert!(resolve_errors("f :: proc(a: [6]int32) {\n    v := a[0:6];\n}\n").is_empty());
+}
+
+#[test]
+fn bounds_on_a_slice_base_are_not_checked_statically() {
+    assert!(resolve_errors("f :: proc(a: []int32) {\n    v := a[9:99];\n}\n").is_empty());
+}
+
+#[test]
+fn only_arrays_and_slices_can_be_sliced() {
+    let errs = resolve_errors("f :: proc(n: int32) {\n    v := n[0:1];\n}\n");
+    assert!(errs.iter().any(|e| e.contains("can be sliced")), "{errs:?}");
+}

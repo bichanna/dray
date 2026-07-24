@@ -271,7 +271,12 @@ impl Lowerer {
         self.current_ret = ret.clone();
         let params = self.lower_params(node);
         let body = match node.child_of_kind(SyntaxKind::Block) {
-            Some(b) => self.lower_block(&b),
+            Some(b) => {
+                let errors_before = self.errors.len();
+                let body = self.lower_block(&b);
+                self.check_definite_return(&name, &ret, &body, errors_before, closing_brace(&b));
+                body
+            }
             None => {
                 self.err(node.span(), "proc without a body");
                 Vec::new()
@@ -501,25 +506,173 @@ impl Lowerer {
         Some(Stmt::Return(value.map(|(e, _)| e)))
     }
 
+    /// A proc that promises a value has to produce one on every path. C would
+    /// otherwise return whatever happened to be in the return register.
+    fn check_definite_return(
+        &mut self,
+        name: &str,
+        ret: &Ty,
+        body: &[Stmt],
+        errors_before: usize,
+        span: Span,
+    ) {
+        if matches!(ret, Ty::Void) || self.errors.len() != errors_before || self.terminates(body) {
+            return;
+        }
+        self.err(
+            span,
+            format!(
+                "control can reach the end of `{name}`, which must return `{}`",
+                type_name(ret)
+            ),
+        );
+    }
+
+    fn terminates(&self, stmts: &[Stmt]) -> bool {
+        stmts.last().is_some_and(|s| self.stmt_terminates(s))
+    }
+
+    fn stmt_terminates(&self, s: &Stmt) -> bool {
+        match s {
+            Stmt::Return(_) => true,
+            Stmt::Block(body) => self.terminates(body),
+            Stmt::If {
+                then_branch,
+                else_branch: Some(otherwise),
+                ..
+            } => self.terminates(then_branch) && self.terminates(otherwise),
+            Stmt::If {
+                else_branch: None, ..
+            } => false,
+            Stmt::Loop { body } => !breaks_out(body),
+            Stmt::CFor {
+                cond: None, body, ..
+            } => !breaks_out(body),
+            Stmt::While { .. } | Stmt::CFor { .. } => false,
+            Stmt::Switch { scrutinee, arms } => {
+                self.covers_every_variant(&scrutinee.ty, arms)
+                    && arms.iter().all(|a| self.terminates(&a.body))
+            }
+            Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Expr(_)
+            | Stmt::StaticAssert { .. } => false,
+        }
+    }
+
+    fn covers_every_variant(&self, scrut_ty: &Ty, arms: &[Arm]) -> bool {
+        let (Ty::Named(enum_name) | Ty::App(enum_name, _)) = scrut_ty else {
+            return false;
+        };
+        let Some(variants) = self.enums.get(enum_name) else {
+            return false;
+        };
+        variants.iter().all(|v| {
+            arms.iter().any(|a| match &a.pattern {
+                Pattern::Enum { variant, .. } => *variant == v.name,
+                Pattern::Value(_) => false,
+            })
+        })
+    }
+
+    fn check_cast(&mut self, from: &Ty, to: &Ty, span: Span) {
+        if self.opaque(from) || self.opaque(to) || self.cast_is_defined(from, to) {
+            return;
+        }
+        self.err(
+            span,
+            format!("cannot cast `{}` to `{}`", type_name(from), type_name(to)),
+        );
+    }
+
+    fn cast_is_defined(&self, from: &Ty, to: &Ty) -> bool {
+        if from == to {
+            return true;
+        }
+
+        match (from, to) {
+            // Raw pointers reinterpret freely, and round-trip through a
+            // pointer-sized integer. A narrower integer would not hold one
+            (Ty::Ptr(_), Ty::Ptr(_)) => true,
+
+            // `@T` down to the raw pointer it already holds
+            (Ty::Rc(a), Ty::Ptr(b)) => a == b,
+
+            (Ty::Ptr(_), i) | (i, Ty::Ptr(_)) => is_pointer_sized(i),
+
+            // Numbers and `cchar` convert between each other freely; `bool` is
+            // in that set too, as C's 0/1 one way and "nonzero" the other.
+            (a, b) if is_arithmetic(a) && is_arithmetic(b) => true,
+            (Ty::Bool, b) | (b, Ty::Bool) => is_integral(b),
+
+            _ => false,
+        }
+    }
+
+    fn opaque(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Infer => true,
+            Ty::Named(name) => !self.type_arity.contains_key(name),
+            _ => false,
+        }
+    }
+
     fn check_assign_target(&mut self, target: &Expr, span: Span) {
-        let describe = match &target.kind {
+        if let Some(why) = self.not_a_place(target) {
+            self.err(span, format!("cannot assign to it: {why}"));
+        }
+    }
+
+    fn check_addressable(&mut self, operand: &Expr, span: Span) {
+        if self.not_a_place(operand).is_some() {
+            self.err(
+                span,
+                "`&` needs a variable, field, or element to point at, not a temporary value",
+            );
+        }
+    }
+
+    fn not_a_place(&self, e: &Expr) -> Option<String> {
+        match &e.kind {
             ExprKind::Name { def, name } => match self.defs.get(def.0 as usize).map(|d| &d.kind) {
-                Some(DefKind::Local | DefKind::Param) => return,
+                Some(DefKind::Local | DefKind::Param) | None => None,
                 Some(DefKind::Proc | DefKind::ExternProc { .. }) => {
-                    format!("`{name}` is a proc")
+                    Some(format!("`{name}` is a proc"))
                 }
-                Some(DefKind::Struct) => format!("`{name}` is a struct type"),
-                Some(DefKind::Enum) => format!("`{name}` is an enum type"),
-                None => return,
+                Some(DefKind::Struct) => Some(format!("`{name}` is a struct type")),
+                Some(DefKind::Enum) => Some(format!("`{name}` is an enum type")),
             },
-            ExprKind::Field { .. } | ExprKind::Index { .. } => return,
+            ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Unresolved(_) => None,
             ExprKind::Unary {
                 op: UnOp::Deref, ..
-            } => return,
-            ExprKind::Paren(inner) => return self.check_assign_target(inner, span),
-            _ => "this is not a place that can hold a value".to_string(),
+            } => None,
+            ExprKind::Paren(inner) => self.not_a_place(inner),
+            _ => Some("this is not a place that can hold a value".to_string()),
+        }
+    }
+
+    fn check_unary_domain(&mut self, op: UnOp, operand: &Expr, span: Span) {
+        let ty = &operand.ty;
+        if self.opaque(ty) {
+            return;
+        }
+        let (ok, domain) = match op {
+            UnOp::Neg => (matches!(ty, Ty::Int { .. } | Ty::Float { .. }), "numbers"),
+            UnOp::BitNot => (matches!(ty, Ty::Int { .. }), "integers"),
+            _ => return,
         };
-        self.err(span, format!("cannot assign to it: {describe}"));
+        if !ok {
+            self.err(
+                span,
+                format!(
+                    "`{}` is only defined for {domain}, but this is `{}`",
+                    unary_operator_name(op),
+                    type_name(ty)
+                ),
+            );
+        }
     }
 
     fn lower_assign(&mut self, node: &SyntaxNode) -> Option<Stmt> {
@@ -952,7 +1105,10 @@ impl Lowerer {
                         self.expect_bool(&operand, "`!`", node.span());
                         Ty::Bool
                     }
-                    UnOp::AddrOf => Ty::Ptr(Box::new(operand.ty.clone())),
+                    UnOp::AddrOf => {
+                        self.check_addressable(&operand, node.span());
+                        Ty::Ptr(Box::new(operand.ty.clone()))
+                    }
                     UnOp::Deref => match &operand.ty {
                         Ty::Ptr(inner) | Ty::Rc(inner) => (**inner).clone(),
                         Ty::Infer => Ty::Infer,
@@ -967,7 +1123,10 @@ impl Lowerer {
                             Ty::Infer
                         }
                     },
-                    UnOp::Neg | UnOp::BitNot => operand.ty.clone(),
+                    UnOp::Neg | UnOp::BitNot => {
+                        self.check_unary_domain(op, &operand, node.span());
+                        operand.ty.clone()
+                    }
                 };
                 (
                     ExprKind::Unary {
@@ -1017,11 +1176,15 @@ impl Lowerer {
 
     fn check_operator_domain(&mut self, op: BinOp, operand: &Expr, span: Span) {
         let ty = &operand.ty;
+        if self.opaque(ty) {
+            return;
+        }
+
         let integers_only = matches!(
             op,
             BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
         );
-        if integers_only && !matches!(ty, Ty::Int { .. } | Ty::Infer) {
+        if integers_only && !matches!(ty, Ty::Int { .. }) {
             self.err(
                 span,
                 format!(
@@ -1034,7 +1197,7 @@ impl Lowerer {
         }
         let arithmetic = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
         let ordered = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
-        if (arithmetic || ordered) && !matches!(ty, Ty::Int { .. } | Ty::Float { .. } | Ty::Infer) {
+        if (arithmetic || ordered) && !matches!(ty, Ty::Int { .. } | Ty::Float { .. }) {
             self.err(
                 span,
                 format!(
@@ -1439,14 +1602,41 @@ impl Lowerer {
     /// `xs[:]` a slice over the whole of an array, which is how a `[]T` value
     /// comes into existence. The slice borrows; it does not own the elements.
     fn lower_slice_expr(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
-        let Some(array_node) = self.first_expr(node) else {
+        let mut array_node = None;
+        let mut lo_node = None;
+        let mut hi_node = None;
+        let mut past_colon = false;
+        for el in node.children_with_tokens() {
+            match el {
+                SyntaxElement::Token(t) if t.kind() == SyntaxKind::Colon => past_colon = true,
+                SyntaxElement::Node(n) if is_expr(n.kind()) => {
+                    if array_node.is_none() {
+                        array_node = Some(n);
+                    } else if past_colon {
+                        hi_node = Some(n);
+                    } else {
+                        lo_node = Some(n);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let Some(array_node) = array_node else {
             return (ExprKind::Unresolved("slice".into()), Ty::Infer);
         };
         let array = self.lower_expr(&array_node);
+        let lo = lo_node.map(|n| Box::new(self.lower_expr(&n)));
+        let hi = hi_node.map(|n| Box::new(self.lower_expr(&n)));
+
+        for bound in lo.iter().chain(hi.iter()) {
+            self.check_slice_bound(bound);
+        }
+        self.check_slice_range(&array.ty, lo.as_deref(), hi.as_deref());
+
         let ty = match &array.ty {
-            Ty::Array(elem, _) => Ty::Slice(elem.clone()),
-            // Already a slice: `xs[:]` is then just `xs`.
-            Ty::Slice(elem) => Ty::Slice(elem.clone()),
+            // Both give a `[]T`; on a slice a full range is the identity.
+            Ty::Array(elem, _) | Ty::Slice(elem) => Ty::Slice(elem.clone()),
             Ty::Infer => Ty::Infer,
             other => {
                 self.err(
@@ -1460,11 +1650,55 @@ impl Lowerer {
             }
         };
         (
-            ExprKind::SliceAll {
+            ExprKind::Slice {
                 array: Box::new(array),
+                lo,
+                hi,
             },
             ty,
         )
+    }
+
+    fn check_slice_bound(&mut self, bound: &Expr) {
+        if !matches!(bound.ty, Ty::Int { .. } | Ty::Infer) {
+            self.err(
+                bound.span,
+                format!(
+                    "a slice bound must be an integer, but this is `{}`",
+                    type_name(&bound.ty)
+                ),
+            );
+        }
+    }
+
+    fn check_slice_range(&mut self, base: &Ty, lo: Option<&Expr>, hi: Option<&Expr>) {
+        let lo = lo.and_then(|e| const_int(e).map(|v| (v, e.span)));
+        let hi = hi.and_then(|e| const_int(e).map(|v| (v, e.span)));
+
+        if let (Some((l, span)), Some((h, _))) = (lo, hi) {
+            if l > h {
+                self.err(span, format!("slice starts at {l} but ends at {h}"));
+                return;
+            }
+        }
+
+        if let Some((l, span)) = lo {
+            if l < 0 {
+                self.err(span, format!("a slice cannot start at {l}"));
+            }
+        }
+
+        let Ty::Array(_, len) = base else {
+            return;
+        };
+        for (value, span) in lo.into_iter().chain(hi) {
+            if value > *len as i64 {
+                self.err(
+                    span,
+                    format!("{value} is past the end of this array's {len} element(s)"),
+                );
+            }
+        }
     }
 
     fn lower_index(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
@@ -1531,6 +1765,7 @@ impl Lowerer {
         match (ty_node.and_then(|t| self.checked_type(&t)), operand) {
             (Some(ty), Some(op)) => {
                 let operand = self.lower_expr(&op);
+                self.check_cast(&operand.ty, &ty, node.span());
                 (
                     ExprKind::Cast {
                         ty: ty.clone(),
@@ -2406,6 +2641,33 @@ impl Lowerer {
 
 // ── free helpers ─────────────────────────────────────────────────────────────
 
+fn breaks_out(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Break => true,
+        Stmt::Block(body) => breaks_out(body),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => breaks_out(then_branch) || else_branch.as_deref().is_some_and(breaks_out),
+        _ => false,
+    })
+}
+
+/// The `}` that closes a block, so a "missing return" points at the end of the
+/// body rather than underlining all of it. Falls back to the whole block. Noice
+fn closing_brace(block: &SyntaxNode) -> Span {
+    block
+        .children_with_tokens()
+        .into_iter()
+        .rev()
+        .find_map(|el| match el {
+            SyntaxElement::Token(t) if t.kind() == SyntaxKind::RBrace => Some(t.span()),
+            _ => None,
+        })
+        .unwrap_or_else(|| block.span())
+}
+
 fn coerces_to(expected: &Ty, value: &Expr) -> bool {
     match expected {
         Ty::Int { .. } => is_untyped_int_literal(value),
@@ -2641,6 +2903,34 @@ fn mentions_rc(ty: &Ty) -> bool {
         Ty::Ptr(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => mentions_rc(inner),
         Ty::App(_, args) => args.iter().any(mentions_rc),
         _ => false,
+    }
+}
+
+fn is_arithmetic(ty: &Ty) -> bool {
+    matches!(ty, Ty::Int { .. } | Ty::Float { .. } | Ty::CChar)
+}
+
+fn is_integral(ty: &Ty) -> bool {
+    matches!(ty, Ty::Int { .. } | Ty::CChar)
+}
+
+fn is_pointer_sized(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Int {
+            bits: IntWidth::Size,
+            ..
+        }
+    )
+}
+
+fn unary_operator_name(op: UnOp) -> &'static str {
+    match op {
+        UnOp::Neg => "-",
+        UnOp::LogicNot => "!",
+        UnOp::BitNot => "~",
+        UnOp::AddrOf => "&",
+        UnOp::Deref => "*",
     }
 }
 

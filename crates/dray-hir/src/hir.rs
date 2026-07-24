@@ -251,8 +251,10 @@ pub enum ExprKind {
         elements: Vec<Expr>,
     },
     ZeroValue(Ty),
-    SliceAll {
+    Slice {
         array: Box<Expr>,
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
     },
     EnumInit {
         enum_name: String,

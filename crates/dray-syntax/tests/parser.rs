@@ -734,3 +734,76 @@ fn ellipsis_is_accepted_on_an_extern() {
     let p = parse("printf :: extern \"printf\" proc(fmt: *int8, ...) -> int32;\n");
     assert!(p.errors.is_empty(), "{:?}", p.errors);
 }
+
+fn bracket_kind(src: &str) -> SyntaxKind {
+    let p = parse(src);
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    assert_eq!(p.root.text(), src, "lossless");
+    fn find(node: &SyntaxNode) -> Option<SyntaxKind> {
+        if matches!(node.kind(), SyntaxKind::SliceExpr | SyntaxKind::IndexExpr) {
+            return Some(node.kind());
+        }
+        node.children().into_iter().find_map(|c| find(&c))
+    }
+    find(&p.root).expect("a SliceExpr or IndexExpr")
+}
+
+#[test]
+fn a_bare_colon_is_a_slice() {
+    assert_eq!(
+        bracket_kind("f :: proc() {\n    v := xs[:];\n}\n"),
+        SyntaxKind::SliceExpr
+    );
+}
+
+#[test]
+fn both_bounds_make_a_slice() {
+    assert_eq!(
+        bracket_kind("f :: proc() {\n    v := xs[1:4];\n}\n"),
+        SyntaxKind::SliceExpr
+    );
+}
+
+#[test]
+fn either_bound_alone_makes_a_slice() {
+    assert_eq!(
+        bracket_kind("f :: proc() {\n    v := xs[2:];\n}\n"),
+        SyntaxKind::SliceExpr
+    );
+    assert_eq!(
+        bracket_kind("f :: proc() {\n    v := xs[:2];\n}\n"),
+        SyntaxKind::SliceExpr
+    );
+}
+
+#[test]
+fn one_expression_is_still_an_index() {
+    assert_eq!(
+        bracket_kind("f :: proc() {\n    v := xs[2];\n}\n"),
+        SyntaxKind::IndexExpr
+    );
+}
+
+#[test]
+fn a_colon_nested_inside_the_index_does_not_make_a_slice() {
+    assert_eq!(
+        bracket_kind("f :: proc() {\n    v := xs[ys[1:2].len];\n}\n"),
+        SyntaxKind::IndexExpr
+    );
+}
+
+#[test]
+fn a_composite_literal_colon_does_not_make_a_slice() {
+    assert_eq!(
+        bracket_kind("f :: proc() {\n    v := xs[Point{x: 1}.x];\n}\n"),
+        SyntaxKind::IndexExpr
+    );
+}
+
+#[test]
+fn a_slice_range_keeps_both_bound_expressions() {
+    let src = "f :: proc() {\n    v := xs[a + 1:b];\n}\n";
+    let p = parse(src);
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    assert_eq!(p.root.text(), src, "lossless");
+}

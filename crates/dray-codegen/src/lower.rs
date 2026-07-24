@@ -277,7 +277,10 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
             args.iter().any(|a| expr_uses_name(a, name))
         }
         ExprKind::ArrayLit { elements, .. } => elements.iter().any(|e| expr_uses_name(e, name)),
-        ExprKind::SliceAll { array } => expr_uses_name(array, name),
+        ExprKind::Slice { array, lo, hi } => {
+            expr_uses_name(array, name)
+                || lo.iter().chain(hi.iter()).any(|b| expr_uses_name(b, name))
+        }
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -492,22 +495,56 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             Ty::Int { .. } | Ty::Ptr(_) | Ty::Rc(_) => T::Int(0),
             _ => T::new_init_struct_in_order(vec![T::Int(0)]),
         },
-        ExprKind::SliceAll { array } => {
-            let Ty::Array(elem, n) = &array.ty else {
-                // Already a slice: slicing the whole of it is the identity.
-                return lower_expr(ir, array);
+        ExprKind::Slice { array, lo, hi } => {
+            let elem = match &array.ty {
+                Ty::Array(elem, _) | Ty::Slice(elem) => (**elem).clone(),
+                _ => return lower_expr(ir, array),
             };
-            let base = lower_expr(ir, array)?;
-            T::new_compound_literal(
-                Type::base(BaseType::Struct(slice_struct_name(elem))),
-                T::new_init_struct_designated(
-                    vec!["len".to_string(), "ptr".to_string()],
-                    vec![
-                        T::Int(*n as i64),
-                        T::new_unary(T::new_arr_index(base, T::Int(0)), tamago::UnaryOp::AddrOf),
-                    ],
+
+            let whole = match &array.ty {
+                Ty::Array(_, n) => {
+                    let base = lower_expr(ir, array)?;
+                    T::new_compound_literal(
+                        Type::base(BaseType::Struct(slice_struct_name(&elem))),
+                        T::new_init_struct_designated(
+                            vec!["len".to_string(), "ptr".to_string()],
+                            vec![
+                                T::Int(*n as i64),
+                                T::new_unary(
+                                    T::new_arr_index(base, T::Int(0)),
+                                    tamago::UnaryOp::AddrOf,
+                                ),
+                            ],
+                        ),
+                    )
+                }
+                // already a slice
+                _ => lower_expr(ir, array)?,
+            };
+
+            let index = |e: &Expr| -> Result<tamago::Expr> {
+                Ok(T::new_cast(
+                    Type::base(BaseType::TypeDef(SLICE_LEN_TYPE.to_string())),
+                    lower_expr(ir, e)?,
+                ))
+            };
+            match (lo, hi) {
+                (None, None) => whole,
+                (Some(lo), None) => T::new_fn_call(
+                    T::new_ident(slice_from_fn_name(&elem)),
+                    vec![whole, index(lo)?],
                 ),
-            )
+                (lo, Some(hi)) => {
+                    let lo = match lo {
+                        Some(lo) => index(lo)?,
+                        None => T::Int(0),
+                    };
+                    T::new_fn_call(
+                        T::new_ident(slice_fn_name(&elem)),
+                        vec![whole, lo, index(hi)?],
+                    )
+                }
+            }
         }
         ExprKind::StructLit { ty, fields } => {
             let mut names = Vec::with_capacity(fields.len());
@@ -676,6 +713,7 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
 
     for elem in slice_element_types(ir) {
         out.push(GlobalStatement::Struct(slice_struct(&elem)?));
+        out.extend(slice_helpers(&elem)?);
     }
 
     let pointed_to = pointer_referenced_aggregates(ir);
@@ -906,6 +944,65 @@ fn c_ident(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// The type of a slice's `len`, and so of the bounds indexing into one
+pub(crate) const SLICE_LEN_TYPE: &str = "DrayI32";
+
+fn slice_helpers(elem: &Ty) -> Result<Vec<GlobalStatement>> {
+    use tamago::Expr as T;
+
+    let slice_ty = Type::base(BaseType::Struct(slice_struct_name(elem)));
+    let len_ty = Type::base(BaseType::TypeDef(SLICE_LEN_TYPE.to_string()));
+    let ptr_plus_lo = T::new_binary(
+        T::new_mem_access(T::new_ident_with_str("s"), "ptr".to_string()),
+        tamago::BinOp::Add,
+        T::new_ident_with_str("lo"),
+    );
+
+    // `(struct DraySlice_T){ .len = <len>, .ptr = s.ptr + lo }`
+    let narrowed = |len: tamago::Expr| {
+        tamago::Statement::Return(Some(T::new_compound_literal(
+            slice_ty.clone(),
+            T::new_init_struct_designated(
+                vec!["len".to_string(), "ptr".to_string()],
+                vec![len, ptr_plus_lo.clone()],
+            ),
+        )))
+    };
+
+    let build = |name: String, takes_hi: bool| -> Result<GlobalStatement> {
+        let mut f = FunctionBuilder::new(name, slice_ty.clone())
+            .make_static()
+            .raw_attr("DRAY_INLINE")
+            .raw_attr("DRAY_UNUSED")
+            .param(ParameterBuilder::new_with_str("s", slice_ty.clone()).build())
+            .param(ParameterBuilder::new_with_str("lo", len_ty.clone()).build());
+        let end = if takes_hi {
+            f = f.param(ParameterBuilder::new_with_str("hi", len_ty.clone()).build());
+            T::new_ident_with_str("hi")
+        } else {
+            T::new_mem_access(T::new_ident_with_str("s"), "len".to_string())
+        };
+        let len = T::new_binary(end, tamago::BinOp::Sub, T::new_ident_with_str("lo"));
+        Ok(GlobalStatement::Function(
+            f.body(BlockBuilder::new().statement(narrowed(len)).build())
+                .build(),
+        ))
+    };
+
+    Ok(vec![
+        build(slice_fn_name(elem), true)?,
+        build(slice_from_fn_name(elem), false)?,
+    ])
+}
+
+fn slice_fn_name(elem: &Ty) -> String {
+    format!("dray_slice_{}", mangle_c_ty(elem))
+}
+
+fn slice_from_fn_name(elem: &Ty) -> String {
+    format!("dray_slice_from_{}", mangle_c_ty(elem))
 }
 
 fn slice_struct_name(elem: &Ty) -> String {

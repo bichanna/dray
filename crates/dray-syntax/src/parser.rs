@@ -841,6 +841,27 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    fn bracket_opens_a_range(&self) -> bool {
+        let mut i = self.pos + 1;
+        let mut depth = 0i32;
+        while let Some(tok) = self.tokens.get(i) {
+            if tok.is_trivia() || matches!(tok.kind, TokenKind::Error(_)) {
+                i += 1;
+                continue;
+            }
+            match tok.kind {
+                TokenKind::Colon if depth == 0 => return true,
+                TokenKind::RBracket if depth == 0 => return false,
+                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => depth -= 1,
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn header_has_semi_before_brace(&self) -> bool {
         let mut i = self.pos;
         let mut paren = 0i32;
@@ -953,8 +974,7 @@ impl<'a> Parser<'a> {
                     self.finish_node();
                 }
                 TokenKind::LBracket => {
-                    // `xs[:]` takes a slice of the whole array, `xs[i]` indexes it
-                    let slicing = self.peek_nth(1) == TokenKind::Colon;
+                    let slicing = self.bracket_opens_a_range();
                     let kind = if slicing {
                         SyntaxKind::SliceExpr
                     } else {
@@ -962,13 +982,19 @@ impl<'a> Parser<'a> {
                     };
                     self.wrap_at(checkpoint, kind);
                     self.bump(); // [
+                    let saved = std::mem::replace(&mut self.no_struct_lit, false);
                     if slicing {
-                        self.bump(); // :
+                        if !self.at(TokenKind::Colon) {
+                            self.expr(); // low bound
+                        }
+                        self.expect(TokenKind::Colon, "':' in a slice range");
+                        if !self.at(TokenKind::RBracket) {
+                            self.expr(); // high bound
+                        }
                     } else {
-                        let saved = std::mem::replace(&mut self.no_struct_lit, false);
                         self.expr();
-                        self.no_struct_lit = saved;
                     }
+                    self.no_struct_lit = saved;
                     self.expect(TokenKind::RBracket, "']' after index");
                     self.finish_node();
                     type_shaped = false;

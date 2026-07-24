@@ -564,7 +564,12 @@ fn each_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
                 each_expr(e, f);
             }
         }
-        ExprKind::SliceAll { array } => each_expr(array, f),
+        ExprKind::Slice { array, lo, hi } => {
+            each_expr(array, f);
+            for b in lo.iter_mut().chain(hi.iter_mut()) {
+                each_expr(b, f);
+            }
+        }
         ExprKind::EnumInit { args, .. } | ExprKind::GenericCall { args, .. } => {
             for a in args {
                 each_expr(a, f);
@@ -619,7 +624,12 @@ fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
             }
         }
         ExprKind::ZeroValue(ty) => f(ty),
-        ExprKind::SliceAll { array } => each_ty_in_expr(array, f),
+        ExprKind::Slice { array, lo, hi } => {
+            each_ty_in_expr(array, f);
+            for b in lo.iter_mut().chain(hi.iter_mut()) {
+                each_ty_in_expr(b, f);
+            }
+        }
         ExprKind::EnumInit { args, .. } => {
             for a in args {
                 each_ty_in_expr(a, f);

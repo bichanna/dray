@@ -917,3 +917,93 @@ fn generated_c_names_drays_own_types() {
     assert!(out.contains("DrayBool b"), "{out}");
     assert!(!out.contains("int64_t"), "raw C type leaked: {out}");
 }
+
+#[test]
+fn a_full_range_is_still_the_plain_fat_pointer() {
+    let src = "f :: proc() {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    v := a[:];\n}\n";
+    let out = c(src);
+    assert!(out.contains(".len=4"), "{out}");
+    assert!(out.contains(".ptr=&a[0]"), "{out}");
+    assert!(!out.contains("v = dray_slice"), "{out}");
+}
+
+#[test]
+fn a_sub_range_narrows_through_the_helper() {
+    let src = "f :: proc() {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    v := a[1:3];\n}\n";
+    let out = c(src);
+    assert!(out.contains("dray_slice_int32("), "{out}");
+}
+
+#[test]
+fn an_open_ended_range_uses_the_length_carrying_helper() {
+    let src = "f :: proc() {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    v := a[1:];\n}\n";
+    let out = c(src);
+    assert!(out.contains("dray_slice_from_int32("), "{out}");
+}
+
+#[test]
+fn a_missing_low_bound_becomes_zero() {
+    let src = "f :: proc() {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    v := a[:2];\n}\n";
+    let out = c(src);
+    assert!(
+        out.contains("dray_slice_int32(") && out.contains(", 0, "),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_sub_range_evaluates_its_base_and_bounds_once_each() {
+    let src = "bump :: proc() -> int32 {\n    return 1;\n}\n\nf :: proc() {\n    a: [4]int32 = { 1, 2, 3, 4 };\n    v := a[bump():bump()];\n}\n";
+    let out = c(src);
+    let line = out
+        .lines()
+        .find(|l| l.contains("v = dray_slice_int32("))
+        .expect("the narrowing call");
+    assert_eq!(line.matches("bump()").count(), 2, "{line}");
+    assert_eq!(line.matches("&a[0]").count(), 1, "{line}");
+}
+
+#[test]
+fn the_slice_helpers_are_static_so_nothing_leaks_out_of_the_file() {
+    let out = c("f :: proc(xs: []int32) -> int32 {\n    return xs.len;\n}\n");
+    assert!(
+        out.contains("static struct DraySlice_int32 dray_slice_int32("),
+        "{out}"
+    );
+    assert!(
+        out.contains("static struct DraySlice_int32 dray_slice_from_int32("),
+        "{out}"
+    );
+}
+
+#[test]
+fn e2e_sub_range_slicing_of_an_array() {
+    let src = "sum :: proc(xs: []int32) -> int32 {\n    total := 0;\n    for n in xs {\n        total = total + n;\n    }\n    return total;\n}\n\nmain :: proc() -> int32 {\n    a: [6]int32 = { 1, 2, 3, 4, 5, 6 };\n    return sum(a[2:5]);\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 12, "a[2:5] is {{3, 4, 5}}");
+    }
+}
+
+#[test]
+fn e2e_sub_range_slicing_of_a_slice() {
+    let src = "sum :: proc(xs: []int32) -> int32 {\n    total := 0;\n    for n in xs {\n        total = total + n;\n    }\n    return total;\n}\n\nmain :: proc() -> int32 {\n    a: [6]int32 = { 1, 2, 3, 4, 5, 6 };\n    v := a[:];\n    return sum(v[3:]) + sum(v[:2]);\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 18, "v[3:] is {{4, 5, 6}} and v[:2] is {{1, 2}}");
+    }
+}
+
+#[test]
+fn e2e_a_slice_range_with_runtime_bounds() {
+    let src = "sum :: proc(xs: []int32) -> int32 {\n    total := 0;\n    for n in xs {\n        total = total + n;\n    }\n    return total;\n}\n\nmain :: proc() -> int32 {\n    a: [6]int32 = { 1, 2, 3, 4, 5, 6 };\n    lo := 1;\n    hi := 5;\n    return sum(a[lo:hi]);\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 14, "a[1:5] is {{2, 3, 4, 5}}");
+    }
+}
+
+#[test]
+fn e2e_an_empty_range_is_a_zero_length_slice() {
+    let src = "main :: proc() -> int32 {\n    a: [6]int32 = { 1, 2, 3, 4, 5, 6 };\n    v := a[3:3];\n    return v.len;\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 0);
+    }
+}

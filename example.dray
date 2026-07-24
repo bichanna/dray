@@ -27,5 +27,13 @@ main :: proc() -> int32 {
 
     view := nums[:];
     printf(cast(*cchar) "view.len = %d, sum = %d\n".ptr, view.len, sum(view));
+
+    printf(cast(*cchar) "nums[1:3] sum = %d\n".ptr, sum(nums[1:3]));
+    printf(cast(*cchar) "nums[2:]  sum = %d\n".ptr, sum(nums[2:]));
+    printf(cast(*cchar) "view[:2]  sum = %d\n".ptr, sum(view[:2]));
+
+    lo := 1;
+    printf(cast(*cchar) "view[lo:] sum = %d\n".ptr, sum(view[lo:]));
+
     return 0;
 }
