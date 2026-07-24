@@ -25,13 +25,13 @@ fn empty_main_is_void() {
 #[test]
 fn main_with_int_return() {
     let out = c("main :: proc() -> int32 {\n    return 0;\n}\n");
-    assert!(out.contains("int32_t main(void)"), "{out}");
+    assert!(out.contains("DrayI32 main(void)"), "{out}");
     assert!(out.contains("return 0;"));
 }
 
 #[test]
-fn stdint_is_always_included() {
-    assert!(c("main :: proc() -> int32 {\n    return 0;\n}\n").contains("#include <stdint.h>"));
+fn draybase_is_always_included() {
+    assert!(c("main :: proc() -> int32 {\n    return 0;\n}\n").contains("#include \"draybase.h\""));
 }
 
 #[test]
@@ -42,26 +42,26 @@ fn c_header_becomes_include() {
 #[test]
 fn params_lower_with_types() {
     let out = c("add :: proc(a: int32, b: int32) -> int32 {\n    return a + b;\n}\n");
-    assert!(out.contains("int32_t add(int32_t a, int32_t b)"), "{out}");
+    assert!(out.contains("DrayI32 add(DrayI32 a, DrayI32 b)"), "{out}");
 }
 
 #[test]
 fn inferred_int_var_is_int32_not_plain_int() {
     let out = c("f :: proc() {\n    x := 5;\n}\n");
-    assert!(out.contains("int32_t x = 5;"), "{out}");
+    assert!(out.contains("DrayI32 x = 5;"), "{out}");
 }
 
 #[test]
 fn inferred_float_var_is_double() {
     let out = c("f :: proc() {\n    r := 1.5;\n}\n");
-    assert!(out.contains("double r = 1.5;"), "{out}");
+    assert!(out.contains("DrayF64 r = 1.5;"), "{out}");
 }
 
 #[test]
 fn extern_prototype_uses_linked_symbol_not_binding_name() {
     // `my_abs :: extern "abs"` must emit `abs`, so it links
     let out = c("my_abs :: extern \"abs\" proc(x: int32) -> int32;\n");
-    assert!(out.contains("int32_t abs(int32_t x);"), "{out}");
+    assert!(out.contains("DrayI32 abs(DrayI32 x);"), "{out}");
     assert!(
         !out.contains("my_abs"),
         "binding name must not leak into C:\n{out}"
@@ -84,7 +84,7 @@ fn call_to_aliased_extern_uses_symbol() {
 #[test]
 fn for_c_style_lowers_to_c_for() {
     let out = c("f :: proc() {\n    for i := 0; i < 10; i += 1 {\n        i += 0;\n    }\n}\n");
-    assert!(out.contains("for (int32_t i = 0; i < 10; i += 1)"), "{out}");
+    assert!(out.contains("for (DrayI32 i = 0; i < 10; i += 1)"), "{out}");
 }
 
 #[test]
@@ -142,8 +142,19 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
     std::fs::write(&c_path, c_src).unwrap();
     let base_h = dir.join("draybase.h");
     let base_c = dir.join(format!("{stamp}_draybase.c"));
-    std::fs::write(&base_h, dray_codegen::DRAYBASE_H).unwrap();
-    std::fs::write(&base_c, dray_codegen::DRAYBASE_C).unwrap();
+    // The runtime is a library on disk, not something the compiler carries, so
+    // the tests read it from the repo exactly as the driver reads it from an
+    // install.
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib = [
+        crate_dir.join("../../lib/system"),
+        crate_dir.join("../lib/system"),
+    ]
+    .into_iter()
+    .find(|p| p.join("draybase.h").is_file())
+    .expect("lib/system/draybase.h");
+    std::fs::copy(lib.join("draybase.h"), &base_h).unwrap();
+    std::fs::copy(lib.join("draybase.c"), &base_c).unwrap();
 
     // The generated C only has to compile and link. Warnings are the C
     // compiler's opinion about code nobody wrote by hand, so they are silenced
@@ -388,9 +399,9 @@ fn generic_proc_monomorphizes_per_instantiation() {
                      return a;\n\
                  }\n",
     );
-    assert!(out.contains("identity_int32(int32_t x)"), "{out}");
-    assert!(out.contains("identity_bool(bool x)"), "{out}");
-    assert!(!out.contains("identity(int32_t"), "template leaked: {out}");
+    assert!(out.contains("identity_int32(DrayI32 x)"), "{out}");
+    assert!(out.contains("identity_bool(DrayBool x)"), "{out}");
+    assert!(!out.contains("identity(DrayI32"), "template leaked: {out}");
 }
 
 #[test]
@@ -399,8 +410,8 @@ fn procs_get_prototypes_so_forward_calls_work() {
                  helper :: proc() -> int32 { return 1; }\n");
     // A prototype precedes the definition of `main`, so the later `helper` is
     // declared before its use
-    let proto = out.find("int32_t helper(void);").expect("prototype");
-    let body = out.find("int32_t main(void) {").expect("main body");
+    let proto = out.find("DrayI32 helper(void);").expect("prototype");
+    let body = out.find("DrayI32 main(void) {").expect("main body");
     assert!(proto < body, "prototype must precede definitions: {out}");
 }
 
@@ -628,7 +639,7 @@ fn an_unused_switch_binding_emits_no_local() {
                      }\n\
                  }\n");
     assert!(
-        !out.contains("int32_t x ="),
+        !out.contains("DrayI32 x ="),
         "unused binding materialized: {out}"
     );
 }
@@ -644,7 +655,7 @@ fn a_used_switch_binding_is_still_emitted() {
                      }\n\
                  }\n");
     assert!(
-        out.contains("int32_t x ="),
+        out.contains("DrayI32 x ="),
         "used binding must be bound: {out}"
     );
 }
@@ -653,18 +664,17 @@ fn a_used_switch_binding_is_still_emitted() {
 fn generated_c_has_no_duplicate_includes() {
     let out = c("Node :: struct { value: int32 }\n\
                  main :: proc() -> int32 { n := alloc Node{ value: 1 }; return n.value; }\n");
-    assert_eq!(out.matches("#include <stdint.h>").count(), 1, "{out}");
-    // `stdlib.h` belongs to the runtime, which now lives in its own header rather
-    // than being copied into every generated file.
-    assert_eq!(out.matches("#include <stdlib.h>").count(), 0, "{out}");
+    // One include, and only one: draybase.h supplies every type the generated
+    // code names.
+    assert_eq!(out.matches("#include").count(), 1, "{out}");
     assert_eq!(out.matches("#include \"draybase.h\"").count(), 1, "{out}");
 }
 
 #[test]
 fn main_gets_no_prototype() {
     let out = c("main :: proc() -> int32 { return 0; }\n");
-    assert!(!out.contains("int32_t main(void);"), "{out}");
-    assert!(out.contains("int32_t main(void) {"), "{out}");
+    assert!(!out.contains("DrayI32 main(void);"), "{out}");
+    assert!(out.contains("DrayI32 main(void) {"), "{out}");
 }
 
 #[test]
@@ -701,7 +711,7 @@ fn only_pointed_to_aggregates_are_forward_declared() {
 #[test]
 fn a_fixed_array_lowers_to_a_c_array() {
     let out = c("main :: proc() -> int32 { xs: [3]int32 = {1, 2, 3}; return xs[0]; }\n");
-    assert!(out.contains("int32_t xs[3] = {1, 2, 3}"), "{out}");
+    assert!(out.contains("DrayI32 xs[3] = {1, 2, 3}"), "{out}");
     assert!(out.contains("xs[0]"), "{out}");
 }
 
@@ -710,8 +720,8 @@ fn a_slice_lowers_to_a_len_ptr_struct() {
     let out = c("f :: proc(xs: []int32) -> int32 { return xs.len; }\n\
                  main :: proc() -> int32 { ys: [2]int32 = {1, 2}; return f(ys[:]); }\n");
     assert!(out.contains("struct DraySlice_int32 {"), "{out}");
-    assert!(out.contains("int32_t len;"), "{out}");
-    assert!(out.contains("int32_t *ptr;"), "{out}");
+    assert!(out.contains("DrayI32 len;"), "{out}");
+    assert!(out.contains("DrayI32 *ptr;"), "{out}");
     assert!(out.contains(".len=2"), "{out}");
     assert!(out.contains(".ptr=&ys[0]"), "{out}");
 }
@@ -846,8 +856,8 @@ fn identifiers_that_are_c_keywords_are_renamed() {
                      register := 2;\n\
                      return inline + register;\n\
                  }\n");
-    assert!(out.contains("int32_t inline_ = 1"), "{out}");
-    assert!(out.contains("int32_t register_ = 2"), "{out}");
+    assert!(out.contains("DrayI32 inline_ = 1"), "{out}");
+    assert!(out.contains("DrayI32 register_ = 2"), "{out}");
     assert!(out.contains("return inline_ + register_"), "{out}");
 }
 
@@ -866,7 +876,7 @@ fn a_variadic_extern_declares_its_ellipsis() {
                  main :: proc() -> int32 { printf(cast(*cchar) \"hi\\n\".ptr); return 0; }\n",
     );
     assert!(
-        out.contains("extern int32_t printf(char * fmt, ...);"),
+        out.contains("extern DrayI32 printf(DrayChar * fmt, ...);"),
         "{out}"
     );
 }
@@ -895,4 +905,15 @@ fn e2e_calling_a_variadic_c_function() {
 fn an_empty_struct_still_has_a_member() {
     let out = c("E :: struct { }\nmain :: proc() -> int32 { e := alloc E{}; return 0; }\n");
     assert!(out.contains("char _dray_empty;"), "{out}");
+}
+
+#[test]
+fn generated_c_names_drays_own_types() {
+    let out = c(
+        "main :: proc() -> int32 {\n    n: int64 = 1;\n    f: float32 = 2.0;\n    b := true;\n    return 0;\n}\n",
+    );
+    assert!(out.contains("DrayI64 n"), "{out}");
+    assert!(out.contains("DrayF32 f"), "{out}");
+    assert!(out.contains("DrayBool b"), "{out}");
+    assert!(!out.contains("int64_t"), "raw C type leaked: {out}");
 }

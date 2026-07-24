@@ -41,6 +41,9 @@ impl Backend {
 #[derive(Debug, Clone)]
 pub struct CcInvocation<'a> {
     pub cc: &'a str,
+    /// Directories to search for headers. The build directory goes here, since
+    /// that is where `draybase.h` is copied to.
+    pub include_dirs: &'a [std::path::PathBuf],
     pub backend: Backend,
     pub show_warnings: bool,
     pub extra: &'a [String],
@@ -56,6 +59,9 @@ impl CcInvocation<'_> {
         match self.backend {
             Backend::Gnu => {
                 cmd.arg(C_STANDARD_GNU);
+                for dir in self.include_dirs {
+                    cmd.arg(format!("-I{}", dir.display()));
+                }
                 if !self.show_warnings {
                     cmd.arg("-w");
                 }
@@ -64,6 +70,9 @@ impl CcInvocation<'_> {
             }
             Backend::Msvc => {
                 cmd.arg(C_STANDARD_MSVC);
+                for dir in self.include_dirs {
+                    cmd.arg(format!("/I{}", dir.display()));
+                }
                 if !self.show_warnings {
                     cmd.arg("/w");
                 }
@@ -90,6 +99,7 @@ mod tests {
     fn a_gnu_compiler_uses_dash_o_and_std() {
         let inv = CcInvocation {
             cc: "clang",
+            include_dirs: &[],
             backend: Backend::Gnu,
             show_warnings: false,
             extra: &[],
@@ -104,6 +114,7 @@ mod tests {
     fn msvc_uses_its_own_spellings() {
         let inv = CcInvocation {
             cc: "cl",
+            include_dirs: &[],
             backend: Backend::Msvc,
             show_warnings: false,
             extra: &[],
@@ -118,6 +129,7 @@ mod tests {
     fn warnings_are_shown_only_when_asked_for() {
         let inv = CcInvocation {
             cc: "gcc",
+            include_dirs: &[],
             backend: Backend::Gnu,
             show_warnings: true,
             extra: &[],

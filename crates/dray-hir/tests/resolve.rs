@@ -814,3 +814,57 @@ fn an_rc_pointer_may_not_cross_into_c() {
     let raw = resolve_errors("f :: extern \"puts\" proc(s: *int8) -> int32;\n");
     assert!(raw.is_empty(), "{raw:?}");
 }
+
+#[test]
+fn arithmetic_needs_both_sides_to_agree() {
+    let widths = resolve_errors(
+        "main :: proc() -> int32 {\n    a: int32 = 1;\n    b: int64 = 2;\n    c := a + b;\n    return 0;\n}\n",
+    );
+    assert!(widths.iter().any(|m| m.contains("same type")), "{widths:?}");
+
+    let classes = resolve_errors(
+        "main :: proc() -> int32 {\n    a: int32 = 1;\n    b: float32 = 2.0;\n    c := a + b;\n    return 0;\n}\n",
+    );
+    assert!(
+        classes.iter().any(|m| m.contains("same type")),
+        "{classes:?}"
+    );
+
+    let nonsense =
+        resolve_errors("main :: proc() -> int32 {\n    x := 1 + true;\n    return 0;\n}\n");
+    assert!(
+        nonsense.iter().any(|m| m.contains("same type")),
+        "{nonsense:?}"
+    );
+}
+
+#[test]
+fn a_literal_takes_the_other_side_s_type() {
+    let errs = resolve_errors(
+        "main :: proc() -> int32 {\n    a: int64 = 40;\n    b := a + 2;\n    return cast(int32) b;\n}\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn some_operators_are_defined_only_for_some_types() {
+    let modulo = resolve_errors(
+        "main :: proc() -> int32 {\n    a: float32 = 1.0;\n    b: float32 = 2.0;\n    c := a % b;\n    return 0;\n}\n",
+    );
+    assert!(
+        modulo
+            .iter()
+            .any(|m| m.contains("only defined for integers")),
+        "{modulo:?}"
+    );
+
+    let ordered = resolve_errors(
+        "main :: proc() -> int32 {\n    if true < false {\n        return 1;\n    }\n    return 0;\n}\n",
+    );
+    assert!(
+        ordered
+            .iter()
+            .any(|m| m.contains("only defined for numbers")),
+        "{ordered:?}"
+    );
+}

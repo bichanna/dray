@@ -25,6 +25,8 @@ pub enum BuildError {
     Io(std::io::Error),
     /// The C compiler was not found or failed.
     CC(String),
+    /// Dray's own `lib/system/` could not be located.
+    MissingLib(Vec<PathBuf>),
 }
 
 impl std::fmt::Display for BuildError {
@@ -35,6 +37,17 @@ impl std::fmt::Display for BuildError {
             BuildError::Monomorphize(m) => write!(f, "monomorphization error: {m}"),
             BuildError::Codegen(m) => write!(f, "{m}"),
             BuildError::Io(e) => write!(f, "io error: {e}"),
+            BuildError::MissingLib(tried) => {
+                writeln!(
+                    f,
+                    "cannot find Dray's runtime library (lib/system/draybase.h)"
+                )?;
+                writeln!(f, "  looked in:")?;
+                for p in tried {
+                    writeln!(f, "    {}", p.display())?;
+                }
+                write!(f, "  set $DRAY_LIB or pass --lib to point at it")
+            }
             BuildError::CC(m) => write!(f, "C compiler error: {m}"),
         }
     }
@@ -67,6 +80,8 @@ pub struct BuildOptions {
     pub cflags: Vec<String>,
     /// Where to put generated C. Defaults to `build/<program>/`.
     pub build_dir: Option<PathBuf>,
+    /// Where Dray's own `lib/` lives. Searched if not given.
+    pub lib_dir: Option<PathBuf>,
 }
 
 impl Default for BuildOptions {
@@ -77,6 +92,7 @@ impl Default for BuildOptions {
             show_c_warnings: false,
             cflags: Vec::new(),
             build_dir: None,
+            lib_dir: None,
         }
     }
 }
@@ -126,6 +142,34 @@ pub fn source_to_c_from_file(src: &str, file: &str) -> Result<String, BuildError
 
 /// Build a Dray source file into an executable at `out_path`. Returns the path
 /// to the generated C file.
+fn system_lib_dir(opts: &BuildOptions) -> Result<PathBuf, BuildError> {
+    let mut tried: Vec<PathBuf> = Vec::new();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = &opts.lib_dir {
+        candidates.push(dir.clone());
+    }
+    if let Ok(dir) = std::env::var("DRAY_LIB") {
+        candidates.push(PathBuf::from(dir));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin) = exe.parent() {
+            candidates.push(bin.join("../lib"));
+            candidates.push(bin.join("../../../lib"));
+        }
+    }
+    candidates.push(PathBuf::from("lib"));
+
+    for base in candidates {
+        let system = base.join("system");
+        if system.join("draybase.h").is_file() {
+            return Ok(system);
+        }
+        tried.push(system);
+    }
+    Err(BuildError::MissingLib(tried))
+}
+
+/// Where generated C for this build lives.
 fn build_dir(opts: &BuildOptions, out_path: &Path) -> PathBuf {
     if let Some(dir) = &opts.build_dir {
         return dir.clone();
@@ -147,7 +191,8 @@ pub fn build_file(
     opts: &BuildOptions,
 ) -> Result<PathBuf, BuildError> {
     let src = std::fs::read_to_string(src_path)?;
-    let c_code = source_to_c_from_file(&src, &src_path.display().to_string())?;
+    let abs_src = std::fs::canonicalize(src_path).unwrap_or_else(|_| src_path.to_path_buf());
+    let c_code = source_to_c_from_file(&src, &abs_src.display().to_string())?;
 
     let dir = build_dir(opts, out_path);
     std::fs::create_dir_all(&dir)?;
@@ -159,13 +204,16 @@ pub fn build_file(
     let c_path = dir.join(format!("{stem}.c"));
     std::fs::write(&c_path, &c_code)?;
 
+    let lib = system_lib_dir(opts)?;
     let base_h = dir.join("draybase.h");
     let base_c = dir.join("draybase.c");
-    std::fs::write(&base_h, dray_codegen::DRAYBASE_H)?;
-    std::fs::write(&base_c, dray_codegen::DRAYBASE_C)?;
+    std::fs::copy(lib.join("draybase.h"), &base_h)?;
+    std::fs::copy(lib.join("draybase.c"), &base_c)?;
 
+    let includes = [dir.clone()];
     let invocation = CcInvocation {
         cc: &opts.cc,
+        include_dirs: &includes,
         backend: Backend::detect(&opts.cc),
         show_warnings: opts.show_c_warnings,
         extra: &opts.cflags,

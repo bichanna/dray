@@ -31,12 +31,6 @@ impl std::error::Error for CodegenError {}
 
 pub type Result<T> = std::result::Result<T, CodegenError>;
 
-/// `draybase.h` — the hand-written C that is not worth generating.
-pub const DRAYBASE_H: &str = include_str!("../../../lib/system/draybase.h");
-
-/// The runtime's definitions, to be compiled exactly once per program.
-pub const DRAYBASE_C: &str = include_str!("../../../lib/system/draybase.c");
-
 /// Lower a whole IR module to C source.
 pub fn ir_to_c(ir: &Ir) -> Result<String> {
     let scope = lower_ir(ir)?;

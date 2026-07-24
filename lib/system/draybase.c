@@ -1,10 +1,12 @@
 /* draybase.c - the hand-written half of the Dray runtime.
-   Compiled once per program, alongside the generated translation units. */
+ * Compiled once per program, alongside the generated translation units. */
 #include "draybase.h"
 
-int64_t dray_rc_live_count = 0;
+#include <stdlib.h>
 
-void *dray_rc_alloc(size_t payload, DrayDropFn drop) {
+DrayI64 dray_rc_live_count = 0;
+
+void *dray_rc_alloc(DraySize payload, DrayDropFn drop) {
   DrayRcHeader *h = (DrayRcHeader *)calloc(1, sizeof(DrayRcHeader) + payload);
   if (!h)
     return NULL;
@@ -34,4 +36,4 @@ void dray_rc_release(void *p) {
   }
 }
 
-int64_t dray_rc_live(void) { return dray_rc_live_count; }
+DrayI64 dray_rc_live(void) { return dray_rc_live_count; }

@@ -989,6 +989,63 @@ impl Lowerer {
         }
     }
 
+    /// Both operands of an arithmetic, comparison or bitwise operator must have
+    /// the same type. No impliciit conversion allowed.
+    fn check_binary_operands(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        if matches!(op, BinOp::And | BinOp::Or) {
+            return; // already required to be `bool`
+        }
+
+        if matches!(lhs.ty, Ty::Infer) || matches!(rhs.ty, Ty::Infer) {
+            return;
+        }
+
+        if lhs.ty == rhs.ty || coerces_to(&lhs.ty, rhs) || coerces_to(&rhs.ty, lhs) {
+            self.check_operator_domain(op, lhs, span);
+            return;
+        }
+        self.err(
+            span,
+            format!(
+                "`{}` needs both sides to have the same type, but this is `{}` and `{}`; add a `cast`",
+                operator_name(op),
+                type_name(&lhs.ty),
+                type_name(&rhs.ty)
+            ),
+        );
+    }
+
+    fn check_operator_domain(&mut self, op: BinOp, operand: &Expr, span: Span) {
+        let ty = &operand.ty;
+        let integers_only = matches!(
+            op,
+            BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+        );
+        if integers_only && !matches!(ty, Ty::Int { .. } | Ty::Infer) {
+            self.err(
+                span,
+                format!(
+                    "`{}` is only defined for integers, but this is `{}`",
+                    operator_name(op),
+                    type_name(ty)
+                ),
+            );
+            return;
+        }
+        let arithmetic = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+        let ordered = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+        if (arithmetic || ordered) && !matches!(ty, Ty::Int { .. } | Ty::Float { .. } | Ty::Infer) {
+            self.err(
+                span,
+                format!(
+                    "`{}` is only defined for numbers, but this is `{}`",
+                    operator_name(op),
+                    type_name(ty)
+                ),
+            );
+        }
+    }
+
     fn lower_binary(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         let parts = self.expr_children(node);
         if parts.len() != 2 {
@@ -1001,6 +1058,7 @@ impl Lowerer {
         let lhs = self.lower_expr(&parts[0]);
         let rhs = self.lower_expr(&parts[1]);
         self.check_logical_operands(op, &lhs, &rhs, node.span());
+        self.check_binary_operands(op, &lhs, &rhs, node.span());
         let ty = if op.is_boolean() {
             Ty::Bool
         } else {
@@ -1457,6 +1515,7 @@ impl Lowerer {
     }
 
     fn lower_cast(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
+        // a cast is the C boundary, so `cchar` is meaningful in its target type
         let outer = std::mem::replace(&mut self.in_extern, true);
         let result = self.lower_cast_inner(node);
         self.in_extern = outer;
@@ -2582,6 +2641,29 @@ fn mentions_rc(ty: &Ty) -> bool {
         Ty::Ptr(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => mentions_rc(inner),
         Ty::App(_, args) => args.iter().any(mentions_rc),
         _ => false,
+    }
+}
+
+fn operator_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Rem => "%",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
     }
 }
 

@@ -22,20 +22,8 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
     let mut scope = ScopeBuilder::new();
 
     scope = scope.global_statement(GlobalStatement::Include(
-        IncludeBuilder::new_system_with_str("stdint.h").build(),
+        IncludeBuilder::new_with_str("draybase.h").build(),
     ));
-    scope = scope.global_statement(GlobalStatement::Include(
-        IncludeBuilder::new_system_with_str("stdbool.h").build(),
-    ));
-    scope = scope.global_statement(GlobalStatement::Include(
-        IncludeBuilder::new_system_with_str("stddef.h").build(),
-    ));
-
-    if ir.uses_rc {
-        scope = scope.global_statement(GlobalStatement::Include(
-            IncludeBuilder::new_with_str("draybase.h").build(),
-        ));
-    }
 
     for gs in aggregate_globals(ir)? {
         scope = scope.new_line();
@@ -590,11 +578,12 @@ fn lower_ty(t: &Ty) -> Result<Type> {
     use tamago::BaseType as B;
     Ok(match t {
         Ty::Void => Type::base(B::Void),
-        Ty::Bool => Type::base(B::Bool),
-        Ty::CChar => Type::base(B::Char),
+        Ty::Bool => Type::base(B::TypeDef("DrayBool".to_string())),
+        Ty::CChar => Type::base(B::TypeDef("DrayChar".to_string())),
         Ty::Int { bits, signed } => Type::base(int_base(*bits, *signed)),
-        Ty::Float { bits } => Type::base(if *bits == 32 { B::Float } else { B::Double }),
-        // Both raw and RC pointers are a C `T*`; the RC bookkeeping is separate.
+        Ty::Float { bits } => Type::base(B::TypeDef(
+            if *bits == 32 { "DrayF32" } else { "DrayF64" }.to_string(),
+        )),
         Ty::Ptr(inner) | Ty::Rc(inner) => Type::ptr(lower_ty(inner)?),
         Ty::Named(n) => Type::base(B::Struct(n.clone())),
         Ty::Array(elem, n) => Type::array(lower_ty(elem)?, Some(tamago::Expr::Int(*n as i64))),
@@ -604,23 +593,27 @@ fn lower_ty(t: &Ty) -> Result<Type> {
                 "internal: un-monomorphized generic `{name}` reached codegen"
             )));
         }
-        Ty::Infer => Type::base(B::Int32),
+        Ty::Infer => Type::base(B::TypeDef("DrayI32".to_string())),
     })
 }
 
+/// Dray's own name for an integer width. The generated C never says `int32_t`
+/// directly. `draybase.h` decides what `DrayI32` means, so a target with
+/// different widths or no `stdint.h` is a change to that header alone.
 fn int_base(bits: IntWidth, signed: bool) -> tamago::BaseType {
-    use tamago::BaseType as B;
-    match (bits, signed) {
-        (IntWidth::W8, true) => B::Int8,
-        (IntWidth::W16, true) => B::Int16,
-        (IntWidth::W32, true) => B::Int32,
-        (IntWidth::W64, true) => B::Int64,
-        (IntWidth::W8, false) => B::UInt8,
-        (IntWidth::W16, false) => B::UInt16,
-        (IntWidth::W32, false) => B::UInt32,
-        (IntWidth::W64, false) => B::UInt64,
-        (IntWidth::Size, _) => B::Size,
-    }
+    let name = match (bits, signed) {
+        (IntWidth::W8, true) => "DrayI8",
+        (IntWidth::W16, true) => "DrayI16",
+        (IntWidth::W32, true) => "DrayI32",
+        (IntWidth::W64, true) => "DrayI64",
+        (IntWidth::W8, false) => "DrayU8",
+        (IntWidth::W16, false) => "DrayU16",
+        (IntWidth::W32, false) => "DrayU32",
+        (IntWidth::W64, false) => "DrayU64",
+        (IntWidth::Size, true) => "DrayISize",
+        (IntWidth::Size, false) => "DraySize",
+    };
+    tamago::BaseType::TypeDef(name.to_string())
 }
 
 fn un_op(op: UnOp) -> tamago::UnaryOp {
@@ -771,13 +764,18 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
 /// `struct DraySlice_T { int32_t len; T *ptr; }` the fat pointer behind `[]T`
 fn slice_struct(elem: &Ty) -> Result<tamago::Struct> {
     Ok(StructBuilder::new_with_str(&slice_struct_name(elem))
-        .field(FieldBuilder::new_with_str("len", Type::base(BaseType::Int32)).build())
+        .field(
+            FieldBuilder::new_with_str("len", Type::base(BaseType::TypeDef("DrayI32".to_string())))
+                .build(),
+        )
         .field(FieldBuilder::new_with_str("ptr", Type::ptr(lower_ty(elem)?)).build())
         .define()
         .build())
 }
 
 fn slice_element_types(ir: &Ir) -> Vec<Ty> {
+    // Every string literal is a `[]uint8`, and a literal can appear anywhere an
+    // expression can, so that one is always available rather than discovered.
     let mut found: Vec<Ty> = vec![Ty::Int {
         bits: dray_hir::IntWidth::W8,
         signed: false,

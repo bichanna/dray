@@ -7,8 +7,8 @@ use dray_driver::{BuildError, source_to_c};
 #[test]
 fn source_to_c_produces_c() {
     let c = source_to_c("main :: proc() -> int32 {\n    return 0;\n}\n").unwrap();
-    assert!(c.contains("int32_t main(void)"));
-    assert!(c.contains("#include <stdint.h>"));
+    assert!(c.contains("DrayI32 main(void)"));
+    assert!(c.contains("#include \"draybase.h\""));
 }
 
 #[test]
@@ -30,7 +30,7 @@ fn inference_and_aliasing_flow_through() {
         "my_abs :: extern \"abs\" proc(x: int32) -> int32;\n\nmain :: proc() -> int32 {\n    v := 5;\n    return my_abs(v);\n}\n",
     )
     .unwrap();
-    assert!(c.contains("int32_t v = 5;"), "inference: {c}");
+    assert!(c.contains("DrayI32 v = 5;"), "inference: {c}");
     assert!(
         c.contains("abs(v)") && !c.contains("my_abs"),
         "aliasing: {c}"

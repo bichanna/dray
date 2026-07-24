@@ -72,6 +72,8 @@ build options:
                       by default, since they refer to generated code)
   --cc <program>      C compiler to use (default: $CC, else cc)
   --build-dir <dir>   where to put generated C (default: build/<program>/)
+  --lib <dir>         Dray's lib/ directory (default: $DRAY_LIB, else found
+                      next to the compiler)
 ";
 
 fn run(args: &[String]) -> Result<(), CliError> {
@@ -172,7 +174,13 @@ fn emit_c_cmd(args: &[String]) -> Result<(), CliError> {
     let generated = if path == "-" {
         source_to_c(&src)
     } else {
-        source_to_c_from_file(&src, path)
+        source_to_c_from_file(
+            &src,
+            &std::fs::canonicalize(path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(path))
+                .display()
+                .to_string(),
+        )
     };
     match generated {
         Ok(c) => {
@@ -190,6 +198,7 @@ fn build_cmd(args: &[String]) -> Result<(), CliError> {
     let mut show_c_warnings = false;
     let mut cc: Option<String> = None;
     let mut build_dir: Option<std::path::PathBuf> = None;
+    let mut lib_dir: Option<std::path::PathBuf> = None;
     let mut path: Option<&str> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -199,6 +208,11 @@ fn build_cmd(args: &[String]) -> Result<(), CliError> {
             }
             "--emit-c" => emit_c = true,
             "--show-c-warnings" => show_c_warnings = true,
+            "--lib" => {
+                lib_dir = Some(std::path::PathBuf::from(
+                    it.next().ok_or("`--lib` needs a path")?,
+                ));
+            }
             "--build-dir" => {
                 build_dir = Some(std::path::PathBuf::from(
                     it.next().ok_or("`--build-dir` needs a path")?,
@@ -226,6 +240,7 @@ fn build_cmd(args: &[String]) -> Result<(), CliError> {
         show_c_warnings,
         cc: cc.unwrap_or(defaults.cc),
         build_dir,
+        lib_dir,
         ..BuildOptions::default()
     };
     match build_file(
