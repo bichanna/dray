@@ -30,6 +30,24 @@ Child :: struct {
     parent: Weak(@Parent),
 }
 
+heap_array_demo :: proc() {
+    squares := alloc [6]int32;
+
+    i := 0;
+    for i < squares.len {
+        squares[i] = i * i;
+        i += 1;
+    }
+
+    total := 0;
+    for v in squares {
+        // total = total + v;
+        total += v;
+    }
+
+    printf(cast(*cchar) "sum of the first 6 squares (starting from 0) = %d\n".ptr, total);
+}
+
 cycle_demo :: proc() -> int32 {
     c := alloc Child{ id: 2 };
     p := alloc Parent{ id: 1, child: c };
@@ -66,6 +84,11 @@ main :: proc() -> int32 {
 
     lo := 1;
     printf(cast(*cchar) "view[lo:] sum = %d\n".ptr, sum(view[lo:]));
+
+    say("-- heap arrays --");
+    printf(cast(*cchar) "live before heap array: %d\n".ptr, rc_live());
+    heap_array_demo();
+    printf(cast(*cchar) "live after heap array:  %d\n".ptr, rc_live());
 
     say("-- weak references --");
     n := cycle_demo();

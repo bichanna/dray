@@ -1196,3 +1196,79 @@ fn an_omitted_weak_field_is_the_empty_reference() {
     let src = "P :: struct {\n    v: int32,\n}\n\nC :: struct {\n    v: int32,\n    parent: Weak(@P),\n}\n\nf :: proc() -> @C {\n    return alloc C{ v: 1 };\n}\n";
     assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
 }
+
+#[test]
+fn alloc_array_yields_a_heap_slice() {
+    let h = hir("f :: proc(n: int32) -> @[]int32 {\n    return alloc [n]int32;\n}\n");
+    let Item::Proc(p) = &h.items[0] else { panic!() };
+    assert_eq!(p.ret, Ty::Rc(Box::new(Ty::Slice(Box::new(Ty::i32())))));
+}
+
+#[test]
+fn an_allocation_count_must_be_an_integer() {
+    let errs = resolve_errors("f :: proc() {\n    xs := alloc [true]int32;\n}\n");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("allocation count must be an integer")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_heap_slice_can_be_indexed_like_a_slice() {
+    let src = "f :: proc(n: int32) -> int32 {\n    xs := alloc [n]int32;\n    return xs[0];\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn a_heap_slice_can_be_iterated_like_a_slice() {
+    let src = "f :: proc(n: int32) -> int32 {\n    xs := alloc [n]int32;\n    total := 0;\n    for v in xs {\n        total = total + v;\n    }\n    return total;\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn a_heap_slice_exposes_len_and_ptr() {
+    let src = "f :: proc(n: int32) -> int32 {\n    xs := alloc [n]int32;\n    return xs.len;\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn a_weak_reference_cannot_cross_into_c() {
+    let param = resolve_errors(
+        "N :: struct {\n    v: int32,\n}\n\nf :: extern \"f\" proc(w: Weak(@N)) -> int32;\n",
+    );
+    assert!(
+        param
+            .iter()
+            .any(|e| e.contains("weak reference cannot cross into C")),
+        "{param:?}"
+    );
+
+    let ret = resolve_errors(
+        "N :: struct {\n    v: int32,\n}\n\nf :: extern \"f\" proc() -> Weak(@N);\n",
+    );
+    assert!(
+        ret.iter()
+            .any(|e| e.contains("weak reference cannot cross into C")),
+        "{ret:?}"
+    );
+}
+
+#[test]
+fn a_counted_pointer_still_cannot_cross_into_c() {
+    let errs = resolve_errors(
+        "N :: struct {\n    v: int32,\n}\n\nf :: extern \"f\" proc(p: @N) -> int32;\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("counted pointer cannot cross")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_weak_reference_is_fine_in_an_ordinary_proc() {
+    let src =
+        "N :: struct {\n    v: int32,\n}\n\nf :: proc(w: Weak(@N)) -> int32 {\n    return 0;\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}

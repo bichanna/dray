@@ -221,6 +221,13 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
         }
         Stmt::Retain(name) => Statement::Expr(rc_call("dray_rc_retain", name)),
         Stmt::Release(name) | Stmt::Free(name) => Statement::Expr(rc_call("dray_rc_release", name)),
+        Stmt::ReleaseArray(name) => Statement::Expr(tamago::Expr::new_fn_call(
+            tamago::Expr::new_ident_with_str("dray_rc_release"),
+            vec![tamago::Expr::new_mem_access(
+                tamago::Expr::new_ident(c_ident(name)),
+                "ptr".to_string(),
+            )],
+        )),
         Stmt::WeakRetain(name) => Statement::Expr(rc_call("dray_rc_downgrade", name)),
         Stmt::WeakRelease(name) => Statement::Expr(rc_call("dray_rc_weak_release", name)),
         Stmt::Switch { scrutinee, arms } => lower_switch(ir, scrutinee, arms)?,
@@ -243,6 +250,7 @@ fn stmt_uses_name(s: &Stmt, name: &str) -> bool {
         Stmt::Located { stmt, .. } => stmt_uses_name(stmt, name),
         Stmt::DropValue { name: n, .. } => n == name,
         Stmt::Retain(n)
+        | Stmt::ReleaseArray(n)
         | Stmt::Release(n)
         | Stmt::Free(n)
         | Stmt::WeakRetain(n)
@@ -299,6 +307,7 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
             args.iter().any(|a| expr_uses_name(a, name))
         }
         ExprKind::ArrayLit { elements, .. } => elements.iter().any(|e| expr_uses_name(e, name)),
+        ExprKind::AllocArray { count, .. } => expr_uses_name(count, name),
         ExprKind::Slice { array, lo, hi } => {
             expr_uses_name(array, name)
                 || lo.iter().chain(hi.iter()).any(|b| expr_uses_name(b, name))
@@ -489,7 +498,8 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
         }
         ExprKind::Field { recv, member } => {
             let base = lower_expr(ir, recv)?;
-            if matches!(recv.ty, Ty::Rc(_) | Ty::Ptr(_)) {
+            let is_heap_slice = heap_slice_elem(&recv.ty).is_some();
+            if matches!(recv.ty, Ty::Rc(_) | Ty::Ptr(_)) && !is_heap_slice {
                 T::new_ptr_mem_access(base, member.clone())
             } else {
                 T::new_mem_access(base, member.clone())
@@ -497,6 +507,13 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
         }
         ExprKind::Index { base, index } => {
             let i = as_index(lower_expr(ir, index)?);
+            if let Some(elem) = heap_slice_elem(&base.ty) {
+                let call = T::new_fn_call(
+                    T::new_ident(index_fn_name(elem)),
+                    vec![lower_expr(ir, base)?, i],
+                );
+                return Ok(T::new_unary(call, tamago::UnaryOp::Deref));
+            }
             match &base.ty {
                 // An array's length is a compile-time constant, so the check
                 // needs nothing but the index and that constant
@@ -617,6 +634,25 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             let concrete = enum_type_name(&e.ty, enum_name);
             T::new_fn_call(T::new_ident(enum_ctor_name(concrete, variant)), a)
         }
+        ExprKind::AllocArray { elem, count } => {
+            let count_c = as_index(lower_expr(ir, count)?);
+            let drop = if ty_holds_rc(ir, elem) {
+                T::new_ident(array_drop_fn_name(elem))
+            } else {
+                T::Int(0)
+            };
+            let raw = T::new_fn_call(
+                T::new_ident_with_str("dray_rc_alloc_array"),
+                vec![count_c.clone(), T::new_sizeof(lower_ty(elem)?), drop],
+            );
+            T::new_compound_literal(
+                Type::base(BaseType::Struct(slice_struct_name(elem))),
+                T::new_init_struct_designated(
+                    vec!["len".to_string(), "ptr".to_string()],
+                    vec![count_c, T::new_cast(Type::ptr(lower_ty(elem)?), raw)],
+                ),
+            )
+        }
         ExprKind::Alloc { ty, fields } => match ty {
             Ty::Named(name) => {
                 let sd = ir.structs.iter().find(|s| &s.name == name);
@@ -656,6 +692,10 @@ fn c_name(ir: &Ir, def: DefId, fallback: &str) -> String {
 
 fn lower_ty(t: &Ty) -> Result<Type> {
     use tamago::BaseType as B;
+
+    if let Some(elem) = heap_slice_elem(t) {
+        return Ok(Type::base(B::Struct(slice_struct_name(elem))));
+    }
     Ok(match t {
         Ty::Void => Type::base(B::Void),
         Ty::Bool => Type::base(B::TypeDef("DrayBool".to_string())),
@@ -824,6 +864,10 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
         out.push(upgrade_helper(&maybe)?);
     }
 
+    for elem in heap_array_elem_types(ir) {
+        out.push(GlobalStatement::Function(array_drop_fn(&elem)?));
+    }
+
     // 4. The definitions themselves.
     for sd in &ir.structs {
         if has_rc_field(ir, sd) {
@@ -866,10 +910,15 @@ fn slice_element_types(ir: &Ir) -> Vec<Ty> {
         signed: false,
     }];
     let mut note = |ty: &Ty| {
-        if let Ty::Slice(elem) = ty
+        // `[]T` and `@[]T` both need the `DraySlice_T` struct.
+        let slice_elem = match ty {
+            Ty::Slice(elem) => Some(&**elem),
+            other => heap_slice_elem(other),
+        };
+        if let Some(elem) = slice_elem
             && !found.contains(elem)
         {
-            found.push((**elem).clone());
+            found.push(elem.clone());
         }
     };
     for sd in &ir.structs {
@@ -1316,6 +1365,17 @@ fn slice_from_fn_name(elem: &Ty) -> String {
     format!("dray_slice_from_{}", mangle_c_ty(elem))
 }
 
+/// The element type of a `@[]T`, or `None`.
+fn heap_slice_elem(ty: &Ty) -> Option<&Ty> {
+    match ty {
+        Ty::Rc(inner) => match &**inner {
+            Ty::Slice(elem) => Some(elem),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn slice_struct_name(elem: &Ty) -> String {
     format!("DraySlice_{}", mangle_c_ty(elem))
 }
@@ -1545,6 +1605,95 @@ fn self_field(base: &str, field: &str) -> tamago::Expr {
 
 fn has_rc_field(ir: &Ir, sd: &dray_ir::StructDef) -> bool {
     sd.fields.iter().any(|f| ty_holds_rc(ir, &f.ty))
+}
+
+fn array_drop_fn_name(elem: &Ty) -> String {
+    format!("dray_drop_arr_{}", mangle_c_ty(elem))
+}
+
+/// The drop function for a `@[]T` whose elements own references. It releases
+/// each of the `dray_rc_count(p)` elements. `dray_rc_release` then frees the
+/// payload itself, so this only undoes what the elements hold.
+///
+/// ```c
+/// void dray_drop_arr_rc_Node(void *p) {
+///   struct Node **elems = p;
+///   for (DraySize i = 0; i < dray_rc_count(p); i++)
+///     dray_rc_release(elems[i]);
+/// }
+/// ```
+fn array_drop_fn(elem: &Ty) -> Result<tamago::Function> {
+    let elem_ptr = Type::ptr(lower_ty(elem)?);
+    let mut body = BlockBuilder::new();
+
+    // `T *elems = p;`
+    body = body.statement(tamago::Statement::Variable(
+        VariableBuilder::new_with_str("elems", elem_ptr.clone())
+            .value(tamago::Expr::new_ident_with_str("p"))
+            .build(),
+    ));
+
+    let size_ty = Type::base(BaseType::TypeDef("DraySize".to_string()));
+    let count = tamago::Expr::new_fn_call(
+        tamago::Expr::new_ident_with_str("dray_rc_count"),
+        vec![tamago::Expr::new_ident_with_str("p")],
+    );
+    let elem_i = tamago::Expr::new_arr_index(
+        tamago::Expr::new_ident_with_str("elems"),
+        tamago::Expr::new_ident_with_str("i"),
+    );
+    let release = element_release(elem, elem_i);
+
+    let init_decl = VariableBuilder::new_with_str("i", size_ty)
+        .value(tamago::Expr::Int(0))
+        .build();
+    let cond = tamago::Expr::new_binary(
+        tamago::Expr::new_ident_with_str("i"),
+        tamago::BinOp::LT,
+        count,
+    );
+    let step = tamago::Expr::new_unary(tamago::Expr::new_ident_with_str("i"), tamago::UnaryOp::Inc);
+    let loop_body = BlockBuilder::new()
+        .statement(tamago::Statement::Expr(release))
+        .build();
+    body = body.statement(tamago::Statement::For(
+        tamago::ForBuilder::new()
+            .init_decl(init_decl)
+            .cond(cond)
+            .step(step)
+            .body(loop_body)
+            .build(),
+    ));
+
+    Ok(drop_signature(&format!("arr_{}", mangle_c_ty(elem)))
+        .body(body.build())
+        .build())
+}
+
+/// How a single element of a heap array is released given the element value
+fn element_release(elem: &Ty, value: tamago::Expr) -> tamago::Expr {
+    let func = match elem {
+        Ty::Weak(_) => "dray_rc_weak_release",
+        _ => "dray_rc_release",
+    };
+    tamago::Expr::new_fn_call(tamago::Expr::new_ident_with_str(func), vec![value])
+}
+
+fn heap_array_elem_types(ir: &Ir) -> Vec<Ty> {
+    let mut found: Vec<Ty> = Vec::new();
+    for item in &ir.items {
+        if let Item::Proc(p) = item {
+            walk_stmt_exprs(&p.body, &mut |e| {
+                if let ExprKind::AllocArray { elem, .. } = &e.kind
+                    && ty_holds_rc(ir, elem)
+                    && !found.contains(elem)
+                {
+                    found.push(elem.clone());
+                }
+            });
+        }
+    }
+    found
 }
 
 fn ty_holds_rc(ir: &Ir, ty: &Ty) -> bool {

@@ -1195,3 +1195,108 @@ fn e2e_upgrade_fails_once_the_owner_is_gone() {
         );
     }
 }
+
+#[test]
+fn alloc_array_builds_a_fat_pointer_over_rc_alloc_array() {
+    let out = c(
+        "f :: proc(n: int32) -> @[]int32 {\n    return alloc [n]int32;\n}\n\
+                 main :: proc() -> int32 { return 0; }\n",
+    );
+    assert!(out.contains("dray_rc_alloc_array("), "{out}");
+    assert!(out.contains("struct DraySlice_int32"), "{out}");
+}
+
+#[test]
+fn a_scalar_heap_array_needs_no_drop_function() {
+    let out = c(
+        "f :: proc(n: int32) -> @[]int32 {\n    return alloc [n]int32;\n}\n\
+                 main :: proc() -> int32 { return 0; }\n",
+    );
+    // The drop argument is NULL (0): plain integers own nothing.
+    assert!(!out.contains("dray_drop_arr_int32"), "{out}");
+}
+
+#[test]
+fn a_heap_array_of_references_gets_a_drop_function_that_walks_the_count() {
+    let out = c("Node :: struct { value: int32 }\n\
+                 f :: proc() -> @[]@Node {\n    return alloc [3]@Node;\n}\n\
+                 main :: proc() -> int32 { return 0; }\n");
+    assert!(out.contains("void dray_drop_arr_rc_Node(void *p)"), "{out}");
+    assert!(out.contains("dray_rc_count(p)"), "{out}");
+    assert!(out.contains("dray_rc_release(elems[i])"), "{out}");
+}
+
+#[test]
+fn a_heap_slice_local_is_a_value_not_a_pointer() {
+    // `@[]T` lowers to the slice struct, so field access uses `.`, not `->`.
+    let out = c(
+        "f :: proc(n: int32) -> int32 {\n    xs := alloc [n]int32;\n    return xs.len;\n}\n\
+                 main :: proc() -> int32 { return 0; }\n",
+    );
+    assert!(out.contains("xs.len"), "{out}");
+    assert!(!out.contains("xs->len"), "{out}");
+}
+
+#[test]
+fn a_heap_slice_is_released_through_its_ptr() {
+    let out = c("f :: proc(n: int32) {\n    xs := alloc [n]int32;\n}\n\
+                 main :: proc() -> int32 { return 0; }\n");
+    assert!(out.contains("dray_rc_release(xs.ptr)"), "{out}");
+}
+
+#[test]
+fn e2e_a_scalar_heap_array_round_trips() {
+    let src = "main :: proc() -> int32 {\n\
+        xs := alloc [5]int32;\n\
+        i := 0;\n\
+        for i < xs.len {\n            xs[i] = i * i;\n            i = i + 1;\n        }\n\
+        total := 0;\n        for v in xs {\n            total = total + v;\n        }\n\
+        return total;\n    }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 30, "0+1+4+9+16");
+    }
+}
+
+#[test]
+fn e2e_a_scalar_heap_array_frees_itself() {
+    let src = "rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+        build :: proc() -> int32 {\n            xs := alloc [4]int32;\n            return cast(int32) rc_live();\n        }\n\
+        main :: proc() -> int32 {\n            inside := build();\n            return inside * 10 + cast(int32) rc_live();\n        }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 10, "one allocation alive inside, none after");
+    }
+}
+
+#[test]
+fn e2e_a_heap_array_of_references_releases_every_element() {
+    let src = "rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+        Node :: struct { value: int32 }\n\
+        build :: proc() -> int32 {\n\
+            xs := alloc [3]@Node;\n\
+            i := 0;\n\
+            for i < xs.len {\n                xs[i] = alloc Node{ value: i + 1 };\n                i = i + 1;\n            }\n\
+            return cast(int32) rc_live();\n        }\n\
+        main :: proc() -> int32 {\n            inside := build();\n            return inside * 10 + cast(int32) rc_live();\n        }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        // 3 nodes + 1 array = 4 alive inside; 0 after.
+        assert_eq!(code, 40);
+    }
+}
+
+#[test]
+fn e2e_returning_a_heap_array_transfers_ownership_not_frees_it() {
+    let src = "rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+        sum :: proc(xs: @[]int32) -> int32 {\n            total := 0;\n            for v in xs {\n                total = total + v;\n            }\n            return total;\n        }\n\
+        make :: proc(n: int32) -> @[]int32 {\n\
+            xs := alloc [n]int32;\n            i := 0;\n            for i < xs.len {\n                xs[i] = i + 1;\n                i = i + 1;\n            }\n            return xs;\n        }\n\
+        owner :: proc() -> int32 {\n            xs := make(4);\n            return sum(xs) * 10 + cast(int32) rc_live();\n        }\n\
+        main :: proc() -> int32 {\n            inside := owner();\n            return inside + cast(int32) rc_live();\n        }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        // sum = 1+2+3+4 = 10; one array live inside owner; none after.
+        assert_eq!(
+            code,
+            10 * 10 + 1,
+            "array alive inside owner, freed at its exit"
+        );
+    }
+}

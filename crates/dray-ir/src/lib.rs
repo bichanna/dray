@@ -154,6 +154,8 @@ pub enum Stmt {
     Retain(String),
     /// strong -= 1, free at zero
     Release(String),
+    /// strong -= 1 on a `@[]T` local reaching the payload through `.ptr`
+    ReleaseArray(String),
     /// one more weak reference to what this local points at
     WeakRetain(String),
     /// one fewer
@@ -238,6 +240,7 @@ struct Lowerer {
 #[derive(Debug, Clone)]
 enum Cleanup {
     Strong(String),
+    StrongArray(String),
     Weak(String),
     ByValue { name: String, ty: Ty },
 }
@@ -245,7 +248,7 @@ enum Cleanup {
 impl Cleanup {
     fn name(&self) -> &str {
         match self {
-            Cleanup::Strong(name) | Cleanup::Weak(name) => name,
+            Cleanup::Strong(name) | Cleanup::StrongArray(name) | Cleanup::Weak(name) => name,
             Cleanup::ByValue { name, .. } => name,
         }
     }
@@ -336,7 +339,13 @@ impl Lowerer {
 
                 if matches!(ty, Ty::Rc(_)) {
                     if let Some(scope) = scopes.last_mut() {
-                        scope.push(Cleanup::Strong(name.clone()));
+                        let cleanup = if matches!(ty, Ty::Rc(inner) if matches!(&**inner, Ty::Slice(_)))
+                        {
+                            Cleanup::StrongArray(name.clone())
+                        } else {
+                            Cleanup::Strong(name.clone())
+                        };
+                        scope.push(cleanup);
                     }
                     if is_rc_borrow(init) {
                         // rule 2: a borrowed @T (Name, Field, …) → retain the
@@ -581,6 +590,9 @@ impl Lowerer {
                     self.retain_if_borrowed_rc(val, out);
                 }
             }
+            // A fresh heap array owns nothing to retain; its elements start
+            // zeroed. The count is an ordinary value, not an RC reference.
+            ExprKind::AllocArray { .. } => self.uses_rc = true,
             ExprKind::StructLit { fields, .. } => {
                 for (_, val) in fields {
                     self.emit_field_retains(val, out);
@@ -662,6 +674,7 @@ impl Lowerer {
                     ty: ty.clone(),
                 }),
                 Cleanup::Strong(name) => out.push(Stmt::Release(name.clone())),
+                Cleanup::StrongArray(name) => out.push(Stmt::ReleaseArray(name.clone())),
                 Cleanup::Weak(name) => out.push(Stmt::WeakRelease(name.clone())),
             }
         }
@@ -701,14 +714,18 @@ fn param(p: &dray_hir::Param) -> Param {
 }
 
 fn is_rc_borrow(e: &Expr) -> bool {
-    matches!(e.ty, Ty::Rc(_)) && !matches!(e.kind, ExprKind::Alloc { .. } | ExprKind::Call { .. })
+    matches!(e.ty, Ty::Rc(_))
+        && !matches!(
+            e.kind,
+            ExprKind::Alloc { .. } | ExprKind::AllocArray { .. } | ExprKind::Call { .. }
+        )
 }
 
 fn is_live_rc_local(scopes: &Scopes, name: &str) -> bool {
     scopes.iter().any(|scope| {
         scope
             .iter()
-            .any(|c| matches!(c, Cleanup::Strong(n) if n == name))
+            .any(|c| matches!(c, Cleanup::Strong(n) | Cleanup::StrongArray(n) if n == name))
     })
 }
 

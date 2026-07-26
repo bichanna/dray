@@ -242,6 +242,10 @@ pub enum ExprKind {
         ty: Ty,
         fields: Vec<(String, Expr)>,
     },
+    AllocArray {
+        elem: Ty,
+        count: Box<Expr>,
+    },
     StructLit {
         ty: Ty,
         fields: Vec<(String, Expr)>,

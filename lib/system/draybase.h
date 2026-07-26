@@ -83,6 +83,10 @@ typedef void (*DrayDropFn)(void *);
 typedef struct {
   DrayU32 strong;
   DrayU32 weak;
+  /* Element count. 1 for a scalar `@T`; the length for a `@[]T`, whose drop
+   * function needs it to walk the payload. The type `@[]T` erases from, so the
+   * count cannot come from anywhere else. */
+  DraySize count;
   DrayDropFn drop;
 } DrayRcHeader;
 
@@ -91,6 +95,14 @@ typedef struct {
 extern DrayI64 dray_rc_live_count;
 
 void *dray_rc_alloc(DraySize payload, DrayDropFn drop);
+
+/* Allocates `count` elements of `stride` bytes each, zeroed, and records the
+ * count in the header. `drop` runs once for the whole payload, not per element:
+ * an array drop function loops using `dray_rc_count`. */
+void *dray_rc_alloc_array(DraySize count, DraySize stride, DrayDropFn drop);
+
+/* The element count recorded at allocationfor an array drop function. */
+DraySize dray_rc_count(void *p);
 void dray_rc_retain(void *p);
 void dray_rc_release(void *p);
 DrayI64 dray_rc_live(void);

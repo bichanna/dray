@@ -13,10 +13,20 @@ void *dray_rc_alloc(DraySize payload, DrayDropFn drop) {
     return NULL;
   h->strong = 1;
   h->weak = 0;
+  h->count = 1;
   h->drop = drop;
   dray_rc_live_count++;
   return (void *)(h + 1);
 }
+
+void *dray_rc_alloc_array(DraySize count, DraySize stride, DrayDropFn drop) {
+  void *p = dray_rc_alloc(count * stride, drop);
+  if (p)
+    ((DrayRcHeader *)p - 1)->count = count;
+  return p;
+}
+
+DraySize dray_rc_count(void *p) { return ((DrayRcHeader *)p - 1)->count; }
 
 void dray_rc_retain(void *p) {
   if (!p)

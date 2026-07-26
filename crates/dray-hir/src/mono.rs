@@ -556,6 +556,7 @@ fn each_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
         }
         ExprKind::Cast { operand, .. } => each_expr(operand, f),
         ExprKind::Downgrade(inner) | ExprKind::Upgrade(inner) => each_expr(inner, f),
+        ExprKind::AllocArray { count, .. } => each_expr(count, f),
         ExprKind::Alloc { fields, .. } | ExprKind::StructLit { fields, .. } => {
             for (_, fe) in fields {
                 each_expr(fe, f);
@@ -619,6 +620,10 @@ fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
             for (_, fe) in fields {
                 each_ty_in_expr(fe, f);
             }
+        }
+        ExprKind::AllocArray { elem, count } => {
+            f(elem);
+            each_ty_in_expr(count, f);
         }
         ExprKind::ArrayLit { ty, elements } => {
             f(ty);

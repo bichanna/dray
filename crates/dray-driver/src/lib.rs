@@ -151,11 +151,11 @@ fn system_lib_dir(opts: &BuildOptions) -> Result<PathBuf, BuildError> {
     if let Ok(dir) = std::env::var("DRAY_LIB") {
         candidates.push(PathBuf::from(dir));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin) = exe.parent() {
-            candidates.push(bin.join("../lib"));
-            candidates.push(bin.join("../../../lib"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin) = exe.parent()
+    {
+        candidates.push(bin.join("../lib"));
+        candidates.push(bin.join("../../../lib"));
     }
     candidates.push(PathBuf::from("lib"));
 

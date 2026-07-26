@@ -329,17 +329,26 @@ impl Lowerer {
     }
 
     fn reject_rc_in_extern(&mut self, ty: &Ty, proc_name: &str, where_: &str, span: Span) {
-        if !mentions_rc(ty) {
-            return;
-        }
-        self.err(
-            span,
-            format!(
-                "the {where_} of `{proc_name}` contains `{}`, and a counted pointer \
-                 cannot cross into C; use a raw pointer (`*T`) instead",
-                type_name(ty)
+        match offending_rc_in_extern(ty) {
+            Some(RcInExtern::Counted) => self.err(
+                span,
+                format!(
+                    "the {where_} of `{proc_name}` contains `{}`, and a counted pointer \
+                     cannot cross into C; use a raw pointer (`*T`) instead",
+                    type_name(ty)
+                ),
             ),
-        );
+            Some(RcInExtern::Weak) => self.err(
+                span,
+                format!(
+                    "the {where_} of `{proc_name}` contains `{}`, and a weak reference \
+                     cannot cross into C; there is nothing C could do with it but hand \
+                     it back to `upgrade`",
+                    type_name(ty)
+                ),
+            ),
+            None => {}
+        }
     }
 
     fn lower_params(&mut self, node: &SyntaxNode) -> Vec<Param> {
@@ -775,6 +784,19 @@ impl Lowerer {
         let sequence = self.lower_expr(&seq_node);
         let elem_ty = match &sequence.ty {
             Ty::Array(elem, _) | Ty::Slice(elem) => (**elem).clone(),
+            Ty::Rc(inner) => match &**inner {
+                Ty::Slice(elem) => (**elem).clone(),
+                _ => {
+                    self.err(
+                        seq_node.span(),
+                        format!(
+                            "only an array or slice can be iterated with `for ... in`, not `{}`",
+                            type_name(&sequence.ty)
+                        ),
+                    );
+                    return None;
+                }
+            },
             Ty::Infer => Ty::Infer,
             other => {
                 self.err(
@@ -788,8 +810,8 @@ impl Lowerer {
             }
         };
 
-        let needs_temp =
-            matches!(sequence.ty, Ty::Slice(_)) && !matches!(sequence.kind, ExprKind::Name { .. });
+        let needs_temp = matches!(sequence.ty, Ty::Slice(_) | Ty::Rc(_))
+            && !matches!(sequence.kind, ExprKind::Name { .. });
 
         self.push_scope();
 
@@ -1345,7 +1367,15 @@ impl Lowerer {
             .token_of_kind(SyntaxKind::Ident)
             .map(|t| t.text().to_string())
             .unwrap_or_default();
-        if let Ty::Slice(elem) = &recv.ty {
+        let slice_elem = match &recv.ty {
+            Ty::Slice(elem) => Some(elem.clone()),
+            Ty::Rc(inner) => match &**inner {
+                Ty::Slice(elem) => Some(elem.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(elem) = slice_elem {
             let ty = match member.as_str() {
                 "len" => Ty::Int {
                     bits: IntWidth::W32,
@@ -1737,17 +1767,17 @@ impl Lowerer {
         let lo = lo.and_then(|e| const_int(e).map(|v| (v, e.span)));
         let hi = hi.and_then(|e| const_int(e).map(|v| (v, e.span)));
 
-        if let (Some((l, span)), Some((h, _))) = (lo, hi) {
-            if l > h {
-                self.err(span, format!("slice starts at {l} but ends at {h}"));
-                return;
-            }
+        if let (Some((l, span)), Some((h, _))) = (lo, hi)
+            && l > h
+        {
+            self.err(span, format!("slice starts at {l} but ends at {h}"));
+            return;
         }
 
-        if let Some((l, span)) = lo {
-            if l < 0 {
-                self.err(span, format!("a slice cannot start at {l}"));
-            }
+        if let Some((l, span)) = lo
+            && l < 0
+        {
+            self.err(span, format!("a slice cannot start at {l}"));
         }
 
         let Ty::Array(_, len) = base else {
@@ -1780,18 +1810,28 @@ impl Lowerer {
                 ),
             );
         }
-        if let (Ty::Array(_, len), Some(i)) = (&base.ty, const_int(&index)) {
-            if i < 0 || i as u64 >= *len {
-                self.err(
-                    parts[1].span(),
-                    format!("index {i} is outside this array's {len} element(s)"),
-                );
-            }
+        if let (Ty::Array(_, len), Some(i)) = (&base.ty, const_int(&index))
+            && (i < 0 || i as u64 >= *len)
+        {
+            self.err(
+                parts[1].span(),
+                format!("index {i} is outside this array's {len} element(s)"),
+            );
         }
 
         let ty = match &base.ty {
             // A raw pointer, an array, and a slice all index to their element.
             Ty::Ptr(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => (**inner).clone(),
+            Ty::Rc(inner) => match &**inner {
+                Ty::Slice(elem) => (**elem).clone(),
+                _ => {
+                    self.err(
+                        node.span(),
+                        format!("`{}` cannot be indexed", type_name(&base.ty)),
+                    );
+                    Ty::Infer
+                }
+            },
             Ty::Infer => Ty::Infer,
             other => {
                 self.err(
@@ -2286,6 +2326,12 @@ impl Lowerer {
             return self.lower_composite_alloc(&lit);
         }
 
+        // `alloc [n]T`, which's a heap array. The count sits where an `[N]T` type would
+        // hold its literal length but here it is any expression
+        if let Some(arr) = node.child_of_kind(SyntaxKind::ArrayType) {
+            return self.lower_alloc_array(&arr);
+        }
+
         // Bare form: `alloc T`, zero-initialized.
         let ty_node = node.children().into_iter().find(|c| is_type(c.kind()));
         match ty_node.and_then(|t| self.checked_type(&t)) {
@@ -2301,6 +2347,42 @@ impl Lowerer {
                 (ExprKind::Unresolved("alloc".into()), Ty::Infer)
             }
         }
+    }
+
+    fn lower_alloc_array(&mut self, arr: &SyntaxNode) -> (ExprKind, Ty) {
+        let elem_node = arr.children().into_iter().find(|c| is_type(c.kind()));
+        let Some(elem) = elem_node.and_then(|t| self.checked_type(&t)) else {
+            self.err(arr.span(), "alloc needs an element type");
+            return (ExprKind::Unresolved("alloc-array".into()), Ty::Infer);
+        };
+
+        let count_node = arr
+            .children()
+            .into_iter()
+            .find(|c| !is_type(c.kind()) && is_expr(c.kind()));
+        let Some(count_node) = count_node else {
+            self.err(arr.span(), "alloc [n]T needs a count");
+            return (ExprKind::Unresolved("alloc-array".into()), Ty::Infer);
+        };
+        let count = self.lower_expr(&count_node);
+        if !matches!(count.ty, Ty::Int { .. } | Ty::Infer) {
+            self.err(
+                count.span,
+                format!(
+                    "an allocation count must be an integer, but this is `{}`",
+                    type_name(&count.ty)
+                ),
+            );
+        }
+
+        let ty = Ty::Rc(Box::new(Ty::Slice(Box::new(elem.clone()))));
+        (
+            ExprKind::AllocArray {
+                elem,
+                count: Box::new(count),
+            },
+            ty,
+        )
     }
 
     /// Lower a `CompositeLit` sitting under an `alloc`: resolve the struct type,
@@ -2971,12 +3053,21 @@ fn fits_arity(given: usize, arity: usize, variadic: bool) -> bool {
     }
 }
 
-fn mentions_rc(ty: &Ty) -> bool {
+/// What kind of counted pointer, if any, an `extern` signature illegally
+/// contains. `@T` outranks `Weak` only in that the walk reports the first it
+/// meets. both are rejected.
+enum RcInExtern {
+    Counted,
+    Weak,
+}
+
+fn offending_rc_in_extern(ty: &Ty) -> Option<RcInExtern> {
     match ty {
-        Ty::Rc(_) => true,
-        Ty::Ptr(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => mentions_rc(inner),
-        Ty::App(_, args) => args.iter().any(mentions_rc),
-        _ => false,
+        Ty::Rc(_) => Some(RcInExtern::Counted),
+        Ty::Weak(_) => Some(RcInExtern::Weak),
+        Ty::Ptr(inner) | Ty::Array(inner, _) | Ty::Slice(inner) => offending_rc_in_extern(inner),
+        Ty::App(_, args) => args.iter().find_map(offending_rc_in_extern),
+        _ => None,
     }
 }
 
