@@ -155,6 +155,11 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
     .expect("lib/system/draybase.h");
     std::fs::copy(lib.join("draybase.h"), &base_h).unwrap();
     std::fs::copy(lib.join("draybase.c"), &base_c).unwrap();
+    // The RC runtime is a companion file that draybase.h includes.
+    let rc_h = dir.join("drayrc.h");
+    let rc_c = dir.join(format!("{stamp}_drayrc.c"));
+    std::fs::copy(lib.join("drayrc.h"), &rc_h).unwrap();
+    std::fs::copy(lib.join("drayrc.c"), &rc_c).unwrap();
 
     // The generated C only has to compile and link. Warnings are the C
     // compiler's opinion about code nobody wrote by hand, so they are silenced
@@ -164,6 +169,7 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
         .arg("-w")
         .arg(&c_path)
         .arg(&base_c)
+        .arg(&rc_c)
         .arg(format!("-I{}", dir.display()))
         .arg("-o")
         .arg(&bin)
@@ -178,6 +184,7 @@ fn compile_and_run(c_src: &str) -> Option<i32> {
     let code = Command::new(&bin).status().unwrap().code().unwrap_or(-1);
     let _ = std::fs::remove_file(&c_path);
     let _ = std::fs::remove_file(&base_c);
+    let _ = std::fs::remove_file(&rc_c);
     let _ = std::fs::remove_file(&bin);
     Some(code)
 }
@@ -1101,8 +1108,8 @@ fn downgrade_and_upgrade_call_the_runtime() {
     let src = format!(
         "{WEAK_PRELUDE}\
         f :: proc(p: @Parent) -> int32 {{\n\
-            w := downgrade(p);\n\
-            switch upgrade(w) {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
+            w := p.downgrade();\n\
+            switch w.upgrade() {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
         }}\n\
         main :: proc() -> int32 {{ return 0; }}\n"
     );
@@ -1117,7 +1124,7 @@ fn a_switch_evaluates_its_scrutinee_once() {
     let src = format!(
         "{WEAK_PRELUDE}\
         f :: proc(w: Weak(@Parent)) -> int32 {{\n\
-            switch upgrade(w) {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
+            switch w.upgrade() {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
         }}\n\
         main :: proc() -> int32 {{ return 0; }}\n"
     );
@@ -1130,7 +1137,7 @@ fn a_proc_ending_in_an_exhaustive_switch_closes_with_unreachable() {
     let src = format!(
         "{WEAK_PRELUDE}\
         f :: proc(w: Weak(@Parent)) -> int32 {{\n\
-            switch upgrade(w) {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
+            switch w.upgrade() {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
         }}\n\
         main :: proc() -> int32 {{ return 0; }}\n"
     );
@@ -1145,7 +1152,7 @@ fn e2e_a_parent_child_cycle_is_collected() {
         build :: proc() -> int32 {{\n\
             c := alloc Child{{ name: 2 }};\n\
             p := alloc Parent{{ name: 1, child: c }};\n\
-            c.parent = downgrade(p);\n\
+            c.parent = p.downgrade();\n\
             return cast(int32) rc_live();\n\
         }}\n\
         main :: proc() -> int32 {{\n\
@@ -1165,8 +1172,8 @@ fn e2e_upgrade_succeeds_while_the_owner_is_alive() {
         main :: proc() -> int32 {{\n\
             c := alloc Child{{ name: 2 }};\n\
             p := alloc Parent{{ name: 7, child: c }};\n\
-            c.parent = downgrade(p);\n\
-            switch upgrade(c.parent) {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
+            c.parent = p.downgrade();\n\
+            switch c.parent.upgrade() {{ case Maybe.Some(up): return up.name; case Maybe.None: return 0; }}\n\
         }}\n"
     );
     if let Some(code) = compile_and_run(&c(&src)) {
@@ -1181,11 +1188,11 @@ fn e2e_upgrade_fails_once_the_owner_is_gone() {
         orphan :: proc() -> Weak(@Parent) {{\n\
             c := alloc Child{{ name: 2 }};\n\
             p := alloc Parent{{ name: 7, child: c }};\n\
-            return downgrade(p);\n\
+            return p.downgrade();\n\
         }}\n\
         main :: proc() -> int32 {{\n\
             w := orphan();\n\
-            switch upgrade(w) {{ case Maybe.Some(up): return 1; case Maybe.None: return 0; }}\n\
+            switch w.upgrade() {{ case Maybe.Some(up): return 1; case Maybe.None: return 0; }}\n\
         }}\n"
     );
     if let Some(code) = compile_and_run(&c(&src)) {
@@ -1298,5 +1305,58 @@ fn e2e_returning_a_heap_array_transfers_ownership_not_frees_it() {
             10 * 10 + 1,
             "array alive inside owner, freed at its exit"
         );
+    }
+}
+
+#[test]
+fn a_method_lowers_to_a_function_taking_the_receiver_first() {
+    let out = c(
+        "Circle :: struct { radius: int32 }\narea :: proc[c: Circle]() -> int32 { return c.radius; }\nmain :: proc() -> int32 { return 0; }\n",
+    );
+    assert!(out.contains("dray_m_Circle_area(struct Circle c)"), "{out}");
+}
+
+#[test]
+fn a_method_call_passes_the_receiver_as_the_first_argument() {
+    let out = c(
+        "Circle :: struct { radius: int32 }\narea :: proc[c: Circle]() -> int32 { return c.radius; }\nmain :: proc() -> int32 { sq := Circle{ radius: 3 }; return sq.area(); }\n",
+    );
+    assert!(out.contains("dray_m_Circle_area(sq)"), "{out}");
+}
+
+#[test]
+fn two_types_sharing_a_method_name_mangle_distinctly() {
+    let out = c(
+        "Circle :: struct { r: int32 }\nSquare :: struct { s: int32 }\narea :: proc[c: Circle]() -> int32 { return c.r; }\narea :: proc[sq: Square]() -> int32 { return sq.s; }\nmain :: proc() -> int32 { return 0; }\n",
+    );
+    assert!(out.contains("dray_m_Circle_area"), "{out}");
+    assert!(out.contains("dray_m_Square_area"), "{out}");
+}
+
+#[test]
+fn e2e_a_value_receiver_method_runs() {
+    let src = "Circle :: struct { radius: int32 }\narea :: proc[c: Circle]() -> int32 { return c.radius * c.radius; }\nscale :: proc[c: Circle](f: int32) -> int32 { return c.radius * f; }\nmain :: proc() -> int32 { sq := Circle{ radius: 3 }; return sq.area() + sq.scale(2); }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 15, "area 9 + scale 6");
+    }
+}
+
+#[test]
+fn e2e_a_pointer_receiver_method_runs() {
+    let src = "Box :: struct { value: int32 }\nget :: proc[b: @Box]() -> int32 { return b.value; }\nmain :: proc() -> int32 { boxed := alloc Box{ value: 42 }; return boxed.get(); }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn e2e_a_method_can_call_another_method() {
+    let src = "printf :: extern \"printf\" proc(fmt: *cchar, ...) -> int32;\nRect :: struct { w: int32, h: int32 }\narea :: proc[r: Rect]() -> int32 { return r.w * r.h; }\nscaled :: proc[r: Rect](f: int32) -> int32 { return r.area() * f; }\nmain :: proc() -> int32 { box := Rect{ w: 3, h: 4 }; return box.scaled(2); }\n";
+    let out = c(src);
+    // The inner call must be the method, never printf.
+    assert!(out.contains("dray_m_Rect_area(r)"), "{out}");
+    assert!(!out.contains("printf(r)"), "{out}");
+    if let Some(code) = compile_and_run(&out) {
+        assert_eq!(code, 24, "area 12 * 2");
     }
 }

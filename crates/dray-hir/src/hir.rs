@@ -94,6 +94,7 @@ pub struct Field {
 pub struct Proc {
     pub def: DefId,
     pub name: String,
+    pub receiver: Option<Param>,
     pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Ty,
@@ -416,5 +417,12 @@ impl Ty {
     }
     pub fn f64() -> Ty {
         Ty::Float { bits: 64 }
+    }
+
+    pub fn rc_or_ptr_inner(&self) -> &Ty {
+        match self {
+            Ty::Rc(inner) | Ty::Ptr(inner) | Ty::Weak(inner) => inner.rc_or_ptr_inner(),
+            other => other,
+        }
     }
 }

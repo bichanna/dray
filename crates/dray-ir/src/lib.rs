@@ -285,7 +285,12 @@ impl Lowerer {
 
                 Some(Item::Proc(Proc {
                     name: p.name.clone(),
-                    params: p.params.iter().map(param).collect(),
+                    params: p
+                        .receiver
+                        .iter()
+                        .chain(p.params.iter())
+                        .map(param)
+                        .collect(),
                     ret: p.ret.clone(),
                     body,
                 }))

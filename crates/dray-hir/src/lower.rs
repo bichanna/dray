@@ -16,8 +16,12 @@ pub struct ResolveError {
 }
 
 pub fn lower(root: &SyntaxNode) -> (Hir, Vec<ResolveError>) {
+    lower_files(&[root])
+}
+
+pub fn lower_files(roots: &[&SyntaxNode]) -> (Hir, Vec<ResolveError>) {
     let mut lw = Lowerer::new();
-    lw.run(root);
+    lw.run_all(roots);
     (
         Hir {
             items: lw.items,
@@ -76,6 +80,35 @@ struct Lowerer {
     /// The comptime type parameters of the declaration currently being lowered, so
     /// type references inside its body (`sizeof(T)`) resolve to them.
     type_params_in_scope: Vec<String>,
+    /// Methods with a concrete receiver, keyed by (receiver type key, method
+    /// name). The value is the method's mangled global name. The orphan rule
+    /// means one type has one declaring file so this needs no per-module split
+    methods: HashMap<(String, String), MethodInfo>,
+    /// Methods whose receiver is a bare comptime type parameter. They have
+    /// no owning type to route through, so
+    /// they are checked against every dot-call as a fallback.
+    generic_methods: Vec<MethodInfo>,
+    /// Per module-scope def: the file it was declared in, and whether it is
+    /// `pub`. A name from file A resolves to a def from file B only if that def
+    /// is `pub`. Indexed by DefId. Non-module defs (params, locals) are absent.
+    visibility: HashMap<DefId, Visibility>,
+    /// The file currently being lowered in pass 2, for the visibility check
+    current_file: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Visibility {
+    file: usize,
+    is_pub: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MethodInfo {
+    receiver: Ty,
+    mangled: String,
+    display: String,
+    arity: usize,
+    ret: Ty,
 }
 
 impl Lowerer {
@@ -100,21 +133,48 @@ impl Lowerer {
             in_extern: false,
             zeroing: Vec::new(),
             type_params_in_scope: Vec::new(),
+            methods: HashMap::new(),
+            generic_methods: Vec::new(),
+            visibility: HashMap::new(),
+            current_file: 0,
         }
     }
 
-    fn run(&mut self, root: &SyntaxNode) {
-        if root.kind() != SyntaxKind::SourceFile {
-            self.err(root.span(), "expected a SourceFile root");
-            return;
+    fn run_all(&mut self, roots: &[&SyntaxNode]) {
+        let mut per_file: Vec<Vec<SyntaxNode>> = Vec::new();
+        for root in roots {
+            if root.kind() != SyntaxKind::SourceFile {
+                self.err(root.span(), "expected a SourceFile root");
+                continue;
+            }
+            let decls: Vec<SyntaxNode> = root
+                .children()
+                .into_iter()
+                .filter(|d| d.kind() != SyntaxKind::ImportDecl)
+                .collect();
+            per_file.push(decls);
         }
-        let decls = root.children();
 
-        // Pass 1: register top-level proc/extern names for forward references
-        for decl in &decls {
+        for (file, decls) in per_file.iter().enumerate() {
+            self.current_file = file;
+            self.pass1(decls);
+        }
+
+        for (file, decls) in per_file.iter().enumerate() {
+            self.current_file = file;
+            self.pass2(decls);
+        }
+    }
+
+    fn pass1(&mut self, decls: &[SyntaxNode]) {
+        for decl in decls {
             match decl.kind() {
                 SyntaxKind::ProcDef => {
                     if let Some(name) = first_ident(decl) {
+                        if let Some(recv) = self.receiver_type(decl) {
+                            self.register_method(&name, recv, decl);
+                            continue;
+                        }
                         let ret = self.return_type(decl);
                         self.proc_arity
                             .insert(name.clone(), runtime_param_count(decl));
@@ -127,7 +187,7 @@ impl Lowerer {
                             self.proc_type_params.insert(name.clone(), type_params);
                         }
                         let id = self.add_def(name.clone(), DefKind::Proc, ret);
-                        self.bind_module(name.clone(), id, decl.span());
+                        self.bind_module_vis(name.clone(), id, decl.span(), is_pub(decl));
                     }
                 }
                 SyntaxKind::ExternProcDecl => {
@@ -142,7 +202,7 @@ impl Lowerer {
                             self.variadic_procs.insert(name.clone());
                         }
                         let id = self.add_def(name.clone(), DefKind::ExternProc { symbol }, ret);
-                        self.bind_module(name, id, decl.span());
+                        self.bind_module_vis(name, id, decl.span(), is_pub(decl));
                     }
                 }
                 SyntaxKind::StructDef => {
@@ -150,7 +210,7 @@ impl Lowerer {
                         let fields = self.struct_fields(decl);
                         let id =
                             self.add_def(name.clone(), DefKind::Struct, Ty::Named(name.clone()));
-                        self.bind_module(name.clone(), id, decl.span());
+                        self.bind_module_vis(name.clone(), id, decl.span(), is_pub(decl));
                         let tps = comptime_type_params(decl);
                         self.type_arity.insert(name.clone(), tps.len());
                         self.struct_type_params.insert(name.clone(), tps);
@@ -161,7 +221,7 @@ impl Lowerer {
                     if let Some(name) = first_ident(decl) {
                         let variants = self.enum_variants(decl);
                         let id = self.add_def(name.clone(), DefKind::Enum, Ty::Named(name.clone()));
-                        self.bind_module(name.clone(), id, decl.span());
+                        self.bind_module_vis(name.clone(), id, decl.span(), is_pub(decl));
                         let tps = comptime_type_params(decl);
                         self.type_arity.insert(name.clone(), tps.len());
                         self.enum_type_params.insert(name.clone(), tps);
@@ -171,9 +231,10 @@ impl Lowerer {
                 _ => {}
             }
         }
+    }
 
-        // Pass 2: lower each declaration
-        for decl in &decls {
+    fn pass2(&mut self, decls: &[SyntaxNode]) {
+        for decl in decls {
             match decl.kind() {
                 SyntaxKind::CHeaderDecl => {
                     if let Some(h) = self.c_header(decl) {
@@ -200,17 +261,92 @@ impl Lowerer {
         }
     }
 
+    fn receiver_type(&mut self, decl: &SyntaxNode) -> Option<Ty> {
+        let recv = decl.child_of_kind(SyntaxKind::Receiver)?;
+        let param = recv.child_of_kind(SyntaxKind::Param)?;
+        if param.token_of_kind(SyntaxKind::KwComptime).is_some() {
+            return first_ident(&param).map(Ty::Named);
+        }
+        let ty_node = param.children().into_iter().find(|c| is_type(c.kind()))?;
+        self.checked_type(&ty_node).or(Some(Ty::Infer))
+    }
+
+    fn register_method(&mut self, name: &str, receiver: Ty, decl: &SyntaxNode) {
+        let ret = self.return_type(decl);
+        let type_params = comptime_type_params(decl);
+        let mangled = method_mangled_name(&receiver, name);
+
+        let is_generic_receiver = matches!(&receiver, Ty::Named(n) if type_params.contains(n));
+
+        let info = MethodInfo {
+            receiver: receiver.clone(),
+            mangled: mangled.clone(),
+            display: name.to_string(),
+            arity: runtime_param_count(decl),
+            ret: ret.clone(),
+        };
+
+        if is_generic_receiver {
+            self.generic_methods.push(info);
+        } else {
+            self.orphan_rule_check(&receiver, decl.span());
+            let key = (receiver_type_key(&receiver), name.to_string());
+            if self.methods.contains_key(&key) {
+                self.err(
+                    decl.span(),
+                    format!(
+                        "`{}` already has a method named `{name}`",
+                        type_name(&receiver)
+                    ),
+                );
+            }
+            self.methods.insert(key, info);
+        }
+
+        let id = self.add_def(mangled.clone(), DefKind::Proc, ret);
+        self.scopes[0].names.insert(mangled.clone(), id);
+        self.proc_arity
+            .insert(mangled.clone(), runtime_param_count(decl) + 1);
+        if !type_params.is_empty() {
+            self.proc_type_params.insert(mangled, type_params);
+        }
+    }
+
+    fn orphan_rule_check(&mut self, receiver: &Ty, span: Span) {
+        let named = match receiver.rc_or_ptr_inner() {
+            Ty::Named(n) => n.clone(),
+            _ => return,
+        };
+        if !self.type_arity.contains_key(&named) {
+            self.err(
+                span,
+                format!(
+                    "cannot declare a method on `{named}` here: a method on a type must live \
+                     in the same file as the type, and `{named}` is declared elsewhere \
+                     (the orphan rule)"
+                ),
+            );
+        }
+    }
+
     fn add_def(&mut self, name: String, kind: DefKind, ty: Ty) -> DefId {
         let id = DefId(self.defs.len() as u32);
         self.defs.push(DefInfo { name, kind, ty });
         id
     }
 
-    fn bind_module(&mut self, name: String, id: DefId, span: Span) {
+    fn bind_module_vis(&mut self, name: String, id: DefId, span: Span, is_pub: bool) {
         if self.scopes[0].names.contains_key(&name) {
             self.err(span, format!("`{name}` is declared more than once"));
         }
         self.scopes[0].names.insert(name, id);
+        self.visibility.insert(
+            id,
+            Visibility {
+                file: self.current_file,
+                is_pub,
+            },
+        );
     }
 
     fn declared_in_current_scope(&self, name: &str) -> bool {
@@ -247,8 +383,17 @@ impl Lowerer {
 
     /// Resolve a name against the scope stack (innermost first, module last).
     fn resolve(&self, name: &str) -> Option<DefId> {
-        for scope in self.scopes.iter().rev() {
+        for (depth, scope) in self.scopes.iter().enumerate().rev() {
             if let Some(&id) = scope.names.get(name) {
+                // Module scope (depth 0) is shared across all files, so a name
+                // from another file is only visible if it is `pub`.
+                if depth == 0 {
+                    if let Some(vis) = self.visibility.get(&id) {
+                        if vis.file != self.current_file && !vis.is_pub {
+                            continue;
+                        }
+                    }
+                }
                 return Some(id);
             }
         }
@@ -260,7 +405,14 @@ impl Lowerer {
             Some(n) => n,
             None => return,
         };
-        let def = self.resolve(&name).unwrap_or(DefId(0));
+
+        let receiver_ty = self.receiver_type(node);
+        let global_name = match &receiver_ty {
+            Some(rt) => method_mangled_name(rt, &name),
+            None => name.clone(),
+        };
+
+        let def = self.resolve(&global_name).unwrap_or(DefId(0));
         let ret = self.return_type(node);
 
         let type_params = comptime_type_params(node);
@@ -269,6 +421,7 @@ impl Lowerer {
         self.push_scope();
         self.type_params_in_scope = type_params.clone();
         self.current_ret = ret.clone();
+        let receiver = self.lower_receiver(node);
         let params = self.lower_params(node);
         let body = match node.child_of_kind(SyntaxKind::Block) {
             Some(b) => {
@@ -289,12 +442,40 @@ impl Lowerer {
 
         self.items.push(Item::Proc(Proc {
             def,
-            name,
+            name: global_name,
+            receiver,
             type_params,
             params,
             ret,
             body,
         }));
+    }
+
+    /// Lower the receiver clause into a `Param`, binding its name in the current
+    /// scope so the method body can use it
+    fn lower_receiver(&mut self, node: &SyntaxNode) -> Option<Param> {
+        let recv = node.child_of_kind(SyntaxKind::Receiver)?;
+        let param = recv.child_of_kind(SyntaxKind::Param)?;
+        let pname = first_ident(&param)?;
+        let ty = if param.token_of_kind(SyntaxKind::KwComptime).is_some() {
+            // A generic receiver names a type parameter; the value's own type is
+            // that parameter.
+            Ty::Named(pname.clone())
+        } else {
+            param
+                .children()
+                .into_iter()
+                .find(|c| is_type(c.kind()))
+                .and_then(|t| self.checked_type(&t))
+                .unwrap_or(Ty::Infer)
+        };
+        let id = self.add_def(pname.clone(), DefKind::Param, ty.clone());
+        self.bind_local(pname.clone(), id);
+        Some(Param {
+            def: id,
+            name: pname,
+            ty,
+        })
     }
 
     fn lower_extern(&mut self, node: &SyntaxNode) {
@@ -1290,7 +1471,13 @@ impl Lowerer {
             && cn.kind() == SyntaxKind::NameExpr
             && matches!(ident_text(cn).as_str(), "downgrade" | "upgrade")
         {
-            return self.lower_weak_op(node, &ident_text(cn));
+            let op = ident_text(cn);
+            let receiver = if op == "downgrade" { "@T" } else { "Weak(@T)" };
+            self.err(
+                node.span(),
+                format!("`{op}` is a method; write `x.{op}()` where `x` is a `{receiver}`"),
+            );
+            return (ExprKind::Unresolved(op), Ty::Infer);
         }
 
         if let Some(cn) = &callee_node
@@ -1298,6 +1485,17 @@ impl Lowerer {
             && self.proc_type_params.contains_key(&ident_text(cn))
         {
             return self.lower_generic_call(node, &ident_text(cn));
+        }
+
+        // `x.foo(args)` if `foo` resolves to a method on the
+        // type of `x`. This has to run before the callee is lowered as an
+        // ordinary expression bc `x.foo` is not a field
+        if let Some(cn) = &callee_node
+            && cn.kind() == SyntaxKind::FieldExpr
+        {
+            if let Some(call) = self.try_method_call(cn, node) {
+                return call;
+            }
         }
 
         let callee = match callee_node {
@@ -1331,6 +1529,180 @@ impl Lowerer {
                 args,
             },
             ty,
+        )
+    }
+
+    fn weak_intrinsic_method(
+        &mut self,
+        name: &str,
+        recv: &Expr,
+        call_node: &SyntaxNode,
+    ) -> Option<(ExprKind, Ty)> {
+        let no_args = self.call_args(call_node).is_empty();
+        match (name, &recv.ty) {
+            ("downgrade", Ty::Rc(pointee)) => {
+                if !no_args {
+                    self.err(call_node.span(), "`downgrade` takes no arguments");
+                }
+                let ty = Ty::Weak(pointee.clone());
+                Some((ExprKind::Downgrade(Box::new(recv.clone())), ty))
+            }
+            ("upgrade", Ty::Weak(pointee)) => {
+                if !no_args {
+                    self.err(call_node.span(), "`upgrade` takes no arguments");
+                }
+                if !self.enums.contains_key("Maybe") {
+                    self.err(
+                        call_node.span(),
+                        "`upgrade` produces a `Maybe(@T)`, but no `Maybe` enum is declared",
+                    );
+                    return Some((ExprKind::Unresolved("upgrade".into()), Ty::Infer));
+                }
+                let ty = Ty::App("Maybe".to_string(), vec![Ty::Rc(pointee.clone())]);
+                Some((ExprKind::Upgrade(Box::new(recv.clone())), ty))
+            }
+            ("downgrade", other) => {
+                self.err(
+                    call_node.span(),
+                    format!(
+                        "`downgrade` needs a `@T`, but this is `{}`",
+                        type_name(other)
+                    ),
+                );
+                Some((ExprKind::Unresolved("downgrade".into()), Ty::Infer))
+            }
+            ("upgrade", other) => {
+                self.err(
+                    call_node.span(),
+                    format!(
+                        "`upgrade` needs a `Weak(@T)`, but this is `{}`",
+                        type_name(other)
+                    ),
+                );
+                Some((ExprKind::Unresolved("upgrade".into()), Ty::Infer))
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve `recv.foo(args)` to a method call, or `None` if `foo` is not a
+    /// method on `recv`'s type (in which case the caller falls back to ordinary
+    /// field-then-call handling, which will report the real error)
+    fn try_method_call(
+        &mut self,
+        field_node: &SyntaxNode,
+        call_node: &SyntaxNode,
+    ) -> Option<(ExprKind, Ty)> {
+        if self.enum_variant_ref(field_node).is_some() {
+            return None;
+        }
+        let recv_node = self.first_expr(field_node)?;
+        let name = field_node
+            .token_of_kind(SyntaxKind::Ident)
+            .map(|t| t.text().to_string())?;
+
+        let recv = self.lower_expr(&recv_node);
+
+        if let Some(intrinsic) = self.weak_intrinsic_method(&name, &recv, call_node) {
+            return Some(intrinsic);
+        }
+
+        if let Ty::Named(sname) = recv.ty.rc_or_ptr_inner() {
+            if let Some(fields) = self.structs.get(sname) {
+                if fields.iter().any(|f| f.name == name) {
+                    return None;
+                }
+            }
+        }
+
+        let args = self.call_args(call_node);
+        let key = (receiver_type_key(&recv.ty), name.clone());
+
+        if let Some(info) = self.methods.get(&key).cloned() {
+            return Some(self.build_method_call(info, recv, args, call_node.span()));
+        }
+
+        // No auto-deref. `@Circle` receiver does not satisfy a `Circle`
+        // method, but an inherent method on the pointer's pointee is a common
+        // case worth a clear error rather than silent "no method"
+        let generic_matches: Vec<MethodInfo> = self
+            .generic_methods
+            .iter()
+            .filter(|m| m.display == name && m.arity == args.len())
+            .cloned()
+            .collect();
+
+        match generic_matches.as_slice() {
+            [] => {
+                self.err(
+                    call_node.span(),
+                    format!("`{}` has no method `{name}`", type_name(&recv.ty)),
+                );
+                Some((ExprKind::Unresolved("method".into()), Ty::Infer))
+            }
+            [info] => {
+                let mut all_args = Vec::with_capacity(args.len() + 1);
+                all_args.push(recv);
+                all_args.extend(args);
+                let ret = info.ret.clone();
+                Some((
+                    ExprKind::GenericCall {
+                        proc_name: info.mangled.clone(),
+                        type_args: Vec::new(),
+                        args: all_args,
+                    },
+                    ret,
+                ))
+            }
+            _ => {
+                self.err(
+                    call_node.span(),
+                    format!("`{name}` is ambiguous: several generic methods match"),
+                );
+                Some((ExprKind::Unresolved("method".into()), Ty::Infer))
+            }
+        }
+    }
+
+    fn build_method_call(
+        &mut self,
+        info: MethodInfo,
+        recv: Expr,
+        args: Vec<Expr>,
+        span: Span,
+    ) -> (ExprKind, Ty) {
+        if args.len() != info.arity {
+            self.err(
+                span,
+                format!(
+                    "method `{}` on `{}` takes {} argument(s), but {} were given",
+                    info.display,
+                    type_name(&info.receiver),
+                    info.arity,
+                    args.len()
+                ),
+            );
+        }
+
+        let mut all_args = Vec::with_capacity(args.len() + 1);
+        all_args.push(recv);
+        all_args.extend(args);
+
+        let def = self.resolve(&info.mangled).unwrap_or(DefId(0));
+        let callee = Expr {
+            kind: ExprKind::Name {
+                def,
+                name: info.mangled.clone(),
+            },
+            ty: Ty::Infer,
+            span,
+        };
+        (
+            ExprKind::Call {
+                callee: Box::new(callee),
+                args: all_args,
+            },
+            info.ret,
         )
     }
 
@@ -1577,60 +1949,6 @@ impl Lowerer {
     }
 
     /// `downgrade(p)` and `upgrade(w)`, the two halves of a weak reference
-    fn lower_weak_op(&mut self, node: &SyntaxNode, op: &str) -> (ExprKind, Ty) {
-        let args: Vec<SyntaxNode> = node
-            .child_of_kind(SyntaxKind::ArgList)
-            .map(|al| al.children())
-            .unwrap_or_default();
-        let [arg] = args.as_slice() else {
-            self.err(
-                node.span(),
-                format!(
-                    "`{op}` takes exactly 1 argument, but {} were given",
-                    args.len()
-                ),
-            );
-            return (ExprKind::Unresolved(op.into()), Ty::Infer);
-        };
-        let value = self.lower_expr(arg);
-
-        if op == "downgrade" {
-            let Ty::Rc(pointee) = &value.ty else {
-                self.err(
-                    node.span(),
-                    format!(
-                        "`downgrade` takes an `@T`, but this is `{}`",
-                        type_name(&value.ty)
-                    ),
-                );
-                return (ExprKind::Unresolved(op.into()), Ty::Infer);
-            };
-            let ty = Ty::Weak(pointee.clone());
-            return (ExprKind::Downgrade(Box::new(value)), ty);
-        }
-
-        let Ty::Weak(pointee) = &value.ty else {
-            self.err(
-                node.span(),
-                format!(
-                    "`upgrade` takes a `Weak(@T)`, but this is `{}`",
-                    type_name(&value.ty)
-                ),
-            );
-            return (ExprKind::Unresolved(op.into()), Ty::Infer);
-        };
-        let ty = Ty::App("Maybe".to_string(), vec![Ty::Rc(pointee.clone())]);
-
-        if !self.enums.contains_key("Maybe") {
-            self.err(
-                node.span(),
-                "`upgrade` produces a `Maybe(@T)`, but no `Maybe` enum is declared",
-            );
-            return (ExprKind::Unresolved(op.into()), Ty::Infer);
-        }
-        (ExprKind::Upgrade(Box::new(value)), ty)
-    }
-
     fn lower_sizeof(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         let size_ty = Ty::Int {
             bits: IntWidth::Size,
@@ -3148,6 +3466,53 @@ fn runtime_param_count(node: &SyntaxNode) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+/// A method's mangled global name: `dray_m_<typekey>_<name>`
+fn method_mangled_name(receiver: &Ty, name: &str) -> String {
+    format!("dray_m_{}_{}", receiver_type_key(receiver), name)
+}
+
+fn receiver_type_key(ty: &Ty) -> String {
+    match ty {
+        Ty::Named(n) => n.clone(),
+        Ty::App(n, args) => {
+            let inner: Vec<String> = args.iter().map(receiver_type_key).collect();
+            format!("{n}_{}", inner.join("_"))
+        }
+        Ty::Rc(inner) => format!("rc_{}", receiver_type_key(inner)),
+        Ty::Ptr(inner) => format!("ptr_{}", receiver_type_key(inner)),
+        Ty::Weak(inner) => format!("weak_{}", receiver_type_key(inner)),
+        Ty::Slice(inner) => format!("slice_{}", receiver_type_key(inner)),
+        Ty::Array(inner, n) => format!("arr{n}_{}", receiver_type_key(inner)),
+        Ty::Int { bits, signed } => {
+            format!(
+                "{}{}",
+                if *signed { "i" } else { "u" },
+                int_width_bits(bits)
+            )
+        }
+        Ty::Float { bits } => format!("f{bits}"),
+        Ty::Bool => "bool".to_string(),
+        Ty::CChar => "cchar".to_string(),
+        Ty::Void => "void".to_string(),
+        Ty::Infer => "infer".to_string(),
+    }
+}
+
+fn int_width_bits(bits: &IntWidth) -> &'static str {
+    match bits {
+        IntWidth::W8 => "8",
+        IntWidth::W16 => "16",
+        IntWidth::W32 => "32",
+        IntWidth::W64 => "64",
+        IntWidth::Size => "size",
+    }
+}
+
+/// Whether a top-level declaration carries the `pub` keyword.
+fn is_pub(decl: &SyntaxNode) -> bool {
+    decl.token_of_kind(SyntaxKind::KwPub).is_some()
 }
 
 fn comptime_type_params(node: &SyntaxNode) -> Vec<String> {

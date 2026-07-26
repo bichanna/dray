@@ -5,6 +5,7 @@
 mod backend;
 pub use backend::{Backend, CcInvocation};
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use dray_hir::lower;
@@ -134,6 +135,74 @@ pub fn source_to_c(src: &str) -> Result<String, BuildError> {
     dray_codegen::ir_to_c(&ir).map_err(|e| BuildError::Codegen(e.to_string()))
 }
 
+struct LoadedModule {
+    parsed: dray_syntax::Parse,
+}
+
+fn source_to_c_with_imports(entry_src: &str, entry_path: &Path) -> Result<String, BuildError> {
+    let mut loaded: Vec<LoadedModule> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    let entry_canon =
+        std::fs::canonicalize(entry_path).unwrap_or_else(|_| entry_path.to_path_buf());
+    seen.insert(entry_canon.clone());
+    let mut queue: Vec<(String, PathBuf)> = vec![(entry_src.to_string(), entry_canon)];
+
+    while let Some((src, path)) = queue.pop() {
+        let parsed = parse(&src);
+        if !parsed.errors.is_empty() {
+            return Err(BuildError::Parse(
+                parsed
+                    .errors
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{}: {}..{}: {}",
+                            path.display(),
+                            e.span.start,
+                            e.span.end,
+                            e.message
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        for rel in dray_syntax::import_paths(&parsed.root) {
+            let target = dir.join(&rel);
+            let canon = std::fs::canonicalize(&target).unwrap_or(target.clone());
+            if !seen.insert(canon.clone()) {
+                continue; // already loaded — this is what stops cycles
+            }
+            let imported_src = std::fs::read_to_string(&canon)
+                .map_err(|e| BuildError::Parse(vec![format!("cannot import \"{rel}\": {e}")]))?;
+            queue.push((imported_src, canon));
+        }
+
+        loaded.push(LoadedModule { parsed });
+    }
+
+    let roots: Vec<&dray_syntax::SyntaxNode> = loaded.iter().map(|m| &m.parsed.root).collect();
+    let (hir, resolve_errors) = dray_hir::lower_files(&roots);
+    if !resolve_errors.is_empty() {
+        return Err(BuildError::Resolve(
+            resolve_errors
+                .iter()
+                .map(|e| format!("{}..{}: {}", e.span.start, e.span.end, e.message))
+                .collect(),
+        ));
+    }
+
+    let mono = dray_hir::monomorphize(hir).map_err(|e| BuildError::Monomorphize(e.to_string()))?;
+    let mut ir = dray_ir::lower(&mono);
+    ir.source = Some(dray_ir::SourceMap::new(
+        &entry_path.display().to_string(),
+        entry_src,
+    ));
+    dray_codegen::ir_to_c(&ir).map_err(|e| BuildError::Codegen(e.to_string()))
+}
+
 pub fn source_to_c_from_file(src: &str, file: &str) -> Result<String, BuildError> {
     let mut ir = source_to_ir(src)?;
     ir.source = Some(dray_ir::SourceMap::new(file, src));
@@ -192,7 +261,7 @@ pub fn build_file(
 ) -> Result<PathBuf, BuildError> {
     let src = std::fs::read_to_string(src_path)?;
     let abs_src = std::fs::canonicalize(src_path).unwrap_or_else(|_| src_path.to_path_buf());
-    let c_code = source_to_c_from_file(&src, &abs_src.display().to_string())?;
+    let c_code = source_to_c_with_imports(&src, &abs_src)?;
 
     let dir = build_dir(opts, out_path);
     std::fs::create_dir_all(&dir)?;
@@ -207,8 +276,13 @@ pub fn build_file(
     let lib = system_lib_dir(opts)?;
     let base_h = dir.join("draybase.h");
     let base_c = dir.join("draybase.c");
+    let rc_h = dir.join("drayrc.h");
+    let rc_c = dir.join("drayrc.c");
+
     std::fs::copy(lib.join("draybase.h"), &base_h)?;
     std::fs::copy(lib.join("draybase.c"), &base_c)?;
+    std::fs::copy(lib.join("drayrc.h"), &rc_h)?;
+    std::fs::copy(lib.join("drayrc.c"), &rc_c)?;
 
     let includes = [dir.clone()];
     let invocation = CcInvocation {
@@ -219,7 +293,7 @@ pub fn build_file(
         extra: &opts.cflags,
     };
     let status = invocation
-        .command_multi(&[c_path.clone(), base_c.clone()], out_path)
+        .command_multi(&[c_path.clone(), base_c.clone(), rc_c.clone()], out_path)
         .status()
         .map_err(|e| {
             BuildError::CC(format!(

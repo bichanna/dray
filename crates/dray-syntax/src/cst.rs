@@ -104,6 +104,8 @@ pub enum SyntaxKind {
     ProcDef,
     /// `c_header ( string_lit ) ;`
     CHeaderDecl,
+    /// `import ( string_lit ) ;`
+    ImportDecl,
     /// `[ "pub" ] identifier "::" "extern" string_lit "proc" "(" ParamList ")"
     /// [ "->" Type ] ";"` — an externally-linked C function (spec §16).
     ExternProcDecl,
@@ -127,6 +129,8 @@ pub enum SyntaxKind {
     EnumPattern,
     /// `( ParamList )`
     ParamList,
+    /// `"[" Param "]"` — a method's receiver clause, `proc[recv: Type](...)`.
+    Receiver,
     /// `[ "comptime" ] identifier ":" Type`
     Param,
     /// The `-> Type` return clause.

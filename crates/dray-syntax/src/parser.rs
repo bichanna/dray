@@ -238,9 +238,21 @@ impl<'a> Parser<'a> {
     fn top_level_decl(&mut self) {
         match self.peek() {
             TokenKind::KwCHeader => self.c_header_decl(),
+            TokenKind::KwImport => self.import_decl(),
             TokenKind::KwPub | TokenKind::Ident => self.named_decl(),
             _ => self.err_and_bump("expected a top-level declaration"),
         }
+    }
+
+    /// `import ( string_lit ) ;`
+    fn import_decl(&mut self) {
+        self.start(SyntaxKind::ImportDecl);
+        self.bump(); // import
+        self.expect(TokenKind::LParen, "'(' after import");
+        self.expect(TokenKind::StringLit, "a module path string");
+        self.expect(TokenKind::RParen, "')'");
+        self.expect(TokenKind::Semi, "';'");
+        self.finish_node();
     }
 
     /// `c_header ( string_lit ) ;`
@@ -415,6 +427,9 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Ident, "the proc's name");
         self.expect(TokenKind::ColonColon, "'::'");
         self.expect(TokenKind::KwProc, "'proc'");
+        if self.at(TokenKind::LBracket) {
+            self.receiver_clause();
+        }
         self.param_list();
         if self.at(TokenKind::Arrow) {
             self.ret_type();
@@ -424,6 +439,24 @@ impl<'a> Parser<'a> {
         } else {
             self.error_at(self.cur_span(), "expected '{' to begin the proc body");
         }
+        self.finish_node();
+    }
+
+    /// `"[" [ "comptime" ] identifier ":" Type "]"`
+    fn receiver_clause(&mut self) {
+        self.start(SyntaxKind::Receiver);
+        self.expect(TokenKind::LBracket, "'['");
+        if !self.at(TokenKind::RBracket) {
+            self.param();
+        }
+        if self.at(TokenKind::Comma) {
+            let span = self.cur_span();
+            self.error_at(span, "a receiver clause takes exactly one parameter");
+            while !self.at(TokenKind::RBracket) && !self.at_eof() {
+                self.bump();
+            }
+        }
+        self.expect(TokenKind::RBracket, "']'");
         self.finish_node();
     }
 

@@ -2,6 +2,8 @@ printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
 rc_live :: extern "dray_rc_live" proc() -> int64;
 puts :: extern "puts" proc(s: *cchar) -> int32;
 
+import("mod.dray");
+
 say :: proc(text: []uint8) -> void {
     puts(cast(*cchar) text.ptr);
     return;
@@ -18,6 +20,19 @@ sum :: proc(xs: []int32) -> int32 {
 Maybe :: enum(comptime T: type) {
     Some(T),
     None,
+}
+
+Rect :: struct {
+    width: int32,
+    height: int32,
+}
+
+area :: proc[r: Rect]() -> int32 {
+    return r.width * r.height;
+}
+
+scaled :: proc[r: Rect](factor: int32) -> int32 {
+    return r.area() * factor * factor;
 }
 
 Parent :: struct {
@@ -51,10 +66,10 @@ heap_array_demo :: proc() {
 cycle_demo :: proc() -> int32 {
     c := alloc Child{ id: 2 };
     p := alloc Parent{ id: 1, child: c };
-    c.parent = downgrade(p);
+    c.parent = p.downgrade();
 
     printf(cast(*cchar) "allocations while linked: %d\n".ptr, rc_live());
-    switch upgrade(c.parent) {
+    switch c.parent.upgrade() {
     case Maybe.Some(up):
         printf(cast(*cchar) "child can reach parent %d\n".ptr, up.id);
         return 0;
@@ -84,6 +99,14 @@ main :: proc() -> int32 {
 
     lo := 1;
     printf(cast(*cchar) "view[lo:] sum = %d\n".ptr, sum(view[lo:]));
+
+    say("-- methods --");
+    box := Rect{ width: 3, height: 4 };
+    printf(cast(*cchar) "area = %d\n".ptr, box.area());
+    printf(cast(*cchar) "scaled(2) = %d\n".ptr, box.scaled(2));
+
+    say("-- modules --");
+    hello("bichanna");
 
     say("-- heap arrays --");
     printf(cast(*cchar) "live before heap array: %d\n".ptr, rc_live());

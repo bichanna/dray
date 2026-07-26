@@ -1129,15 +1129,15 @@ fn weak_needs_an_rc_pointer() {
 
 #[test]
 fn downgrade_turns_a_strong_reference_into_a_weak_one() {
-    let src = "N :: struct {\n    v: int32,\n}\n\nf :: proc(n: @N) -> Weak(@N) {\n    return downgrade(n);\n}\n";
+    let src = "N :: struct {\n    v: int32,\n}\n\nf :: proc(n: @N) -> Weak(@N) {\n    return n.downgrade();\n}\n";
     assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
 }
 
 #[test]
 fn downgrade_needs_a_strong_reference() {
-    let errs = resolve_errors("f :: proc(n: int32) {\n    w := downgrade(n);\n}\n");
+    let errs = resolve_errors("f :: proc(n: int32) {\n    w := n.downgrade();\n}\n");
     assert!(
-        errs.iter().any(|e| e.contains("`downgrade` takes an `@T`")),
+        errs.iter().any(|e| e.contains("`downgrade` needs a `@T`")),
         "{errs:?}"
     );
 }
@@ -1145,7 +1145,7 @@ fn downgrade_needs_a_strong_reference() {
 #[test]
 fn upgrade_produces_a_maybe_of_the_strong_reference() {
     let src = format!(
-        "{MAYBE}N :: struct {{\n    v: int32,\n}}\n\nf :: proc(w: Weak(@N)) {{\n    m := upgrade(w);\n}}\n"
+        "{MAYBE}N :: struct {{\n    v: int32,\n}}\n\nf :: proc(w: Weak(@N)) {{\n    m := w.upgrade();\n}}\n"
     );
     assert!(
         resolve_errors(&src).is_empty(),
@@ -1169,12 +1169,12 @@ fn upgrade_produces_a_maybe_of_the_strong_reference() {
 #[test]
 fn upgrade_needs_a_weak_reference() {
     let src = format!(
-        "{MAYBE}N :: struct {{\n    v: int32,\n}}\n\nf :: proc(n: @N) {{\n    m := upgrade(n);\n}}\n"
+        "{MAYBE}N :: struct {{\n    v: int32,\n}}\n\nf :: proc(n: @N) {{\n    m := n.upgrade();\n}}\n"
     );
     let errs = resolve_errors(&src);
     assert!(
         errs.iter()
-            .any(|e| e.contains("`upgrade` takes a `Weak(@T)`")),
+            .any(|e| e.contains("`upgrade` needs a `Weak(@T)`")),
         "{errs:?}"
     );
 }
@@ -1182,7 +1182,7 @@ fn upgrade_needs_a_weak_reference() {
 #[test]
 fn upgrade_says_so_when_maybe_is_not_declared() {
     let src =
-        "N :: struct {\n    v: int32,\n}\n\nf :: proc(w: Weak(@N)) {\n    m := upgrade(w);\n}\n";
+        "N :: struct {\n    v: int32,\n}\n\nf :: proc(w: Weak(@N)) {\n    m := w.upgrade();\n}\n";
     let errs = resolve_errors(src);
     assert!(
         errs.iter()
@@ -1271,4 +1271,155 @@ fn a_weak_reference_is_fine_in_an_ordinary_proc() {
     let src =
         "N :: struct {\n    v: int32,\n}\n\nf :: proc(w: Weak(@N)) -> int32 {\n    return 0;\n}\n";
     assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn a_method_call_resolves_to_its_receiver_type() {
+    let src = "Circle :: struct {\n    radius: int32,\n}\n\narea :: proc[c: Circle]() -> int32 {\n    return c.radius * c.radius;\n}\n\nf :: proc() -> int32 {\n    sq := Circle{ radius: 3 };\n    return sq.area();\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn two_types_can_share_a_method_name() {
+    let src = "Circle :: struct {\n    r: int32,\n}\n\nSquare :: struct {\n    s: int32,\n}\n\narea :: proc[c: Circle]() -> int32 {\n    return c.r * c.r;\n}\n\narea :: proc[sq: Square]() -> int32 {\n    return sq.s * sq.s;\n}\n\nf :: proc() -> int32 {\n    c := Circle{ r: 3 };\n    s := Square{ s: 4 };\n    return c.area() + s.area();\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn calling_a_method_that_does_not_exist_is_an_error() {
+    let errs = resolve_errors(
+        "Circle :: struct {\n    r: int32,\n}\n\nf :: proc() -> int32 {\n    c := Circle{ r: 3 };\n    return c.bogus();\n}\n",
+    );
+    assert!(
+        errs.iter().any(|e| e.contains("has no method `bogus`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_pointer_does_not_satisfy_a_value_receiver() {
+    let errs = resolve_errors(
+        "Circle :: struct {\n    r: int32,\n}\n\narea :: proc[c: Circle]() -> int32 {\n    return c.r;\n}\n\nf :: proc() -> int32 {\n    c := alloc Circle{ r: 3 };\n    return c.area();\n}\n",
+    );
+    assert!(
+        errs.iter().any(|e| e.contains("has no method `area`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_method_can_take_a_pointer_receiver() {
+    let src = "Box :: struct {\n    value: int32,\n}\n\nget :: proc[b: @Box]() -> int32 {\n    return b.value;\n}\n\nf :: proc() -> int32 {\n    boxed := alloc Box{ value: 42 };\n    return boxed.get();\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn a_method_on_a_builtin_receiver_is_allowed() {
+    let src = "double :: proc[n: int32]() -> int32 {\n    return n * 2;\n}\n\nf :: proc() -> int32 {\n    x := 5;\n    return x.double();\n}\n";
+    assert!(resolve_errors(src).is_empty(), "{:?}", resolve_errors(src));
+}
+
+#[test]
+fn a_method_on_an_undeclared_type_violates_the_orphan_rule() {
+    let errs = resolve_errors("area :: proc[c: Circle]() -> int32 {\n    return 0;\n}\n");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("orphan rule") || e.contains("cannot declare a method")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_receiver_clause_takes_one_parameter() {
+    let p = dray_syntax::parse("area :: proc[a: int32, b: int32]() -> int32 {\n    return 0;\n}\n");
+    assert!(
+        p.errors.iter().any(|e| e.message.contains("one parameter")),
+        "{:?}",
+        p.errors
+    );
+}
+
+// ── downgrade / upgrade as methods ───────────────────────────────────────────
+
+#[test]
+fn downgrade_and_upgrade_are_methods_now() {
+    let src = format!(
+        "{MAYBE}N :: struct {{\n    v: int32,\n}}\n\nf :: proc(n: @N) -> int32 {{\n    w := n.downgrade();\n    switch w.upgrade() {{ case Maybe.Some(up): return up.v; case Maybe.None: return 0; }}\n}}\n"
+    );
+    assert!(
+        resolve_errors(&src).is_empty(),
+        "{:?}",
+        resolve_errors(&src)
+    );
+}
+
+#[test]
+fn the_old_free_function_downgrade_redirects_to_the_method() {
+    let errs = resolve_errors(
+        "N :: struct {\n    v: int32,\n}\n\nf :: proc(n: @N) {\n    w := downgrade(n);\n}\n",
+    );
+    assert!(
+        errs.iter().any(|e| e.contains("is a method; write")),
+        "{errs:?}"
+    );
+}
+
+fn lower_two(a: &str, b: &str) -> Vec<String> {
+    let pa = parse(a);
+    let pb = parse(b);
+    assert!(
+        pa.errors.is_empty() && pb.errors.is_empty(),
+        "parse: {:?} {:?}",
+        pa.errors,
+        pb.errors
+    );
+    dray_hir::lower_files(&[&pa.root, &pb.root])
+        .1
+        .into_iter()
+        .map(|e| e.message)
+        .collect()
+}
+
+#[test]
+fn a_pub_symbol_is_visible_across_files() {
+    let lib = "pub helper :: proc() -> int32 {\n    return 42;\n}\n";
+    let main = "main :: proc() -> int32 {\n    return helper();\n}\n";
+    assert!(
+        lower_two(main, lib).is_empty(),
+        "{:?}",
+        lower_two(main, lib)
+    );
+}
+
+#[test]
+fn a_private_symbol_is_not_visible_across_files() {
+    let lib = "secret :: proc() -> int32 {\n    return 42;\n}\n";
+    let main = "main :: proc() -> int32 {\n    return secret();\n}\n";
+    let errs = lower_two(main, lib);
+    assert!(
+        errs.iter().any(|e| e.contains("cannot find `secret`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_private_symbol_is_still_visible_within_its_own_file() {
+    let lib = "helper :: proc() -> int32 {\n    return 42;\n}\n\npub entry :: proc() -> int32 {\n    return helper();\n}\n";
+    let main = "main :: proc() -> int32 {\n    return entry();\n}\n";
+    assert!(
+        lower_two(main, lib).is_empty(),
+        "{:?}",
+        lower_two(main, lib)
+    );
+}
+
+#[test]
+fn a_pub_type_and_its_methods_cross_files() {
+    let lib = "pub Point :: struct {\n    x: int32,\n}\n\npub get_x :: proc[p: Point]() -> int32 {\n    return p.x;\n}\n";
+    let main = "main :: proc() -> int32 {\n    p := Point{ x: 7 };\n    return p.get_x();\n}\n";
+    assert!(
+        lower_two(main, lib).is_empty(),
+        "{:?}",
+        lower_two(main, lib)
+    );
 }

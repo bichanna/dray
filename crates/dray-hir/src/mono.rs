@@ -170,6 +170,11 @@ impl Mono {
         let concrete = Proc {
             def: template.def,
             name: mangled.clone(),
+            receiver: template.receiver.as_ref().map(|r| Param {
+                def: r.def,
+                name: r.name.clone(),
+                ty: subst_ty(&r.ty, &subst),
+            }),
             type_params: Vec::new(),
             params: template
                 .params

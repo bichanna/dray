@@ -21,3 +21,23 @@ pub use debug::{
 pub use lexer::{Lexer, tokenize};
 pub use parser::{Parse, ParseError, parse};
 pub use token::{LexError, Span, Token, TokenKind};
+
+/// The string paths of every top-level `import(...)` in a parsed file, in order.
+/// Used by the driver to resolve modules before lowering
+pub fn import_paths(root: &SyntaxNode) -> Vec<String> {
+    root.children()
+        .into_iter()
+        .filter(|d| d.kind() == SyntaxKind::ImportDecl)
+        .filter_map(|d| {
+            d.token_of_kind(SyntaxKind::StringLit)
+                .map(|t| unquote_str(t.text()))
+        })
+        .collect()
+}
+
+fn unquote_str(s: &str) -> String {
+    s.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(s)
+        .to_string()
+}

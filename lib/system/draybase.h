@@ -1,8 +1,9 @@
 /* draybase.h - the hand-written half of the Dray runtime.
  *
- * Everything the generated C needs that is not worth generating: the numeric
- * typedefs, the reference-counting header, and the handful of macros whose
- * spelling differs between compilers.
+ * The base: the numeric typedefs, the compiler macros, and the small runtime
+ * helpers (bounds checks, the unreachable marker). The reference-counting
+ * runtime lives in its companion drayrc.h, which this file includes, so
+ * generated code that includes draybase.h sees everything.
  *
  * Generated code never writes `int32_t` or `bool` directly. It writes `DrayI32`
  * and `DrayBool`, and this file decides what those mean. That indirection is
@@ -78,45 +79,10 @@ typedef bool DrayBool;
  *  Reference counting                                              *
  * ---------------------------------------------------------------- */
 
-typedef void (*DrayDropFn)(void *);
-
-typedef struct {
-  DrayU32 strong;
-  DrayU32 weak;
-  /* Element count. 1 for a scalar `@T`; the length for a `@[]T`, whose drop
-   * function needs it to walk the payload. The type `@[]T` erases from, so the
-   * count cannot come from anywhere else. */
-  DraySize count;
-  DrayDropFn drop;
-} DrayRcHeader;
-
-/* The header sits immediately before the payload, so a `@T` value is an
- * ordinary `T *` as far as C is concerned. */
-extern DrayI64 dray_rc_live_count;
-
-void *dray_rc_alloc(DraySize payload, DrayDropFn drop);
-
-/* Allocates `count` elements of `stride` bytes each, zeroed, and records the
- * count in the header. `drop` runs once for the whole payload, not per element:
- * an array drop function loops using `dray_rc_count`. */
-void *dray_rc_alloc_array(DraySize count, DraySize stride, DrayDropFn drop);
-
-/* The element count recorded at allocationfor an array drop function. */
-DraySize dray_rc_count(void *p);
-void dray_rc_retain(void *p);
-void dray_rc_release(void *p);
-DrayI64 dray_rc_live(void);
-
-/* Weak references. A weak reference does not keep the payload alive. it keeps
- * the *header* alive, so that an upgrade can ask whether the payload is still
- * there. That is the two-phase free: the payload dies when the last strong
- * reference goes, the header when the last weak one does. */
-void *dray_rc_downgrade(void *p);
-void dray_rc_weak_release(void *p);
-
-/* NULL when the payload is gone. On success the strong count is incremented,
- * so the caller receives an owning reference like any other. */
-void *dray_rc_upgrade(void *p);
+/* The reference-counting runtime is its own file, kept separate so the base
+ * above stays small. It needs the typedefs declared here, so it is included
+ * after them, not before. */
+#include "drayrc.h"
 
 /* Both print to stderr and abort. They are the only way a Dray program stops
  * on a bad index, so they say which index and which length, not just that

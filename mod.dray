@@ -1,0 +1,5 @@
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+
+pub hello :: proc(text: []uint8) {
+  printf(cast(*cchar) "Hello, %s!\n".ptr, text);
+}
