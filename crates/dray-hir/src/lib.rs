@@ -11,5 +11,7 @@ mod types;
 pub use debug::dump_hir;
 pub use dray_syntax::Span;
 pub use hir::*;
-pub use lower::{ResolveError, lower, lower_files};
+pub use lower::{
+    FileImports, ModuleGraph, ResolveError, lower, lower_files, lower_files_with_graph,
+};
 pub use mono::{MonoError, monomorphize};

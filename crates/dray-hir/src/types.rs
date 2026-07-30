@@ -51,6 +51,25 @@ pub(crate) fn lower_type(node: &SyntaxNode) -> Option<Ty> {
             let len = array_length(node)?;
             Some(Ty::Array(Box::new(lower_type(&elem)?), len))
         }
+        SyntaxKind::QualifiedType => {
+            let idents: Vec<String> = node.tokens_of_kind(SyntaxKind::Ident);
+            let name = idents.get(1).or_else(|| idents.first())?.clone();
+            let args: Vec<Ty> = node
+                .child_of_kind(SyntaxKind::TypeArgList)
+                .map(|al| {
+                    al.children()
+                        .into_iter()
+                        .filter(|c| is_type(c.kind()))
+                        .filter_map(|t| lower_type(&t))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if args.is_empty() {
+                Some(name_to_ty(&name))
+            } else {
+                Some(Ty::App(name, args))
+            }
+        }
         _ => None,
     }
 }
@@ -74,6 +93,7 @@ pub(crate) fn is_type(kind: SyntaxKind) -> bool {
             | SyntaxKind::SliceType
             | SyntaxKind::ArrayType
             | SyntaxKind::GenericType
+            | SyntaxKind::QualifiedType
     )
 }
 

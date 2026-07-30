@@ -82,6 +82,7 @@ pub struct Proc {
     pub params: Vec<Param>,
     pub ret: Ty,
     pub body: Vec<Stmt>,
+    pub file: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +294,7 @@ impl Lowerer {
                         .collect(),
                     ret: p.ret.clone(),
                     body,
+                    file: p.file,
                 }))
             }
         }

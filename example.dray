@@ -2,7 +2,7 @@ printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
 rc_live :: extern "dray_rc_live" proc() -> int64;
 puts :: extern "puts" proc(s: *cchar) -> int32;
 
-import("mod.dray");
+mod :: import("mod") for hello;
 
 say :: proc(text: []uint8) -> void {
     puts(cast(*cchar) text.ptr);

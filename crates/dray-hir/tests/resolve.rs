@@ -1364,16 +1364,37 @@ fn the_old_free_function_downgrade_redirects_to_the_method() {
     );
 }
 
-fn lower_two(a: &str, b: &str) -> Vec<String> {
-    let pa = parse(a);
-    let pb = parse(b);
+/// Lower `main` (file 0) and `lib` (file 1) with `main` glob-importing `lib`,
+/// the way `main :: import("lib")`-style resolution would after the driver
+/// builds the graph.
+fn lower_two(main: &str, lib: &str) -> Vec<String> {
+    lower_two_graph(main, lib, true, None)
+}
+
+/// As `lower_two`, but choose whether file 0 glob-imports file 1, and optionally
+/// give file 0 a selective import of specific names from file 1.
+fn lower_two_graph(main: &str, lib: &str, glob: bool, only: Option<&[&str]>) -> Vec<String> {
+    let pa = parse(main);
+    let pb = parse(lib);
     assert!(
         pa.errors.is_empty() && pb.errors.is_empty(),
         "parse: {:?} {:?}",
         pa.errors,
         pb.errors
     );
-    dray_hir::lower_files(&[&pa.root, &pb.root])
+    let mut f0 = dray_hir::FileImports::default();
+    if glob {
+        f0.globs.push(1);
+    }
+    if let Some(names) = only {
+        for n in names {
+            f0.selective.push((n.to_string(), 1));
+        }
+    }
+    let graph = dray_hir::ModuleGraph {
+        files: vec![f0, dray_hir::FileImports::default()],
+    };
+    dray_hir::lower_files_with_graph(&[&pa.root, &pb.root], &graph)
         .1
         .into_iter()
         .map(|e| e.message)
@@ -1421,5 +1442,150 @@ fn a_pub_type_and_its_methods_cross_files() {
         lower_two(main, lib).is_empty(),
         "{:?}",
         lower_two(main, lib)
+    );
+}
+
+fn lower_qualified(main: &str, lib: &str, alias: &str) -> Vec<String> {
+    let pa = parse(main);
+    let pb = parse(lib);
+    assert!(
+        pa.errors.is_empty() && pb.errors.is_empty(),
+        "parse: {:?} {:?}",
+        pa.errors,
+        pb.errors
+    );
+    let mut f0 = dray_hir::FileImports::default();
+    f0.aliases.push((alias.to_string(), 1));
+    let graph = dray_hir::ModuleGraph {
+        files: vec![f0, dray_hir::FileImports::default()],
+    };
+    dray_hir::lower_files_with_graph(&[&pa.root, &pb.root], &graph)
+        .1
+        .into_iter()
+        .map(|e| e.message)
+        .collect()
+}
+
+#[test]
+fn a_qualified_call_resolves_a_pub_proc() {
+    let lib = "pub add :: proc(a: int32, b: int32) -> int32 {\n    return a + b;\n}\n";
+    let main = "main :: proc() -> int32 {\n    return math.add(2, 3);\n}\n";
+    assert!(
+        lower_qualified(main, lib, "math").is_empty(),
+        "{:?}",
+        lower_qualified(main, lib, "math")
+    );
+}
+
+#[test]
+fn a_qualified_call_to_a_private_proc_is_an_error() {
+    let lib = "secret :: proc() -> int32 {\n    return 9;\n}\n";
+    let main = "main :: proc() -> int32 {\n    return math.secret();\n}\n";
+    let errs = lower_qualified(main, lib, "math");
+    assert!(errs.iter().any(|e| e.contains("not `pub`")), "{errs:?}");
+}
+
+#[test]
+fn a_qualified_call_to_a_missing_name_is_an_error() {
+    let lib = "pub add :: proc(a: int32, b: int32) -> int32 {\n    return a + b;\n}\n";
+    let main = "main :: proc() -> int32 {\n    return math.nope();\n}\n";
+    let errs = lower_qualified(main, lib, "math");
+    assert!(
+        errs.iter().any(|e| e.contains("no `pub` `nope`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_selective_import_binds_only_named_symbols() {
+    let lib = "pub wanted :: proc() -> int32 {\n    return 1;\n}\n\npub unwanted :: proc() -> int32 {\n    return 2;\n}\n";
+    // `wanted` is imported unqualified; `unwanted` is not.
+    let ok = "main :: proc() -> int32 {\n    return wanted();\n}\n";
+    assert!(
+        lower_two_graph(ok, lib, false, Some(&["wanted"])).is_empty(),
+        "{:?}",
+        lower_two_graph(ok, lib, false, Some(&["wanted"]))
+    );
+    let bad = "main :: proc() -> int32 {\n    return unwanted();\n}\n";
+    let errs = lower_two_graph(bad, lib, false, Some(&["wanted"]));
+    assert!(
+        errs.iter().any(|e| e.contains("cannot find `unwanted`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn an_alias_is_shadowed_by_a_local_of_the_same_name() {
+    // If a local named `math` exists, `math.add` is a field access on it, not a
+    // qualified call — so resolution must not treat `math` as the module alias.
+    let lib = "pub add :: proc(a: int32, b: int32) -> int32 {\n    return a + b;\n}\n";
+    let main = "Box :: struct {\n    add: int32,\n}\n\nmain :: proc() -> int32 {\n    math := Box{ add: 5 };\n    return math.add;\n}\n";
+    assert!(
+        lower_qualified(main, lib, "math").is_empty(),
+        "{:?}",
+        lower_qualified(main, lib, "math")
+    );
+}
+
+// ── type visibility across modules ───────────────────────────────────────────
+
+#[test]
+fn a_type_does_not_leak_across_modules_without_import() {
+    // `lib` declares `Point`; `main` imports nothing from it, so `Point` is not
+    // in scope even though both files are compiled together.
+    let lib = "pub Point :: struct {\n    x: int32,\n}\n";
+    let main = "main :: proc() -> int32 {\n    p := Point{ x: 1 };\n    return p.x;\n}\n";
+    let errs = lower_two_graph(main, lib, false, None);
+    assert!(
+        errs.iter().any(|e| e.contains("another module")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_selectively_imported_type_is_usable() {
+    let lib = "pub Point :: struct {\n    x: int32,\n}\n";
+    let main = "main :: proc() -> int32 {\n    p := Point{ x: 5 };\n    return p.x;\n}\n";
+    // `for Point` brings the type into unqualified scope.
+    assert!(
+        lower_two_graph(main, lib, false, Some(&["Point"])).is_empty(),
+        "{:?}",
+        lower_two_graph(main, lib, false, Some(&["Point"]))
+    );
+}
+
+#[test]
+fn a_non_pub_type_cannot_be_imported() {
+    let lib = "Point :: struct {\n    x: int32,\n}\n";
+    let main = "main :: proc() -> int32 {\n    p := Point{ x: 5 };\n    return p.x;\n}\n";
+    // Even glob-imported, a private type stays hidden.
+    let errs = lower_two_graph(main, lib, true, None);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("not `pub`") || e.contains("another module")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_qualified_type_resolves_through_its_alias() {
+    let lib = "pub Point :: struct {\n    x: int32,\n}\n\npub origin :: proc() -> Point {\n    return Point{ x: 0 };\n}\n";
+    // `shapes.Point` in a signature, with `shapes` aliased to lib.
+    let main = "use :: proc(p: shapes.Point) -> int32 {\n    return p.x;\n}\n\nmain :: proc() -> int32 {\n    return use(shapes.origin());\n}\n";
+    assert!(
+        lower_qualified(main, lib, "shapes").is_empty(),
+        "{:?}",
+        lower_qualified(main, lib, "shapes")
+    );
+}
+
+#[test]
+fn a_qualified_type_with_a_bad_alias_is_an_error() {
+    let lib = "pub Point :: struct {\n    x: int32,\n}\n";
+    let main = "f :: proc(p: nope.Point) -> int32 {\n    return 0;\n}\n\nmain :: proc() -> int32 {\n    return 0;\n}\n";
+    let errs = lower_qualified(main, lib, "shapes");
+    assert!(
+        errs.iter().any(|e| e.contains("not an imported module")),
+        "{errs:?}"
     );
 }

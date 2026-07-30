@@ -61,6 +61,85 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
     Ok(scope.build())
 }
 
+/// Lower an IR program to a shared header scope plus one scope per module.
+pub fn lower_ir_split(ir: &Ir, header_name: &str) -> Result<(Scope, Vec<Scope>)> {
+    let (header_globals, def_globals) = split_globals(ir)?;
+
+    let mut header = ScopeBuilder::new();
+    header = header.global_statement(GlobalStatement::Raw("#pragma once".to_string()));
+    header = header.new_line();
+    header = header.global_statement(GlobalStatement::Include(
+        IncludeBuilder::new_with_str("draybase.h").build(),
+    ));
+
+    for gs in header_globals {
+        header = header.new_line();
+        header = header.global_statement(gs);
+    }
+    for item in &ir.items {
+        if let Item::Include(h) = item {
+            header = header.new_line();
+            header = header.global_statement(GlobalStatement::Include(
+                IncludeBuilder::new_system_with_str(h).build(),
+            ));
+        }
+    }
+
+    let mut seen_externs = std::collections::HashSet::new();
+    for item in &ir.items {
+        match item {
+            Item::ExternProc(e) if !seen_externs.insert(e.symbol.clone()) => {}
+            Item::ExternProc(e) if e.variadic => {
+                header = header.new_line();
+                header = header.global_statement(GlobalStatement::Raw(variadic_extern(e)?));
+            }
+            Item::ExternProc(e) => {
+                header = header.new_line();
+                header = header.global_statement(GlobalStatement::Function(lower_extern(e)?));
+            }
+            Item::Proc(p) => {
+                header = header.new_line();
+                header = header.global_statement(GlobalStatement::Function(proc_prototype(p)?));
+            }
+            Item::Include(_) => {}
+        }
+    }
+
+    let module_count = ir
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Proc(p) => Some(p.file + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(1);
+
+    let mut per_module: Vec<Vec<GlobalStatement>> = vec![Vec::new(); module_count];
+
+    per_module[0].extend(def_globals);
+    for item in &ir.items {
+        if let Item::Proc(p) = item {
+            per_module[p.file].push(GlobalStatement::Function(lower_proc(ir, p)?));
+        }
+    }
+
+    let modules = per_module
+        .into_iter()
+        .map(|fns| {
+            let mut m = ScopeBuilder::new().global_statement(GlobalStatement::Include(
+                IncludeBuilder::new_with_str(header_name).build(),
+            ));
+            for f in fns {
+                m = m.new_line().global_statement(f);
+            }
+            m.build()
+        })
+        .collect();
+
+    Ok((header.build(), modules))
+}
+
 /// `extern <ret> <symbol>(<params>, ...);`
 fn variadic_extern(e: &ExternProc) -> Result<String> {
     let mut params = Vec::with_capacity(e.params.len() + 1);
@@ -792,18 +871,26 @@ fn assign_op(op: AssignOp) -> tamago::AssignOp {
 /// a forward declaration, the definition, drop glue (for structs with `@T`
 /// fields), and a constructor `dray_new_T`. Emitted ahead of the user's functions.
 pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
-    let mut out = Vec::new();
+    let (mut header, defs) = split_globals(ir)?;
+    header.extend(defs);
+    Ok(header)
+}
+
+pub(crate) fn split_globals(ir: &Ir) -> Result<(Vec<GlobalStatement>, Vec<GlobalStatement>)> {
+    let mut head = Vec::new();
+    let mut defs = Vec::new();
 
     for elem in slice_element_types(ir) {
-        out.push(GlobalStatement::Struct(slice_struct(&elem)?));
-        out.extend(slice_helpers(&elem)?);
+        head.push(GlobalStatement::Struct(slice_struct(&elem)?));
+        // slice_helpers are `static inline`, so they are header-safe.
+        head.extend(slice_helpers(&elem)?);
     }
 
     let pointed_to = pointer_referenced_aggregates(ir);
 
     for sd in &ir.structs {
         if pointed_to.contains(sd.name.as_str()) {
-            out.push(GlobalStatement::Struct(
+            head.push(GlobalStatement::Struct(
                 StructBuilder::new_with_str(&sd.name)
                     .forward_declaration()
                     .build(),
@@ -815,9 +902,9 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
         for v in &ed.variants {
             eb = eb.variant(VariantBuilder::new_with_str(&tag_const(&ed.name, &v.name)).build());
         }
-        out.push(GlobalStatement::Enum(eb.build()));
+        head.push(GlobalStatement::Enum(eb.build()));
         if pointed_to.contains(ed.name.as_str()) {
-            out.push(GlobalStatement::Struct(
+            head.push(GlobalStatement::Struct(
                 StructBuilder::new_with_str(&ed.name)
                     .forward_declaration()
                     .build(),
@@ -825,69 +912,69 @@ pub(crate) fn aggregate_globals(ir: &Ir) -> Result<Vec<GlobalStatement>> {
         }
     }
 
-    // 2. Definitions in dependency order: a type embedded *by value* must be fully
-    //    defined before the type embedding it (a forward declaration only suffices
-    //    for a pointer field).
+    // Type definitions in dependency order — header material.
     let structs: HashMap<&str, &dray_ir::StructDef> =
         ir.structs.iter().map(|s| (s.name.as_str(), s)).collect();
     let enums: HashMap<&str, &dray_ir::EnumDef> =
         ir.enums.iter().map(|e| (e.name.as_str(), e)).collect();
     for name in aggregate_definition_order(ir) {
         if let Some(sd) = structs.get(name.as_str()) {
-            out.push(GlobalStatement::Struct(struct_definition(sd)?));
+            head.push(GlobalStatement::Struct(struct_definition(sd)?));
         } else if let Some(ed) = enums.get(name.as_str()) {
-            out.push(GlobalStatement::Struct(enum_definition(ed)?));
+            head.push(GlobalStatement::Struct(enum_definition(ed)?));
         }
     }
 
-    // 3. Prototypes for every generated function, ahead of all definitions.
     for sd in &ir.structs {
         if has_rc_field(ir, sd) {
-            out.push(GlobalStatement::Function(drop_signature(&sd.name).build()));
+            head.push(GlobalStatement::Function(drop_signature(&sd.name).build()));
         }
-        out.push(GlobalStatement::Function(
+        head.push(GlobalStatement::Function(
             constructor_signature(sd)?.build(),
         ));
     }
     for ed in &ir.enums {
         if enum_has_rc_payload(ir, ed) {
-            out.push(GlobalStatement::Function(drop_signature(&ed.name).build()));
+            head.push(GlobalStatement::Function(drop_signature(&ed.name).build()));
         }
         for v in &ed.variants {
-            out.push(GlobalStatement::Function(
+            head.push(GlobalStatement::Function(
                 enum_ctor_signature(ed, v)?.build(),
             ));
         }
     }
-
     for maybe in upgrade_result_types(ir) {
-        out.push(upgrade_helper(&maybe)?);
+        head.push(upgrade_helper(&maybe)?);
     }
 
     for elem in heap_array_elem_types(ir) {
-        out.push(GlobalStatement::Function(array_drop_fn(&elem)?));
+        head.push(GlobalStatement::Function(
+            array_drop_signature(&elem).build(),
+        ));
     }
 
-    // 4. The definitions themselves.
+    for elem in heap_array_elem_types(ir) {
+        defs.push(GlobalStatement::Function(array_drop_fn(&elem)?));
+    }
     for sd in &ir.structs {
         if has_rc_field(ir, sd) {
-            out.push(GlobalStatement::Function(drop_fn(ir, sd)?));
+            defs.push(GlobalStatement::Function(drop_fn(ir, sd)?));
         }
     }
     for ed in &ir.enums {
         if enum_has_rc_payload(ir, ed) {
-            out.push(GlobalStatement::Function(enum_drop_fn(ir, ed)?));
+            defs.push(GlobalStatement::Function(enum_drop_fn(ir, ed)?));
         }
     }
     for sd in &ir.structs {
-        out.push(GlobalStatement::Function(constructor_fn(ir, sd)?));
+        defs.push(GlobalStatement::Function(constructor_fn(ir, sd)?));
     }
     for ed in &ir.enums {
         for v in &ed.variants {
-            out.push(GlobalStatement::Function(enum_ctor(ed, v)?));
+            defs.push(GlobalStatement::Function(enum_ctor(ed, v)?));
         }
     }
-    Ok(out)
+    Ok((head, defs))
 }
 
 /// `struct DraySlice_T { int32_t len; T *ptr; }` the fat pointer behind `[]T`
@@ -1622,6 +1709,10 @@ fn array_drop_fn_name(elem: &Ty) -> String {
 ///     dray_rc_release(elems[i]);
 /// }
 /// ```
+fn array_drop_signature(elem: &Ty) -> FunctionBuilder {
+    drop_signature(&format!("arr_{}", mangle_c_ty(elem)))
+}
+
 fn array_drop_fn(elem: &Ty) -> Result<tamago::Function> {
     let elem_ptr = Type::ptr(lower_ty(elem)?);
     let mut body = BlockBuilder::new();

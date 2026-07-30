@@ -5,7 +5,7 @@
 mod backend;
 pub use backend::{Backend, CcInvocation};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use dray_hir::lower;
@@ -137,18 +137,58 @@ pub fn source_to_c(src: &str) -> Result<String, BuildError> {
 
 struct LoadedModule {
     parsed: dray_syntax::Parse,
+    imports: Vec<(dray_syntax::ImportInfo, usize)>,
 }
 
-fn source_to_c_with_imports(entry_src: &str, entry_path: &Path) -> Result<String, BuildError> {
-    let mut loaded: Vec<LoadedModule> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+fn resolve_import_path(dir: &Path, path: &str) -> Result<PathBuf, BuildError> {
+    let with_ext = if Path::new(path).extension().is_some() {
+        dir.join(path)
+    } else {
+        dir.join(format!("{path}.dray"))
+    };
+    std::fs::canonicalize(&with_ext)
+        .map_err(|e| BuildError::Parse(vec![format!("cannot import \"{path}\": {e}")]))
+}
 
+fn build_module_graph(loaded: &[LoadedModule]) -> dray_hir::ModuleGraph {
+    let files = loaded
+        .iter()
+        .map(|m| {
+            let mut fi = dray_hir::FileImports::default();
+            for (imp, target) in &m.imports {
+                match &imp.only {
+                    // `alias :: import("m")` qualified only
+                    None => {
+                        fi.aliases.push((imp.alias.clone(), *target));
+                    }
+                    // `x :: import("m") for a, b`
+                    Some(names) => {
+                        for n in names {
+                            fi.selective.push((n.clone(), *target));
+                        }
+                    }
+                }
+            }
+            fi
+        })
+        .collect();
+    dray_hir::ModuleGraph { files }
+}
+
+fn source_to_c_with_imports(
+    entry_src: &str,
+    entry_path: &Path,
+) -> Result<(dray_codegen::CModules, Vec<String>), BuildError> {
     let entry_canon =
         std::fs::canonicalize(entry_path).unwrap_or_else(|_| entry_path.to_path_buf());
-    seen.insert(entry_canon.clone());
-    let mut queue: Vec<(String, PathBuf)> = vec![(entry_src.to_string(), entry_canon)];
 
-    while let Some((src, path)) = queue.pop() {
+    let mut index_of: HashMap<PathBuf, usize> = HashMap::new();
+    let mut queue: VecDeque<(String, PathBuf)> = VecDeque::new();
+    index_of.insert(entry_canon.clone(), 0);
+    queue.push_back((entry_src.to_string(), entry_canon.clone()));
+    let mut pending: Vec<Option<LoadedModule>> = vec![None];
+
+    while let Some((src, path)) = queue.pop_front() {
         let parsed = parse(&src);
         if !parsed.errors.is_empty() {
             return Err(BuildError::Parse(
@@ -168,23 +208,47 @@ fn source_to_c_with_imports(entry_src: &str, entry_path: &Path) -> Result<String
             ));
         }
 
+        let my_index = index_of[&path];
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        for rel in dray_syntax::import_paths(&parsed.root) {
-            let target = dir.join(&rel);
-            let canon = std::fs::canonicalize(&target).unwrap_or(target.clone());
-            if !seen.insert(canon.clone()) {
-                continue; // already loaded — this is what stops cycles
-            }
-            let imported_src = std::fs::read_to_string(&canon)
-                .map_err(|e| BuildError::Parse(vec![format!("cannot import \"{rel}\": {e}")]))?;
-            queue.push((imported_src, canon));
+        let mut edges: Vec<(dray_syntax::ImportInfo, usize)> = Vec::new();
+
+        for imp in dray_syntax::imports(&parsed.root) {
+            let canon = resolve_import_path(&dir, &imp.path)?;
+            let target = match index_of.get(&canon) {
+                Some(&i) => i,
+                None => {
+                    let i = pending.len();
+                    index_of.insert(canon.clone(), i);
+                    pending.push(None);
+                    let imported_src = std::fs::read_to_string(&canon).map_err(|e| {
+                        BuildError::Parse(vec![format!("cannot import \"{}\": {e}", imp.path)])
+                    })?;
+                    queue.push_back((imported_src, canon));
+                    i
+                }
+            };
+            edges.push((imp, target));
         }
 
-        loaded.push(LoadedModule { parsed });
+        pending[my_index] = Some(LoadedModule {
+            parsed,
+            imports: edges,
+        });
     }
 
+    let loaded: Vec<LoadedModule> = pending
+        .into_iter()
+        .map(|slot| slot.expect("every module index is filled by the BFS"))
+        .collect();
+
+    let mut index_paths: Vec<PathBuf> = vec![PathBuf::new(); loaded.len()];
+    for (path, &i) in &index_of {
+        index_paths[i] = path.clone();
+    }
+
+    let graph = build_module_graph(&loaded);
     let roots: Vec<&dray_syntax::SyntaxNode> = loaded.iter().map(|m| &m.parsed.root).collect();
-    let (hir, resolve_errors) = dray_hir::lower_files(&roots);
+    let (hir, resolve_errors) = dray_hir::lower_files_with_graph(&roots, &graph);
     if !resolve_errors.is_empty() {
         return Err(BuildError::Resolve(
             resolve_errors
@@ -200,7 +264,25 @@ fn source_to_c_with_imports(entry_src: &str, entry_path: &Path) -> Result<String
         &entry_path.display().to_string(),
         entry_src,
     ));
-    dray_codegen::ir_to_c(&ir).map_err(|e| BuildError::Codegen(e.to_string()))
+
+    let stems: Vec<String> = loaded
+        .iter()
+        .enumerate()
+        .map(|(i, _)| module_stem(&index_paths, i))
+        .collect();
+    let modules = dray_codegen::ir_to_c_modules(&ir, HEADER_NAME)
+        .map_err(|e| BuildError::Codegen(e.to_string()))?;
+    Ok((modules, stems))
+}
+
+const HEADER_NAME: &str = "dray_program.h";
+
+fn module_stem(paths: &[PathBuf], i: usize) -> String {
+    paths
+        .get(i)
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("module{i}"))
 }
 
 pub fn source_to_c_from_file(src: &str, file: &str) -> Result<String, BuildError> {
@@ -261,17 +343,33 @@ pub fn build_file(
 ) -> Result<PathBuf, BuildError> {
     let src = std::fs::read_to_string(src_path)?;
     let abs_src = std::fs::canonicalize(src_path).unwrap_or_else(|_| src_path.to_path_buf());
-    let c_code = source_to_c_with_imports(&src, &abs_src)?;
+    let (cmodules, stems) = source_to_c_with_imports(&src, &abs_src)?;
 
     let dir = build_dir(opts, out_path);
     std::fs::create_dir_all(&dir)?;
 
-    let stem = src_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "main".to_string());
-    let c_path = dir.join(format!("{stem}.c"));
-    std::fs::write(&c_path, &c_code)?;
+    // The shared header, then one `.c` per module named after its source file
+    let header_path = dir.join(HEADER_NAME);
+    std::fs::write(&header_path, &cmodules.header)?;
+
+    let mut c_paths: Vec<PathBuf> = Vec::with_capacity(cmodules.modules.len());
+    let mut used: HashMap<String, usize> = HashMap::new();
+    for (i, source) in cmodules.modules.iter().enumerate() {
+        let stem = stems
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("module{i}"));
+        let n = used.entry(stem.clone()).or_insert(0);
+        let name = if *n == 0 {
+            format!("{stem}.c")
+        } else {
+            format!("{stem}.{n}.c")
+        };
+        *n += 1;
+        let path = dir.join(name);
+        std::fs::write(&path, source)?;
+        c_paths.push(path);
+    }
 
     let lib = system_lib_dir(opts)?;
     let base_h = dir.join("draybase.h");
@@ -292,8 +390,12 @@ pub fn build_file(
         show_warnings: opts.show_c_warnings,
         extra: &opts.cflags,
     };
+
+    let mut sources = c_paths.clone();
+    sources.push(base_c.clone());
+    sources.push(rc_c.clone());
     let status = invocation
-        .command_multi(&[c_path.clone(), base_c.clone(), rc_c.clone()], out_path)
+        .command_multi(&sources, out_path)
         .status()
         .map_err(|e| {
             BuildError::CC(format!(
@@ -304,12 +406,12 @@ pub fn build_file(
 
     if !status.success() {
         return Err(BuildError::CC(format!(
-            "`{}` exited with {}; generated C left at {}",
+            "`{}` exited with {}; generated C left in {}",
             opts.cc,
             status,
-            c_path.display()
+            dir.display()
         )));
     }
 
-    Ok(c_path)
+    Ok(c_paths.into_iter().next().unwrap_or(header_path))
 }

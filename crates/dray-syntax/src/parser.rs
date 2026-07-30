@@ -238,19 +238,36 @@ impl<'a> Parser<'a> {
     fn top_level_decl(&mut self) {
         match self.peek() {
             TokenKind::KwCHeader => self.c_header_decl(),
-            TokenKind::KwImport => self.import_decl(),
             TokenKind::KwPub | TokenKind::Ident => self.named_decl(),
             _ => self.err_and_bump("expected a top-level declaration"),
         }
     }
 
-    /// `import ( string_lit ) ;`
+    /// `[ "pub" ] ident "::" import ( string_lit ) [ "for" ident { "," ident } ] ;`
     fn import_decl(&mut self) {
         self.start(SyntaxKind::ImportDecl);
-        self.bump(); // import
+        self.eat(TokenKind::KwPub);
+        self.expect(TokenKind::Ident, "the module alias name");
+        self.expect(TokenKind::ColonColon, "'::'");
+        self.expect(TokenKind::KwImport, "'import'");
         self.expect(TokenKind::LParen, "'(' after import");
         self.expect(TokenKind::StringLit, "a module path string");
         self.expect(TokenKind::RParen, "')'");
+
+        if self.at(TokenKind::KwFor) {
+            self.start(SyntaxKind::ImportOnly);
+            self.bump(); // for
+            self.expect(TokenKind::Ident, "a name after `for`");
+            while self.at(TokenKind::Comma) {
+                self.bump();
+                if self.at(TokenKind::Semi) {
+                    break;
+                }
+                self.expect(TokenKind::Ident, "a name in the `for` list");
+            }
+            self.finish_node();
+        }
+
         self.expect(TokenKind::Semi, "';'");
         self.finish_node();
     }
@@ -286,6 +303,8 @@ impl<'a> Parser<'a> {
             self.struct_def();
         } else if head_ok && after_head == TokenKind::KwEnum {
             self.enum_def();
+        } else if head_ok && after_head == TokenKind::KwImport {
+            self.import_decl();
         } else {
             self.start(SyntaxKind::Error);
             self.error_at(
@@ -577,7 +596,19 @@ impl<'a> Parser<'a> {
                 }
             }
             TokenKind::Ident => {
-                if self.peek_nth(1) == TokenKind::LParen {
+                // `alias.Name`
+                if self.peek_nth(1) == TokenKind::Dot {
+                    self.start(SyntaxKind::QualifiedType);
+                    self.bump(); // alias
+                    self.bump(); // .
+                    if self.peek_nth(1) == TokenKind::LParen {
+                        self.expect(TokenKind::Ident, "a type name after `.`");
+                        self.type_arg_list();
+                    } else {
+                        self.expect(TokenKind::Ident, "a type name after `.`");
+                    }
+                    self.finish_node();
+                } else if self.peek_nth(1) == TokenKind::LParen {
                     self.start(SyntaxKind::GenericType);
                     self.bump(); // type name
                     self.type_arg_list();

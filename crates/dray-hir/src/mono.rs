@@ -187,6 +187,7 @@ impl Mono {
                 .collect(),
             ret: subst_ty(&template.ret, &subst),
             body: template.body.clone(),
+            file: template.file,
         };
 
         // Substitute the type parameters everywhere in the cloned body.

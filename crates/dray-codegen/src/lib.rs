@@ -6,7 +6,7 @@ use dray_ir::Ir;
 
 mod lower;
 
-pub use lower::lower_ir;
+pub use lower::{lower_ir, lower_ir_split};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodegenError {
@@ -41,4 +41,25 @@ pub fn ir_to_c(ir: &Ir) -> Result<String> {
             ..Default::default()
         },
     ))
+}
+
+#[derive(Debug, Clone)]
+pub struct CModules {
+    pub header: String,
+    pub modules: Vec<String>,
+}
+
+pub fn ir_to_c_modules(ir: &Ir, header_name: &str) -> Result<CModules> {
+    let (header_scope, module_scopes) = lower::lower_ir_split(ir, header_name)?;
+    let opts = || tamago::RenderOptions {
+        line_directives: false,
+        ..Default::default()
+    };
+    Ok(CModules {
+        header: tamago::render(&header_scope, opts()),
+        modules: module_scopes
+            .iter()
+            .map(|s| tamago::render(s, opts()))
+            .collect(),
+    })
 }

@@ -1360,3 +1360,78 @@ fn e2e_a_method_can_call_another_method() {
         assert_eq!(code, 24, "area 12 * 2");
     }
 }
+
+fn c_modules(main: &str, lib: &str) -> dray_codegen::CModules {
+    let pa = parse(main);
+    let pb = parse(lib);
+    assert!(
+        pa.errors.is_empty() && pb.errors.is_empty(),
+        "parse: {:?} {:?}",
+        pa.errors,
+        pb.errors
+    );
+    let mut f0 = dray_hir::FileImports::default();
+    f0.globs.push(1);
+    let graph = dray_hir::ModuleGraph {
+        files: vec![f0, dray_hir::FileImports::default()],
+    };
+    let (hir, errs) = dray_hir::lower_files_with_graph(&[&pa.root, &pb.root], &graph);
+    assert!(errs.is_empty(), "resolve: {errs:?}");
+    let ir = dray_ir::lower(&dray_hir::monomorphize(hir).expect("monomorphize"));
+    dray_codegen::ir_to_c_modules(&ir, "prog.h").expect("codegen")
+}
+
+#[test]
+fn each_module_gets_its_own_source_including_the_header() {
+    let lib = "pub helper :: proc() -> int32 {\n    return 7;\n}\n";
+    let main = "main :: proc() -> int32 {\n    return helper();\n}\n";
+    let cm = c_modules(main, lib);
+    assert_eq!(cm.modules.len(), 2, "one C source per module");
+    for m in &cm.modules {
+        assert!(
+            m.contains("#include \"prog.h\""),
+            "each module includes the header: {m}"
+        );
+    }
+    // main's proc goes in module 0, helper's in module 1.
+    assert!(cm.modules[0].contains("DrayI32 main("), "{}", cm.modules[0]);
+    assert!(
+        cm.modules[1].contains("DrayI32 helper("),
+        "{}",
+        cm.modules[1]
+    );
+}
+
+#[test]
+fn the_header_declares_procs_but_does_not_define_them() {
+    let lib = "pub helper :: proc() -> int32 {\n    return 7;\n}\n";
+    let main = "main :: proc() -> int32 {\n    return helper();\n}\n";
+    let cm = c_modules(main, lib);
+    // A prototype ends in `;`, a definition has a body `{`.
+    assert!(
+        cm.header.contains("DrayI32 helper(void);"),
+        "header has the prototype: {}",
+        cm.header
+    );
+    assert!(
+        !cm.header.contains("DrayI32 helper(void) {"),
+        "header has no definition: {}",
+        cm.header
+    );
+}
+
+#[test]
+fn a_generated_helper_is_defined_in_exactly_one_module() {
+    let lib = "pub Box :: struct {\n    value: int32,\n}\n\npub make :: proc(v: int32) -> Box {\n    return Box{ value: v };\n}\n";
+    let main = "main :: proc() -> int32 {\n    b := make(5);\n    return b.value;\n}\n";
+    let cm = c_modules(main, lib);
+    let defs: usize = cm
+        .modules
+        .iter()
+        .map(|m| m.matches("struct Box *dray_new_Box(").count())
+        .sum();
+    assert_eq!(
+        defs, 1,
+        "the Box constructor is defined once across all modules"
+    );
+}

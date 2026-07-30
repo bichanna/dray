@@ -20,7 +20,38 @@ pub fn lower(root: &SyntaxNode) -> (Hir, Vec<ResolveError>) {
 }
 
 pub fn lower_files(roots: &[&SyntaxNode]) -> (Hir, Vec<ResolveError>) {
+    lower_files_with_graph(roots, &ModuleGraph::flat(roots.len()))
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModuleGraph {
+    pub files: Vec<FileImports>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FileImports {
+    /// `alias -> target file index`, for qualified `alias.name` lookups
+    pub aliases: Vec<(String, usize)>,
+    /// Target files whose entire public surface is in unqualified scope
+    pub globs: Vec<usize>,
+    /// `name -> target file index`, for `for a, b` selective imports
+    pub selective: Vec<(String, usize)>,
+}
+
+impl ModuleGraph {
+    pub fn flat(n: usize) -> ModuleGraph {
+        ModuleGraph {
+            files: vec![FileImports::default(); n],
+        }
+    }
+}
+
+pub fn lower_files_with_graph(
+    roots: &[&SyntaxNode],
+    graph: &ModuleGraph,
+) -> (Hir, Vec<ResolveError>) {
     let mut lw = Lowerer::new();
+    lw.install_graph(graph);
     lw.run_all(roots);
     (
         Hir {
@@ -92,8 +123,27 @@ struct Lowerer {
     /// `pub`. A name from file A resolves to a def from file B only if that def
     /// is `pub`. Indexed by DefId. Non-module defs (params, locals) are absent.
     visibility: HashMap<DefId, Visibility>,
+    /// Module-scope names can be declared in more than one file.
+    module_defs: HashMap<String, Vec<DefId>>,
+    /// One entry per file/module, indexed by file number. Carries the module's
+    /// import table built during pass 0.
+    modules: Vec<ModuleInfo>,
+    /// Which file declares each type (struct or enum), so a type reference can
+    /// be checked against the current file's imports. Types respect module
+    /// boundaries just as procs do.
+    type_file: HashMap<String, usize>,
     /// The file currently being lowered in pass 2, for the visibility check
     current_file: usize,
+}
+
+/// A module is one source file. This records how it reaches other modules: the
+/// qualified aliases it bound with `import`, and which modules' public names it
+/// pulled into its own unqualified scope.
+#[derive(Debug, Default, Clone)]
+struct ModuleInfo {
+    aliases: HashMap<String, usize>,
+    glob_imports: Vec<usize>,
+    selective: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,8 +186,24 @@ impl Lowerer {
             methods: HashMap::new(),
             generic_methods: Vec::new(),
             visibility: HashMap::new(),
+            type_file: HashMap::new(),
+            module_defs: HashMap::new(),
+            modules: Vec::new(),
             current_file: 0,
         }
+    }
+
+    /// Translate the driver-supplied import graph into per-module records.
+    fn install_graph(&mut self, graph: &ModuleGraph) {
+        self.modules = graph
+            .files
+            .iter()
+            .map(|f| ModuleInfo {
+                aliases: f.aliases.iter().cloned().collect(),
+                glob_imports: f.globs.clone(),
+                selective: f.selective.iter().cloned().collect(),
+            })
+            .collect();
     }
 
     fn run_all(&mut self, roots: &[&SyntaxNode]) {
@@ -153,6 +219,10 @@ impl Lowerer {
                 .filter(|d| d.kind() != SyntaxKind::ImportDecl)
                 .collect();
             per_file.push(decls);
+        }
+
+        if self.modules.len() < per_file.len() {
+            self.modules.resize(per_file.len(), ModuleInfo::default());
         }
 
         for (file, decls) in per_file.iter().enumerate() {
@@ -213,6 +283,7 @@ impl Lowerer {
                         self.bind_module_vis(name.clone(), id, decl.span(), is_pub(decl));
                         let tps = comptime_type_params(decl);
                         self.type_arity.insert(name.clone(), tps.len());
+                        self.type_file.insert(name.clone(), self.current_file);
                         self.struct_type_params.insert(name.clone(), tps);
                         self.structs.insert(name, fields);
                     }
@@ -224,6 +295,7 @@ impl Lowerer {
                         self.bind_module_vis(name.clone(), id, decl.span(), is_pub(decl));
                         let tps = comptime_type_params(decl);
                         self.type_arity.insert(name.clone(), tps.len());
+                        self.type_file.insert(name.clone(), self.current_file);
                         self.enum_type_params.insert(name.clone(), tps);
                         self.enums.insert(name, variants);
                     }
@@ -304,7 +376,19 @@ impl Lowerer {
         }
 
         let id = self.add_def(mangled.clone(), DefKind::Proc, ret);
-        self.scopes[0].names.insert(mangled.clone(), id);
+        // The mangled name is internal and unique; make it resolvable from any
+        // file (call sites reference it after method resolution).
+        self.module_defs
+            .entry(mangled.clone())
+            .or_default()
+            .push(id);
+        self.visibility.insert(
+            id,
+            Visibility {
+                file: self.current_file,
+                is_pub: true,
+            },
+        );
         self.proc_arity
             .insert(mangled.clone(), runtime_param_count(decl) + 1);
         if !type_params.is_empty() {
@@ -335,11 +419,18 @@ impl Lowerer {
         id
     }
 
+    /// Bind a module-scope name. Names can repeat across files (every module
+    /// re-declares `printf`)
     fn bind_module_vis(&mut self, name: String, id: DefId, span: Span, is_pub: bool) {
-        if self.scopes[0].names.contains_key(&name) {
+        let clash = self.module_defs.get(&name).is_some_and(|cands| {
+            cands
+                .iter()
+                .any(|&c| self.def_file(c) == Some(self.current_file))
+        });
+        if clash {
             self.err(span, format!("`{name}` is declared more than once"));
         }
-        self.scopes[0].names.insert(name, id);
+        self.module_defs.entry(name).or_default().push(id);
         self.visibility.insert(
             id,
             Visibility {
@@ -347,6 +438,14 @@ impl Lowerer {
                 is_pub,
             },
         );
+    }
+
+    fn resolve_internal(&self, name: &str) -> Option<DefId> {
+        self.module_defs.get(name).and_then(|c| c.first().copied())
+    }
+
+    fn def_file(&self, id: DefId) -> Option<usize> {
+        self.visibility.get(&id).map(|v| v.file)
     }
 
     fn declared_in_current_scope(&self, name: &str) -> bool {
@@ -381,23 +480,50 @@ impl Lowerer {
         self.scopes.pop();
     }
 
-    /// Resolve a name against the scope stack (innermost first, module last).
+    /// Resolve a name against the scope stack (innermost first), then the module
+    /// namespace.
     fn resolve(&self, name: &str) -> Option<DefId> {
-        for (depth, scope) in self.scopes.iter().enumerate().rev() {
+        for scope in self.scopes.iter().skip(1).rev() {
             if let Some(&id) = scope.names.get(name) {
-                // Module scope (depth 0) is shared across all files, so a name
-                // from another file is only visible if it is `pub`.
-                if depth == 0 {
-                    if let Some(vis) = self.visibility.get(&id) {
-                        if vis.file != self.current_file && !vis.is_pub {
-                            continue;
-                        }
-                    }
-                }
                 return Some(id);
             }
         }
-        None
+        self.resolve_module_name(name)
+    }
+
+    /// Look a name up in the module namespace, honouring cross-file visibility:
+    /// a candidate from the current file always wins. Otherwise, it must be both
+    /// `pub` and brought into scope by one of this file's imports
+    fn resolve_module_name(&self, name: &str) -> Option<DefId> {
+        let candidates = self.module_defs.get(name)?;
+        if let Some(&id) = candidates
+            .iter()
+            .find(|&&c| self.def_file(c) == Some(self.current_file))
+        {
+            return Some(id);
+        }
+
+        candidates
+            .iter()
+            .find(|&&c| self.is_imported_unqualified(name, c))
+            .copied()
+    }
+
+    /// Whether a `pub` def from another file is in this file's unqualified scope
+    fn is_imported_unqualified(&self, name: &str, id: DefId) -> bool {
+        let Some(vis) = self.visibility.get(&id) else {
+            return false;
+        };
+        if !vis.is_pub {
+            return false;
+        }
+        let Some(module) = self.modules.get(self.current_file) else {
+            return false;
+        };
+        if module.glob_imports.contains(&vis.file) {
+            return true;
+        }
+        module.selective.get(name) == Some(&vis.file)
     }
 
     fn lower_proc(&mut self, node: &SyntaxNode) {
@@ -448,6 +574,7 @@ impl Lowerer {
             params,
             ret,
             body,
+            file: self.current_file,
         }));
     }
 
@@ -1532,6 +1659,63 @@ impl Lowerer {
         )
     }
 
+    /// Lower `alias.func(args)` a call to a `pub` proc in an imported module.
+    fn lower_qualified_call(
+        &mut self,
+        target_file: usize,
+        name: &str,
+        call_node: &SyntaxNode,
+    ) -> (ExprKind, Ty) {
+        let args = self.call_args(call_node);
+        let Some(def) = self.resolve_qualified(target_file, name) else {
+            // Distinguish "exists but private" from "no such name" for a better
+            // message :)
+            let exists_private = self
+                .module_defs
+                .get(name)
+                .is_some_and(|c| c.iter().any(|&id| self.def_file(id) == Some(target_file)));
+            if exists_private {
+                self.err(
+                    call_node.span(),
+                    format!("`{name}` is not `pub` in the imported module"),
+                );
+            } else {
+                self.err(
+                    call_node.span(),
+                    format!("the imported module has no `pub` `{name}`"),
+                );
+            }
+            return (ExprKind::Unresolved(name.to_string()), Ty::Infer);
+        };
+        if let Some(&arity) = self.proc_arity.get(name) {
+            if !fits_arity(args.len(), arity, self.variadic_procs.contains(name)) {
+                self.err(
+                    call_node.span(),
+                    format!(
+                        "proc `{name}` takes {arity} argument(s), but {} were given",
+                        args.len()
+                    ),
+                );
+            }
+        }
+        let ty = self.defs[def.0 as usize].ty.clone();
+        let callee = Expr {
+            kind: ExprKind::Name {
+                def,
+                name: name.to_string(),
+            },
+            ty: ty.clone(),
+            span: call_node.span(),
+        };
+        (
+            ExprKind::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            ty,
+        )
+    }
+
     fn weak_intrinsic_method(
         &mut self,
         name: &str,
@@ -1600,6 +1784,10 @@ impl Lowerer {
         let name = field_node
             .token_of_kind(SyntaxKind::Ident)
             .map(|t| t.text().to_string())?;
+
+        if let Some(target) = self.alias_target(&recv_node) {
+            return Some(self.lower_qualified_call(target, &name, call_node));
+        }
 
         let recv = self.lower_expr(&recv_node);
 
@@ -1688,7 +1876,7 @@ impl Lowerer {
         all_args.push(recv);
         all_args.extend(args);
 
-        let def = self.resolve(&info.mangled).unwrap_or(DefId(0));
+        let def = self.resolve_internal(&info.mangled).unwrap_or(DefId(0));
         let callee = Expr {
             kind: ExprKind::Name {
                 def,
@@ -1715,6 +1903,37 @@ impl Lowerer {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
+    }
+
+    fn alias_target(&self, node: &SyntaxNode) -> Option<usize> {
+        if node.kind() != SyntaxKind::NameExpr {
+            return None;
+        }
+        let ident = node.token_of_kind(SyntaxKind::Ident)?.text().to_string();
+
+        // a local of the same name shadows a module alias
+        if self.name_is_local(&ident) {
+            return None;
+        }
+        self.modules
+            .get(self.current_file)
+            .and_then(|m| m.aliases.get(&ident).copied())
+    }
+
+    fn resolve_qualified(&self, target_file: usize, name: &str) -> Option<DefId> {
+        let candidates = self.module_defs.get(name)?;
+        candidates.iter().copied().find(|&id| {
+            self.visibility
+                .get(&id)
+                .is_some_and(|v| v.file == target_file && v.is_pub)
+        })
+    }
+
+    fn name_is_local(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .skip(1)
+            .any(|s| s.names.contains_key(name))
     }
 
     fn lower_field(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
@@ -2234,12 +2453,70 @@ impl Lowerer {
         let mut type_nodes = Vec::new();
         collect_type_nodes(node, &mut type_nodes);
         for (tn, at_boundary) in type_nodes {
+            let qualified_ok = self.validate_qualified_type(&tn);
             if let Some(ty) = lower_type(&tn) {
                 let outer = self.in_extern;
                 self.in_extern = outer || at_boundary;
-                self.check_type(&ty, type_params, tn.span());
+                if qualified_ok {
+                    self.check_type_shape_only(&ty, type_params, tn.span());
+                } else {
+                    self.check_type(&ty, type_params, tn.span());
+                }
                 self.in_extern = outer;
             }
+        }
+    }
+
+    /// If `node` is a qualified type `alias.Name`, check the alias resolves to a
+    /// module that exports `Name` as a `pub` type.
+    fn validate_qualified_type(&mut self, node: &SyntaxNode) -> bool {
+        let qnode = find_qualified_type(node);
+        let Some(qnode) = qnode else {
+            return false;
+        };
+        let idents = qnode.tokens_of_kind(SyntaxKind::Ident);
+        let (Some(alias), Some(name)) = (idents.first(), idents.get(1)) else {
+            return true;
+        };
+        match self
+            .modules
+            .get(self.current_file)
+            .and_then(|m| m.aliases.get(alias).copied())
+        {
+            Some(target) => {
+                let visible = self.type_file.get(name).is_some_and(|&f| f == target)
+                    && self.type_is_pub(name, target);
+                if !visible {
+                    self.err(
+                        qnode.span(),
+                        format!("module `{alias}` has no `pub` type `{name}`"),
+                    );
+                }
+            }
+            None => self.err(qnode.span(), format!("`{alias}` is not an imported module")),
+        }
+        true
+    }
+
+    /// whether a named type declared in `file` is `pub`
+    fn type_is_pub(&self, name: &str, file: usize) -> bool {
+        self.module_defs
+            .get(name)
+            .and_then(|c| c.iter().find(|&&id| self.def_file(id) == Some(file)))
+            .and_then(|id| self.visibility.get(id))
+            .is_some_and(|v| v.is_pub)
+    }
+
+    fn check_type_shape_only(&mut self, ty: &Ty, type_params: &[String], span: Span) {
+        match ty {
+            Ty::Named(n) => match self.type_arity.get(n) {
+                Some(0) | None => {}
+                Some(arity) => self.err(
+                    span,
+                    format!("`{n}` is generic; write `{n}(...)` with {arity} type argument(s)"),
+                ),
+            },
+            _ => self.check_type(ty, type_params, span),
         }
     }
 
@@ -2266,6 +2543,38 @@ impl Lowerer {
         self.type_params_in_scope = scoped;
     }
 
+    fn check_type_visible(&mut self, name: &str, span: Span) {
+        let Some(&decl_file) = self.type_file.get(name) else {
+            return;
+        };
+
+        if decl_file == self.current_file {
+            return;
+        }
+
+        let type_def = self
+            .module_defs
+            .get(name)
+            .and_then(|c| c.iter().find(|&&id| self.def_file(id) == Some(decl_file)));
+        let is_pub = type_def
+            .and_then(|id| self.visibility.get(id))
+            .is_some_and(|v| v.is_pub);
+        let imported = self.modules.get(self.current_file).is_some_and(|m| {
+            m.glob_imports.contains(&decl_file) || m.selective.get(name) == Some(&decl_file)
+        });
+        if !is_pub {
+            self.err(
+                span,
+                format!("`{name}` is not `pub`, so it cannot be used from another module"),
+            );
+        } else if !imported {
+            self.err(
+                span,
+                format!("`{name}` is declared in another module; import it to use it here"),
+            );
+        }
+    }
+
     fn check_type(&mut self, ty: &Ty, type_params: &[String], span: Span) {
         match ty {
             Ty::Named(n) => {
@@ -2273,7 +2582,7 @@ impl Lowerer {
                     return;
                 }
                 match self.type_arity.get(n) {
-                    Some(0) => {}
+                    Some(0) => self.check_type_visible(n, span),
                     Some(arity) => self.err(
                         span,
                         format!("`{n}` is generic; write `{n}(...)` with {arity} type argument(s)"),
@@ -3531,6 +3840,14 @@ fn comptime_type_params(node: &SyntaxNode) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn find_qualified_type(node: &SyntaxNode) -> Option<SyntaxNode> {
+    if node.kind() == SyntaxKind::QualifiedType {
+        Some(node.clone())
+    } else {
+        None
+    }
 }
 
 fn collect_type_nodes(node: &SyntaxNode, out: &mut Vec<(SyntaxNode, bool)>) {

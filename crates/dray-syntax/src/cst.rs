@@ -104,8 +104,10 @@ pub enum SyntaxKind {
     ProcDef,
     /// `c_header ( string_lit ) ;`
     CHeaderDecl,
-    /// `import ( string_lit ) ;`
+    /// `[ "pub" ] ident "::" import ( string_lit ) [ ImportOnly ] ";"`
     ImportDecl,
+    /// `"for" ident { "," ident }` selective clause of an import
+    ImportOnly,
     /// `[ "pub" ] identifier "::" "extern" string_lit "proc" "(" ParamList ")"
     /// [ "->" Type ] ";"` — an externally-linked C function (spec §16).
     ExternProcDecl,
@@ -177,6 +179,8 @@ pub enum SyntaxKind {
     NameType,
     /// `TypeName ( ArgumentList )` — e.g. `Stack(int32)`, `Maybe(@Node)`.
     GenericType,
+    /// `alias "." TypeName [ ArgumentList ]` a type from an imported module
+    QualifiedType,
     /// `"(" Type { "," Type } ")"` — type arguments of a generic instantiation.
     TypeArgList,
 
@@ -460,6 +464,16 @@ impl SyntaxNode {
                 SyntaxElement::Token(t) if t.kind() == kind => Some(t),
                 _ => None,
             })
+    }
+
+    pub fn tokens_of_kind(&self, kind: SyntaxKind) -> Vec<String> {
+        self.children_with_tokens()
+            .into_iter()
+            .filter_map(|e| match e {
+                SyntaxElement::Token(t) if t.kind() == kind => Some(t.text().to_string()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Reconstruct the exact source text this node covers — the losslessness
