@@ -213,11 +213,7 @@ impl Lowerer {
                 self.err(root.span(), "expected a SourceFile root");
                 continue;
             }
-            let decls: Vec<SyntaxNode> = root
-                .children()
-                .into_iter()
-                .filter(|d| d.kind() != SyntaxKind::ImportDecl)
-                .collect();
+            let decls: Vec<SyntaxNode> = root.children();
             per_file.push(decls);
         }
 
@@ -300,6 +296,19 @@ impl Lowerer {
                         self.enums.insert(name, variants);
                     }
                 }
+                SyntaxKind::ImportDecl => {
+                    if let Some(alias) = first_ident(decl) {
+                        if let Some(&target) = self
+                            .modules
+                            .get(self.current_file)
+                            .and_then(|m| m.aliases.get(&alias))
+                        {
+                            let id =
+                                self.add_def(alias.clone(), DefKind::Module { target }, Ty::Void);
+                            self.bind_module_vis(alias, id, decl.span(), false);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -323,6 +332,7 @@ impl Lowerer {
                         "source has an Error node; fix parse errors first",
                     );
                 }
+                SyntaxKind::ImportDecl => {}
                 other => {
                     self.err(
                         decl.span(),
@@ -960,6 +970,7 @@ impl Lowerer {
                 }
                 Some(DefKind::Struct) => Some(format!("`{name}` is a struct type")),
                 Some(DefKind::Enum) => Some(format!("`{name}` is an enum type")),
+                Some(DefKind::Module { .. }) => Some(format!("`{name}` is a module")),
             },
             ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Unresolved(_) => None,
             ExprKind::Unary {
@@ -2022,8 +2033,19 @@ impl Lowerer {
         let variant = node.token_of_kind(SyntaxKind::Ident)?.text().to_string();
 
         let (enum_name, type_args) = match recv.kind() {
-            // `Shape.Circle` — a plain enum name.
             SyntaxKind::NameExpr => (ident_text(&recv), Vec::new()),
+            SyntaxKind::FieldExpr => {
+                let base = self.first_expr(&recv)?;
+                let alias_target = self.alias_target(&base)?;
+                let name = recv.token_of_kind(SyntaxKind::Ident)?.text().to_string();
+                // The enum must be declared in the aliased module and be pub.
+                if self.type_file.get(&name) != Some(&alias_target)
+                    || !self.type_is_pub(&name, alias_target)
+                {
+                    return None;
+                }
+                (name, Vec::new())
+            }
             // `Maybe(int32).Some` — a generic instantiation, which parses in
             // expression position as a call of the enum name on its type arguments.
             SyntaxKind::CallExpr => {
@@ -2929,10 +2951,20 @@ impl Lowerer {
                 _ => None,
             })
             .collect();
-        // `Enum . Variant ( b0, b1, ... )` — first two idents are the type + variant.
-        let enum_name = idents.first().cloned().unwrap_or_default();
-        let variant = idents.get(1).cloned().unwrap_or_default();
-        let bindings = idents.iter().skip(2).cloned().collect();
+
+        let is_qualified = idents
+            .first()
+            .and_then(|a| {
+                self.modules
+                    .get(self.current_file)
+                    .and_then(|m| m.aliases.get(a))
+            })
+            .is_some();
+
+        let skip = if is_qualified { 1 } else { 0 };
+        let enum_name = idents.get(skip).cloned().unwrap_or_default();
+        let variant = idents.get(skip + 1).cloned().unwrap_or_default();
+        let bindings = idents.iter().skip(skip + 2).cloned().collect();
         Pattern::Enum {
             enum_name,
             variant,
@@ -3200,8 +3232,22 @@ impl Lowerer {
 
     fn composite_type(&mut self, lit: &SyntaxNode) -> Option<Ty> {
         let head = lit.children().into_iter().find(|c| {
-            is_type(c.kind()) || matches!(c.kind(), SyntaxKind::NameExpr | SyntaxKind::CallExpr)
+            is_type(c.kind())
+                || matches!(
+                    c.kind(),
+                    SyntaxKind::NameExpr | SyntaxKind::CallExpr | SyntaxKind::FieldExpr
+                )
         })?;
+        if head.kind() == SyntaxKind::FieldExpr {
+            let base = self.first_expr(&head)?;
+            let target = self.alias_target(&base)?;
+            let name = head.token_of_kind(SyntaxKind::Ident)?.text().to_string();
+            if self.type_file.get(&name) != Some(&target) || !self.type_is_pub(&name, target) {
+                self.err(head.span(), format!("module has no `pub` type `{name}`"));
+                return None;
+            }
+            return Some(name_to_ty(&name));
+        }
         let ty = if is_type(head.kind()) {
             self.checked_type(&head)?
         } else {

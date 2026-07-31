@@ -1,0 +1,35 @@
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+
+// Aliased import: reach items as `geometry.Name`
+geometry :: import("geometry");
+
+// Renamed alias: the same module under a shorter name.
+c :: import("compass");
+
+// Selective import: bring just `Point` and `area` into unqualified scope.
+tools :: import("geometry") for Point, area;
+
+main :: proc() -> int32 {
+    sq := geometry.make_square(5);
+    a := sq.area();
+
+    p := Point{ x: 2, y: 3 };
+    moved := p.translated(10, 10);
+
+    heading := c.Direction.North;
+    turned := heading.turn_right();
+
+    dir_index := 0;
+    switch turned {
+    case c.Direction.North: dir_index = 0;
+    case c.Direction.East:  dir_index = 1;
+    case c.Direction.South: dir_index = 2;
+    case c.Direction.West:  dir_index = 3;
+    }
+
+    printf(cast(*cchar) "square area      = %d\n".ptr, a);
+    printf(cast(*cchar) "moved point      = (%d, %d)\n".ptr, moved.x, moved.y);
+    printf(cast(*cchar) "turned direction = %d (0=N,1=E,2=S,3=W)\n".ptr, dir_index);
+
+    return a + moved.x + dir_index;
+}

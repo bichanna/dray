@@ -1,0 +1,22 @@
+pub Point :: struct {
+    x: int32,
+    y: int32,
+}
+
+pub Rect :: struct {
+    origin: Point,
+    width: int32,
+    height: int32,
+}
+
+pub area :: proc[r: Rect]() -> int32 {
+    return r.width * r.height;
+}
+
+pub translated :: proc[p: Point](dx: int32, dy: int32) -> Point {
+    return Point{ x: p.x + dx, y: p.y + dy };
+}
+
+pub make_square :: proc(side: int32) -> Rect {
+    return Rect{ origin: Point{ x: 0, y: 0 }, width: side, height: side };
+}

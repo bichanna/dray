@@ -1589,3 +1589,77 @@ fn a_qualified_type_with_a_bad_alias_is_an_error() {
         "{errs:?}"
     );
 }
+
+fn lower_with_imports(main: &str, lib: &str) -> Vec<String> {
+    let pa = parse(main);
+    let pb = parse(lib);
+    assert!(
+        pa.errors.is_empty() && pb.errors.is_empty(),
+        "parse: {:?} {:?}",
+        pa.errors,
+        pb.errors
+    );
+    let mut f0 = dray_hir::FileImports::default();
+    for imp in dray_syntax::imports(&pa.root) {
+        match imp.only {
+            None => f0.aliases.push((imp.alias, 1)),
+            Some(names) => {
+                for n in names {
+                    f0.selective.push((n, 1));
+                }
+            }
+        }
+    }
+    let graph = dray_hir::ModuleGraph {
+        files: vec![f0, dray_hir::FileImports::default()],
+    };
+    dray_hir::lower_files_with_graph(&[&pa.root, &pb.root], &graph)
+        .1
+        .into_iter()
+        .map(|e| e.message)
+        .collect()
+}
+
+#[test]
+fn a_duplicate_import_alias_is_rejected() {
+    let lib = "pub thing :: proc() -> int32 {\n    return 1;\n}\n";
+    let main = "m :: import(\"lib\");\nm :: import(\"lib\");\nmain :: proc() -> int32 {\n    return 0;\n}\n";
+    let errs = lower_with_imports(main, lib);
+    assert!(
+        errs.iter().any(|e| e.contains("declared more than once")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn an_alias_colliding_with_a_proc_name_is_rejected() {
+    let lib = "pub thing :: proc() -> int32 {\n    return 1;\n}\n";
+    let main = "foo :: import(\"lib\");\nfoo :: proc() -> int32 {\n    return 5;\n}\nmain :: proc() -> int32 {\n    return 0;\n}\n";
+    let errs = lower_with_imports(main, lib);
+    assert!(
+        errs.iter().any(|e| e.contains("declared more than once")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_qualified_enum_variant_resolves_through_its_alias() {
+    let lib = "pub Color :: enum { Red, Green, Blue }\n";
+    let main = "c :: import(\"lib\");\nmain :: proc() -> int32 {\n    x := c.Color.Green;\n    switch x {\n    case c.Color.Red: return 0;\n    case c.Color.Green: return 1;\n    case c.Color.Blue: return 2;\n    }\n}\n";
+    assert!(
+        lower_with_imports(main, lib).is_empty(),
+        "{:?}",
+        lower_with_imports(main, lib)
+    );
+}
+
+#[test]
+fn a_qualified_construction_resolves_through_its_alias() {
+    let lib = "pub Point :: struct {\n    x: int32,\n    y: int32,\n}\n";
+    let main = "s :: import(\"lib\");\nmain :: proc() -> int32 {\n    p := s.Point{ x: 3, y: 4 };\n    return p.x;\n}\n";
+    assert!(
+        lower_with_imports(main, lib).is_empty(),
+        "{:?}",
+        lower_with_imports(main, lib)
+    );
+}

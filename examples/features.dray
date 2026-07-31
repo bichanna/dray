@@ -1,0 +1,60 @@
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+rc_live :: extern "dray_rc_live" proc() -> int64;
+
+// A generic option type, instantiated at compile time with `comptime`
+Maybe :: enum(comptime T: type) {
+    Some(T),
+    None,
+}
+
+// Reference-counted parent/child with a weak back-edge to avoid a cycle
+Parent :: struct {
+    id: int32,
+    child: @Child,
+}
+
+Child :: struct {
+    id: int32,
+    parent: Weak(@Parent),
+}
+
+// Sum a heap-allocated array of the first `n` squares
+sum_squares :: proc(n: int32) -> int32 {
+    xs := alloc [n]int32;
+    i := 0;
+    for i < n {
+        xs[i] = i * i;
+        i += 1;
+    }
+    total := 0;
+    for v in xs {
+        total += v;
+    }
+    return total;
+}
+
+main :: proc() -> int32 {
+    // Heap array use
+    squares := sum_squares(6);
+    printf(cast(*cchar) "sum of first 6 squares = %d\n".ptr, squares);
+
+    // RC & weak references: a parent owns a child that points weakly back,
+    // so there is no reference cycle to leak.
+    c := alloc Child{ id: 2 };
+    p := alloc Parent{ id: 42, child: c };
+    c.parent = p.downgrade();
+
+    printf(cast(*cchar) "live allocations while linked = %lld\n".ptr, rc_live());
+
+    // Upgrading a weak reference yields a Maybe: Some if the parent is alive
+    reached := 0;
+    switch c.parent.upgrade() {
+    case Maybe.Some(up):
+        printf(cast(*cchar) "child reached parent %d\n".ptr, up.id);
+        reached = up.id;
+    case Maybe.None:
+        printf(cast(*cchar) "parent already gone\n".ptr);
+    }
+
+    return squares + reached;
+}

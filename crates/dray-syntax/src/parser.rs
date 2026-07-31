@@ -783,15 +783,19 @@ impl<'a> Parser<'a> {
     /// `TypeName "." identifier [ "(" IdentifierList ")" ]`; anything else is an
     /// ordinary expression pattern (value match).
     fn pattern(&mut self) {
-        // Lookahead for `Ident . Ident` — the enum-pattern shape.
         if self.peek() == TokenKind::Ident
             && self.peek_nth(1) == TokenKind::Dot
             && self.peek_nth(2) == TokenKind::Ident
         {
             self.start(SyntaxKind::EnumPattern);
-            self.bump(); // type name
+            self.bump(); // type name (or module alias)
             self.bump(); // '.'
-            self.bump(); // variant name
+            self.bump(); // variant name (or enum name, if qualified)
+            // a qualified pattern has a second `. Ident`
+            if self.peek() == TokenKind::Dot && self.peek_nth(1) == TokenKind::Ident {
+                self.bump(); // '.'
+                self.bump(); // variant name
+            }
             if self.eat(TokenKind::LParen) {
                 while self.at(TokenKind::Ident) {
                     self.bump(); // binding identifier
@@ -1030,7 +1034,10 @@ impl<'a> Parser<'a> {
                     self.bump(); // .
                     self.expect(TokenKind::Ident, "a field or method name");
                     self.finish_node();
-                    type_shaped = false;
+                    // A dotted chain of names stays type-shaped: `alias.Type{...}`
+                    // is a qualified composite literal. Only a following `{`
+                    // resolves the ambiguity with field access, and field access
+                    // is never followed by `{`
                 }
                 TokenKind::LParen => {
                     self.wrap_at(checkpoint, SyntaxKind::CallExpr);

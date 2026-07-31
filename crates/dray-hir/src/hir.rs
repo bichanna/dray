@@ -44,6 +44,8 @@ pub enum DefKind {
     Struct,
     /// An enum type. Used to resolve `Ty::Named` and enum construction/patterns.
     Enum,
+    /// An import alias (`geo :: import("geometry")`).
+    Module { target: usize },
 }
 
 /// A top-level item.

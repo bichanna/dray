@@ -25,6 +25,8 @@ pub struct Ir {
     /// Where this program came from, so codegen can emit `#line` directives
     /// `None` when the source is not a file on disk, like --emit-c.
     pub source: Option<SourceMap>,
+    /// One source map per module (file index), for `#line` directives
+    pub sources: Vec<SourceMap>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +121,7 @@ pub enum Stmt {
     Block(Vec<Stmt>),
     Located {
         offset: u32,
+        file: usize,
         stmt: Box<Stmt>,
     },
     DropValue {
@@ -199,6 +202,7 @@ pub fn lower(hir: &Hir) -> Ir {
         enum_payloads,
         uses_rc: false,
         temp: 0,
+        current_file: 0,
     };
 
     let items = hir.items.iter().filter_map(|it| lw.item(it)).collect();
@@ -226,6 +230,7 @@ pub fn lower(hir: &Hir) -> Ir {
         defs: lw.defs,
         uses_rc,
         source: None,
+        sources: Vec::new(),
     }
 }
 
@@ -236,6 +241,7 @@ struct Lowerer {
     enum_payloads: HashMap<String, Vec<Ty>>,
     uses_rc: bool,
     temp: u32,
+    current_file: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +277,7 @@ impl Lowerer {
                 ret: e.ret.clone(),
             })),
             dray_hir::Item::Proc(p) => {
+                self.current_file = p.file;
                 let mut scopes: Scopes = vec![Vec::new()];
                 let mut body = Vec::new();
                 for s in &p.body {
@@ -470,6 +477,7 @@ impl Lowerer {
             let lowered = std::mem::replace(st, Stmt::Break);
             *st = Stmt::Located {
                 offset: span.start,
+                file: self.current_file,
                 stmt: Box::new(lowered),
             };
         }

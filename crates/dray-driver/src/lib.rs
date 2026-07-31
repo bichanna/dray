@@ -138,6 +138,8 @@ pub fn source_to_c(src: &str) -> Result<String, BuildError> {
 struct LoadedModule {
     parsed: dray_syntax::Parse,
     imports: Vec<(dray_syntax::ImportInfo, usize)>,
+    src: String,
+    path: String,
 }
 
 fn resolve_import_path(dir: &Path, path: &str) -> Result<PathBuf, BuildError> {
@@ -233,6 +235,8 @@ fn source_to_c_with_imports(
         pending[my_index] = Some(LoadedModule {
             parsed,
             imports: edges,
+            src: src.clone(),
+            path: path.display().to_string(),
         });
     }
 
@@ -264,6 +268,10 @@ fn source_to_c_with_imports(
         &entry_path.display().to_string(),
         entry_src,
     ));
+    ir.sources = loaded
+        .iter()
+        .map(|m| dray_ir::SourceMap::new(&m.path, &m.src))
+        .collect();
 
     let stems: Vec<String> = loaded
         .iter()
@@ -336,6 +344,54 @@ fn build_dir(opts: &BuildOptions, out_path: &Path) -> PathBuf {
         .join(name)
 }
 
+/// Write `contents` to `path` only if it differs from what is already there, so
+/// an unchanged file keeps its modification time
+fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<bool> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == contents {
+            return Ok(false);
+        }
+    }
+    std::fs::write(path, contents)?;
+    Ok(true)
+}
+
+/// Copy `from` to `to` only if the destination differs
+fn copy_if_changed(from: &Path, to: &Path) -> std::io::Result<()> {
+    let src = std::fs::read(from)?;
+    if let Ok(dst) = std::fs::read(to) {
+        if dst == src {
+            return Ok(());
+        }
+    }
+    std::fs::write(to, src)?;
+    Ok(())
+}
+
+/// The last modified time of a file, if it exists and the OS reports one
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Whether `source` must be recompiled into `object`: true if the object is
+/// missing, older than the source, or older than the newest shared header
+fn needs_recompile(
+    source: &Path,
+    object: &Path,
+    newest_header: Option<std::time::SystemTime>,
+) -> bool {
+    let (Some(obj_time), Some(src_time)) = (file_mtime(object), file_mtime(source)) else {
+        return true;
+    };
+    if src_time > obj_time {
+        return true;
+    }
+    match newest_header {
+        Some(h) => h > obj_time,
+        None => false,
+    }
+}
+
 pub fn build_file(
     src_path: &Path,
     out_path: &Path,
@@ -348,9 +404,8 @@ pub fn build_file(
     let dir = build_dir(opts, out_path);
     std::fs::create_dir_all(&dir)?;
 
-    // The shared header, then one `.c` per module named after its source file
     let header_path = dir.join(HEADER_NAME);
-    std::fs::write(&header_path, &cmodules.header)?;
+    write_if_changed(&header_path, &cmodules.header)?;
 
     let mut c_paths: Vec<PathBuf> = Vec::with_capacity(cmodules.modules.len());
     let mut used: HashMap<String, usize> = HashMap::new();
@@ -367,7 +422,7 @@ pub fn build_file(
         };
         *n += 1;
         let path = dir.join(name);
-        std::fs::write(&path, source)?;
+        write_if_changed(&path, source)?;
         c_paths.push(path);
     }
 
@@ -377,10 +432,10 @@ pub fn build_file(
     let rc_h = dir.join("drayrc.h");
     let rc_c = dir.join("drayrc.c");
 
-    std::fs::copy(lib.join("draybase.h"), &base_h)?;
-    std::fs::copy(lib.join("draybase.c"), &base_c)?;
-    std::fs::copy(lib.join("drayrc.h"), &rc_h)?;
-    std::fs::copy(lib.join("drayrc.c"), &rc_c)?;
+    copy_if_changed(&lib.join("draybase.h"), &base_h)?;
+    copy_if_changed(&lib.join("draybase.c"), &base_c)?;
+    copy_if_changed(&lib.join("drayrc.h"), &rc_h)?;
+    copy_if_changed(&lib.join("drayrc.c"), &rc_c)?;
 
     let includes = [dir.clone()];
     let invocation = CcInvocation {
@@ -391,11 +446,43 @@ pub fn build_file(
         extra: &opts.cflags,
     };
 
-    let mut sources = c_paths.clone();
-    sources.push(base_c.clone());
-    sources.push(rc_c.clone());
+    let mut all_c = c_paths.clone();
+    all_c.push(base_c.clone());
+    all_c.push(rc_c.clone());
+
+    // The shared header and runtime headers affect every module, so a change to
+    // any of them forces a full recompile
+    let newest_header = [&header_path, &base_h, &rc_h]
+        .iter()
+        .filter_map(|p| file_mtime(p))
+        .max();
+
+    let mut objects: Vec<PathBuf> = Vec::with_capacity(all_c.len());
+    for c in &all_c {
+        let obj = c.with_extension("o");
+        if !needs_recompile(c, &obj, newest_header) {
+            objects.push(obj);
+            continue;
+        }
+        let status = invocation.compile_object(c, &obj).status().map_err(|e| {
+            BuildError::CC(format!(
+                "failed to run `{}` (is a C compiler installed?): {e}",
+                opts.cc
+            ))
+        })?;
+        if !status.success() {
+            return Err(BuildError::CC(format!(
+                "`{}` failed compiling {}; generated C left in {}",
+                opts.cc,
+                c.display(),
+                dir.display()
+            )));
+        }
+        objects.push(obj);
+    }
+
     let status = invocation
-        .command_multi(&sources, out_path)
+        .link_objects(&objects, out_path)
         .status()
         .map_err(|e| {
             BuildError::CC(format!(

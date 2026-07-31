@@ -233,9 +233,14 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
         Stmt::Break => Statement::Break,
         Stmt::Continue => Statement::Continue,
         Stmt::Expr(e) => Statement::Expr(lower_expr(ir, e)?),
-        Stmt::Located { offset, stmt } => {
+        Stmt::Located { offset, file, stmt } => {
             let inner = lower_stmt(ir, stmt)?;
-            return Ok(match ir.source.as_ref().and_then(|m| m.locate(*offset)) {
+            let located = ir
+                .sources
+                .get(*file)
+                .or(ir.source.as_ref())
+                .and_then(|m| m.locate(*offset));
+            return Ok(match located {
                 Some((file, line)) => inner.located(tamago::SourceLoc::new(file, line)),
                 None => inner,
             });

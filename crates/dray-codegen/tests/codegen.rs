@@ -1435,3 +1435,49 @@ fn a_generated_helper_is_defined_in_exactly_one_module() {
         "the Box constructor is defined once across all modules"
     );
 }
+
+#[test]
+fn per_module_line_directives_name_each_modules_own_file() {
+    let pa = parse("main :: proc() -> int32 {\n    return helper();\n}\n");
+    let pb = parse("pub helper :: proc() -> int32 {\n    return 7;\n}\n");
+    assert!(pa.errors.is_empty() && pb.errors.is_empty());
+
+    let mut f0 = dray_hir::FileImports::default();
+    f0.globs.push(1);
+
+    let graph = dray_hir::ModuleGraph {
+        files: vec![f0, dray_hir::FileImports::default()],
+    };
+
+    let (hir, errs) = dray_hir::lower_files_with_graph(&[&pa.root, &pb.root], &graph);
+    assert!(errs.is_empty(), "resolve: {errs:?}");
+    let mut ir = dray_ir::lower(&dray_hir::monomorphize(hir).expect("monomorphize"));
+
+    ir.sources = vec![
+        dray_ir::SourceMap::new(
+            "main.dray",
+            "main :: proc() -> int32 {\n    return helper();\n}\n",
+        ),
+        dray_ir::SourceMap::new(
+            "helper.dray",
+            "pub helper :: proc() -> int32 {\n    return 7;\n}\n",
+        ),
+    ];
+    let cm = dray_codegen::ir_to_c_modules(&ir, "prog.h").expect("codegen");
+
+    assert!(
+        cm.modules[0].contains("\"main.dray\""),
+        "module 0: {}",
+        cm.modules[0]
+    );
+    assert!(
+        cm.modules[1].contains("\"helper.dray\""),
+        "module 1: {}",
+        cm.modules[1]
+    );
+    assert!(
+        !cm.modules[1].contains("\"main.dray\""),
+        "module 1 must not point at entry: {}",
+        cm.modules[1]
+    );
+}

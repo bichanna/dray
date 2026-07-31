@@ -51,8 +51,9 @@ pub struct CModules {
 
 pub fn ir_to_c_modules(ir: &Ir, header_name: &str) -> Result<CModules> {
     let (header_scope, module_scopes) = lower::lower_ir_split(ir, header_name)?;
-    let opts = || tamago::RenderOptions {
-        line_directives: false,
+    let line_directives = !ir.sources.is_empty();
+    let opts = move || tamago::RenderOptions {
+        line_directives,
         ..Default::default()
     };
     Ok(CModules {

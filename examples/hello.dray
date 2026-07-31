@@ -1,0 +1,6 @@
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+
+main :: proc() -> int32 {
+    printf(cast(*cchar) "Hello from Dray!\n".ptr);
+    return 0;
+}

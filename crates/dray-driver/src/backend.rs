@@ -83,6 +83,54 @@ impl CcInvocation<'_> {
         }
         cmd
     }
+
+    pub fn compile_object(&self, source: &Path, object: &Path) -> Command {
+        let mut cmd = Command::new(self.cc);
+        match self.backend {
+            Backend::Gnu => {
+                cmd.arg(C_STANDARD_GNU);
+                for dir in self.include_dirs {
+                    cmd.arg(format!("-I{}", dir.display()));
+                }
+                if !self.show_warnings {
+                    cmd.arg("-w");
+                }
+                cmd.args(self.extra);
+                cmd.arg("-c").arg(source).arg("-o").arg(object);
+            }
+            Backend::Msvc => {
+                cmd.arg(C_STANDARD_MSVC);
+                for dir in self.include_dirs {
+                    cmd.arg(format!("/I{}", dir.display()));
+                }
+                if !self.show_warnings {
+                    cmd.arg("/w");
+                }
+                cmd.args(self.extra);
+                cmd.arg("/c")
+                    .arg(source)
+                    .arg(format!("/Fo:{}", object.display()));
+            }
+        }
+        cmd
+    }
+
+    /// Link already compiled object files into the final executable.
+    pub fn link_objects(&self, objects: &[std::path::PathBuf], output: &Path) -> Command {
+        let mut cmd = Command::new(self.cc);
+        match self.backend {
+            Backend::Gnu => {
+                cmd.args(self.extra);
+                cmd.args(objects).arg("-o").arg(output);
+            }
+            Backend::Msvc => {
+                cmd.args(self.extra);
+                cmd.arg(format!("/Fe:{}", output.display()));
+                cmd.args(objects);
+            }
+        }
+        cmd
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +193,43 @@ mod tests {
         assert_eq!(Backend::detect("/usr/bin/gcc-13"), Backend::Gnu);
         assert_eq!(Backend::detect("cl"), Backend::Msvc);
         assert_eq!(Backend::detect(r"C:\VC\bin\cl.exe"), Backend::Msvc);
+    }
+
+    #[test]
+    fn compiling_an_object_uses_dash_c_and_does_not_link() {
+        let inv = CcInvocation {
+            cc: "cc",
+            include_dirs: &[],
+            backend: Backend::Gnu,
+            show_warnings: false,
+            extra: &[],
+        };
+        let args = args_of(&inv.compile_object(Path::new("mod.c"), Path::new("mod.o")));
+        assert!(args.contains(&"-c".to_string()), "{args:?}");
+        assert!(args.contains(&"mod.o".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn linking_objects_omits_the_c_standard_flag() {
+        let inv = CcInvocation {
+            cc: "cc",
+            include_dirs: &[],
+            backend: Backend::Gnu,
+            show_warnings: false,
+            extra: &[],
+        };
+        let objs = vec![
+            Path::new("a.o").to_path_buf(),
+            Path::new("b.o").to_path_buf(),
+        ];
+        let args = args_of(&inv.link_objects(&objs, Path::new("prog")));
+        // Linking does not compile, so no `-c` and no `-std=`.
+        assert!(!args.contains(&"-c".to_string()), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("-std=")), "{args:?}");
+        assert!(
+            args.contains(&"a.o".to_string()) && args.contains(&"b.o".to_string()),
+            "{args:?}"
+        );
+        assert!(args.contains(&"-o".to_string()), "{args:?}");
     }
 }
