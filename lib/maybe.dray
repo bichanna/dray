@@ -1,0 +1,11 @@
+// maybe.dray
+// A prelude module, implicitly imported into every Dray program.
+//
+// `Maybe` is always in scope, unqualified, without an `import`. Compiler
+// features build on it: `upgrade` and `try_alloc` both produce a `Maybe`.
+
+// An optional value: `Some(x)` or nothing.
+pub Maybe :: enum(comptime T: type) {
+    Some(T),
+    None,
+}

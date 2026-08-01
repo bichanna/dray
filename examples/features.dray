@@ -1,12 +1,6 @@
 printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
 rc_live :: extern "dray_rc_live" proc() -> int64;
 
-// A generic option type, instantiated at compile time with `comptime`
-Maybe :: enum(comptime T: type) {
-    Some(T),
-    None,
-}
-
 // Reference-counted parent/child with a weak back-edge to avoid a cycle
 Parent :: struct {
     id: int32,

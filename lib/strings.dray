@@ -1,0 +1,74 @@
+// strings.dray
+// The owned mutable string type. Import explicitly:
+//   s :: import("strings")
+
+String :: struct {
+    data: @[]uint8,
+    length: int32,
+}
+
+// Copy bytes (typically a literal view) into a fresh owned String.
+pub from :: proc(bytes: []uint8) -> String {
+    n := bytes.len;
+    buf := alloc [n]uint8;
+    i := 0;
+    for i < n {
+        buf[i] = bytes[i];
+        i += 1;
+    }
+    return String{ data: buf, length: n };
+}
+
+pub len :: proc[s: String]() -> int32 {
+    return s.length;
+}
+
+// The byte at `i`, bounds-checked by the underlying heap-array indexing.
+pub at :: proc[s: String](i: int32) -> uint8 {
+    return s.data[i];
+}
+
+// A fresh String holding this string's bytes followed by `other`'s.
+pub concat :: proc[s: String](other: String) -> String {
+    total := s.length + other.length;
+    buf := alloc [total]uint8;
+    i := 0;
+    for i < s.length {
+        buf[i] = s.data[i];
+        i += 1;
+    }
+    j := 0;
+    for j < other.length {
+        buf[s.length + j] = other.data[j];
+        j += 1;
+    }
+    return String{ data: buf, length: total };
+}
+
+// Byte-wise equality.
+pub equals :: proc[s: String](other: String) -> bool {
+    if s.length != other.length {
+        return false;
+    }
+    i := 0;
+    for i < s.length {
+        if s.data[i] != other.data[i] {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// A NUL-terminated heap copy, for C APIs that expect `char *`. Pass its `.ptr`.
+// This is the safe boundary: a String is not NUL-terminated on its own.
+pub to_c_str :: proc[s: String]() -> @[]uint8 {
+    buf := alloc [s.length + 1]uint8;
+    i := 0;
+    for i < s.length {
+        buf[i] = s.data[i];
+        i += 1;
+    }
+    buf[s.length] = 0;
+    return buf;
+}

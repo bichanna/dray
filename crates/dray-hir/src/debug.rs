@@ -101,7 +101,7 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
         Stmt::Expr(e) => {
             let _ = writeln!(out, "{pad}{}", expr(e));
         }
-        Stmt::Block(body) => {
+        Stmt::Block(body) | Stmt::ScopedBlock(body) => {
             let _ = writeln!(out, "{pad}{{");
             for st in body {
                 dump_stmt(st, depth + 1, out);

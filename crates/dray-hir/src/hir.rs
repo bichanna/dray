@@ -143,6 +143,7 @@ pub enum Stmt {
     Continue,
     Expr(Expr),
     Block(Vec<Stmt>),
+    ScopedBlock(Vec<Stmt>),
     StaticAssert {
         cond: Expr,
         message: String,
@@ -397,7 +398,7 @@ impl Stmt {
             Stmt::If { cond, .. } | Stmt::While { cond, .. } => Some(cond.span),
             Stmt::Switch { scrutinee, .. } => Some(scrutinee.span),
             Stmt::CFor { cond, .. } => cond.as_ref().map(|c| c.span),
-            Stmt::Block(body) => body.first().and_then(Stmt::span),
+            Stmt::Block(body) | Stmt::ScopedBlock(body) => body.first().and_then(Stmt::span),
             Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Loop { .. } => None,
         }
     }

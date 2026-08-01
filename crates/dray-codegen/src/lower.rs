@@ -25,6 +25,11 @@ pub fn lower_ir(ir: &Ir) -> Result<Scope> {
         IncludeBuilder::new_with_str("draybase.h").build(),
     ));
 
+    for gs in string_literal_globals(ir) {
+        scope = scope.new_line();
+        scope = scope.global_statement(gs);
+    }
+
     for gs in aggregate_globals(ir)? {
         scope = scope.new_line();
         scope = scope.global_statement(gs);
@@ -73,6 +78,10 @@ pub fn lower_ir_split(ir: &Ir, header_name: &str) -> Result<(Scope, Vec<Scope>)>
     ));
 
     for gs in header_globals {
+        header = header.new_line();
+        header = header.global_statement(gs);
+    }
+    for gs in string_literal_globals(ir) {
         header = header.new_line();
         header = header.global_statement(gs);
     }
@@ -192,7 +201,7 @@ fn ends_in_return(stmts: &[Stmt]) -> bool {
     match stmts.last() {
         Some(Stmt::Located { stmt, .. }) => ends_in_return(std::slice::from_ref(stmt)),
         Some(Stmt::Return(_)) => true,
-        Some(Stmt::Block(inner)) => ends_in_return(inner),
+        Some(Stmt::Block(inner)) | Some(Stmt::ScopedBlock(inner)) => ends_in_return(inner),
         _ => false,
     }
 }
@@ -208,6 +217,14 @@ fn lower_body(ir: &Ir, stmts: &[Stmt]) -> Result<Block> {
             for st in inner {
                 b = b.statement(lower_stmt(ir, st)?);
             }
+            continue;
+        }
+        if let Stmt::ScopedBlock(inner) = unwrapped {
+            b = b.statement(tamago::Statement::Raw("{".to_string()));
+            for st in inner {
+                b = b.statement(lower_stmt(ir, st)?);
+            }
+            b = b.statement(tamago::Statement::Raw("}".to_string()));
             continue;
         }
         b = b.statement(lower_stmt(ir, s)?);
@@ -245,7 +262,7 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
                 None => inner,
             });
         }
-        Stmt::Block(_) => {
+        Stmt::Block(_) | Stmt::ScopedBlock(_) => {
             return Err(CodegenError::new(
                 "internal: a block statement reached codegen unflattened".to_string(),
             ));
@@ -330,7 +347,7 @@ fn stmt_uses_name(s: &Stmt, name: &str) -> bool {
         }
         Stmt::Return(Some(e)) | Stmt::Expr(e) => expr_uses_name(e, name),
         Stmt::StaticAssert { cond, .. } => expr_uses_name(cond, name),
-        Stmt::Block(body) => block_uses_name(body, name),
+        Stmt::Block(body) | Stmt::ScopedBlock(body) => block_uses_name(body, name),
         Stmt::Located { stmt, .. } => stmt_uses_name(stmt, name),
         Stmt::DropValue { name: n, .. } => n == name,
         Stmt::Retain(n)
@@ -551,13 +568,24 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
                 bits: dray_hir::IntWidth::W8,
                 signed: false,
             };
+            let idx = string_literals(ir)
+                .iter()
+                .position(|s| s == text)
+                .ok_or_else(|| {
+                    CodegenError::new(
+                        "internal: string literal missing from collection".to_string(),
+                    )
+                })?;
             T::new_compound_literal(
                 Type::base(BaseType::Struct(slice_struct_name(&elem))),
                 T::new_init_struct_designated(
                     vec!["len".to_string(), "ptr".to_string()],
                     vec![
                         T::Int(byte_len),
-                        T::new_cast(Type::ptr(lower_ty(&elem)?), T::Str(text.clone())),
+                        T::new_cast(
+                            Type::ptr(lower_ty(&elem)?),
+                            T::new_ident(string_literal_symbol(idx)),
+                        ),
                     ],
                 ),
             )
@@ -1029,6 +1057,42 @@ fn slice_struct(elem: &Ty) -> Result<tamago::Struct> {
         .build())
 }
 
+fn string_literals(ir: &Ir) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for item in &ir.items {
+        if let Item::Proc(p) = item {
+            walk_stmt_exprs(&p.body, &mut |e| {
+                if let ExprKind::Str(text) = &e.kind
+                    && !seen.contains(text)
+                {
+                    seen.push(text.clone());
+                }
+            });
+        }
+    }
+    seen
+}
+
+fn string_literal_symbol(i: usize) -> String {
+    format!("dray_str_{i}")
+}
+
+fn string_literal_globals(ir: &Ir) -> Vec<GlobalStatement> {
+    string_literals(ir)
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let mut listed: Vec<String> = text.as_bytes().iter().map(|b| b.to_string()).collect();
+            listed.push("0".to_string());
+            GlobalStatement::Raw(format!(
+                "DRAY_UNUSED static const DrayU8 {}[] = {{ {} }};",
+                string_literal_symbol(i),
+                listed.join(", ")
+            ))
+        })
+        .collect()
+}
+
 fn slice_element_types(ir: &Ir) -> Vec<Ty> {
     // Every string literal is a `[]uint8`, and a literal can appear anywhere an
     // expression can, so that one is always available rather than discovered.
@@ -1078,7 +1142,7 @@ fn walk_stmt_types(stmts: &[Stmt], note: &mut impl FnMut(&Ty)) {
         };
 
         match s {
-            Stmt::Block(body) => walk_stmt_types(body, note),
+            Stmt::Block(body) | Stmt::ScopedBlock(body) => walk_stmt_types(body, note),
             Stmt::Let { ty, init, .. } => {
                 note(ty);
                 note(&init.ty);
@@ -1405,6 +1469,7 @@ fn walk_stmt_exprs(stmts: &[Stmt], f: &mut impl FnMut(&Expr)) {
         };
         match s {
             Stmt::Block(body)
+            | Stmt::ScopedBlock(body)
             | Stmt::While { body, .. }
             | Stmt::Loop { body }
             | Stmt::CFor { body, .. } => walk_stmt_exprs(body, f),

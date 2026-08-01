@@ -29,6 +29,7 @@ pub struct ImportInfo {
     pub alias: String,
     pub path: String,
     pub only: Option<Vec<String>>,
+    pub span: Span,
 }
 
 pub fn imports(root: &SyntaxNode) -> Vec<ImportInfo> {
@@ -45,7 +46,12 @@ pub fn imports(root: &SyntaxNode) -> Vec<ImportInfo> {
             let only = d
                 .child_of_kind(SyntaxKind::ImportOnly)
                 .map(|clause| clause.tokens_of_kind(SyntaxKind::Ident));
-            Some(ImportInfo { alias, path, only })
+            Some(ImportInfo {
+                alias,
+                path,
+                only,
+                span: d.span(),
+            })
         })
         .collect()
 }

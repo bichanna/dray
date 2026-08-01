@@ -739,10 +739,7 @@ impl Lowerer {
             SyntaxKind::IfStmt => self.lower_if(node),
             SyntaxKind::ForStmt => self.lower_for(node),
             SyntaxKind::SwitchStmt => self.lower_switch(node),
-            SyntaxKind::Block => {
-                self.err(node.span(), "nested bare blocks are not lowered yet");
-                None
-            }
+            SyntaxKind::Block => Some(Stmt::ScopedBlock(self.lower_block(node))),
             _ => None,
         }
     }
@@ -863,7 +860,7 @@ impl Lowerer {
     fn stmt_terminates(&self, s: &Stmt) -> bool {
         match s {
             Stmt::Return(_) => true,
-            Stmt::Block(body) => self.terminates(body),
+            Stmt::Block(body) | Stmt::ScopedBlock(body) => self.terminates(body),
             Stmt::If {
                 then_branch,
                 else_branch: Some(otherwise),
@@ -3508,7 +3505,7 @@ impl Lowerer {
 fn breaks_out(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
         Stmt::Break => true,
-        Stmt::Block(body) => breaks_out(body),
+        Stmt::Block(body) | Stmt::ScopedBlock(body) => breaks_out(body),
         Stmt::If {
             then_branch,
             else_branch,

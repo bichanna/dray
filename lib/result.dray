@@ -1,0 +1,11 @@
+
+// result.dray
+// A prelude module, implicitly imported into every Dray program.
+//
+// `Result` is always in scope, unqualified, without an `import`.
+
+// The outcome of a fallible operation: `Ok(value)` or `Err(error)`.
+pub Result :: enum(comptime T: type, comptime E: type) {
+    Ok(T),
+    Err(E),
+}

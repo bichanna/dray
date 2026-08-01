@@ -1593,3 +1593,66 @@ fn e2e_heap_slice_field_runs_without_leaking() {
         assert_eq!(code, 8);
     }
 }
+
+#[test]
+fn e2e_a_nested_block_scopes_its_locals() {
+    let src = "main :: proc() -> int32 {\n\
+                   x := 1;\n\
+                   {\n\
+                       y := 2;\n\
+                       x = x + y;\n\
+                   }\n\
+                   return x;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 3);
+    }
+}
+
+#[test]
+fn e2e_a_nested_block_shadow_does_not_leak() {
+    let src = "main :: proc() -> int32 {\n\
+                   x := 10;\n\
+                   {\n\
+                       x := 99;\n\
+                       x = x + 1;\n\
+                   }\n\
+                   return x;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 10);
+    }
+}
+
+#[test]
+fn a_nested_block_emits_a_c_scope() {
+    let out = c(
+        "main :: proc() -> int32 {\n    x := 1;\n    {\n        y := 2;\n        x = x + y;\n    }\n    return x;\n}\n",
+    );
+    assert!(
+        out.contains('{') && out.contains('}'),
+        "should emit braces: {out}"
+    );
+}
+
+#[test]
+fn a_string_literal_lowers_to_a_byte_array() {
+    let out = c("main :: proc() -> int32 {\n    s := \"hi\";\n    return s.len;\n}\n");
+    assert!(
+        out.contains("static const DrayU8 dray_str_0[]"),
+        "expected byte array: {out}"
+    );
+    assert!(
+        out.contains("dray_str_0"),
+        "literal should reference the array: {out}"
+    );
+}
+
+#[test]
+fn e2e_a_string_literal_keeps_its_bytes_past_an_interior_nul() {
+    let src =
+        "main :: proc() -> int32 {\n    s := \"ab\\x00cd\";\n    return cast(int32) s[4];\n}\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 100); // 'd'
+    }
+}

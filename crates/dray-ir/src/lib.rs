@@ -132,6 +132,7 @@ pub enum Stmt {
     Continue,
     Expr(Expr),
     Block(Vec<Stmt>),
+    ScopedBlock(Vec<Stmt>),
     Located {
         offset: u32,
         file: usize,
@@ -392,6 +393,7 @@ impl Lowerer {
                 out.push(Stmt::Expr(e.clone()));
             }
             H::Block(body) => out.push(Stmt::Block(self.block(body, scopes))),
+            H::ScopedBlock(body) => out.push(Stmt::ScopedBlock(self.block(body, scopes))),
             H::StaticAssert { cond, message } => out.push(Stmt::StaticAssert {
                 cond: cond.clone(),
                 message: message.clone(),

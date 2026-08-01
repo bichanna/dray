@@ -1692,3 +1692,24 @@ fn a_qualified_construction_resolves_through_its_alias() {
         lower_with_imports(main, lib)
     );
 }
+
+#[test]
+fn a_nested_block_lowers_and_scopes_its_locals() {
+    let errs = resolve_errors(
+        "f :: proc() -> int32 {\n    x := 1;\n    {\n        y := 2;\n        x = x + y;\n    }\n    return x;\n}\n",
+    );
+    assert!(
+        errs.is_empty(),
+        "nested block should lower cleanly: {errs:?}"
+    );
+}
+
+#[test]
+fn a_local_from_a_nested_block_is_not_visible_outside_it() {
+    let errs =
+        resolve_errors("f :: proc() -> int32 {\n    {\n        y := 2;\n    }\n    return y;\n}\n");
+    assert!(
+        errs.iter().any(|m| m.contains("y")),
+        "y should be out of scope after the block: {errs:?}"
+    );
+}

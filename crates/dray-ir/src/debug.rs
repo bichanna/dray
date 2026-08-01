@@ -79,7 +79,7 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
         Stmt::Continue => out.push_str(&format!("{pad}continue\n")),
         Stmt::Expr(e) => out.push_str(&format!("{pad}{}\n", expr_str(e))),
         Stmt::Located { stmt, .. } => dump_stmt(stmt, depth, out),
-        Stmt::Block(body) => {
+        Stmt::Block(body) | Stmt::ScopedBlock(body) => {
             out.push_str(&format!("{pad}{{\n"));
             for st in body {
                 dump_stmt(st, depth + 1, out);
