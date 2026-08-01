@@ -1525,3 +1525,71 @@ fn try_alloc_calls_the_non_aborting_allocator() {
         "must use the fallible allocator: {out}"
     );
 }
+
+#[test]
+fn e2e_reassigning_a_weak_local_keeps_counts_balanced() {
+    let src = format!(
+        "{WEAK_PRELUDE}\
+        main :: proc() -> int32 {{\n\
+            a := alloc Parent{{ name: 1, child: alloc Child{{ name: 0 }} }};\n\
+            b := alloc Parent{{ name: 2, child: alloc Child{{ name: 0 }} }};\n\
+            w := a.downgrade();\n\
+            w = b.downgrade();\n\
+            switch w.upgrade() {{ case Maybe.Some(p): return p.name; case Maybe.None: return 0; }}\n\
+        }}\n"
+    );
+    if let Some(code) = compile_and_run(&c(&src)) {
+        assert_eq!(code, 2, "w should point at b after reassignment");
+    }
+}
+
+#[test]
+fn reassigning_a_weak_local_emits_weak_release_of_the_old() {
+    let src = format!(
+        "{WEAK_PRELUDE}\
+        main :: proc() -> int32 {{\n\
+            a := alloc Parent{{ name: 1, child: alloc Child{{ name: 0 }} }};\n\
+            b := alloc Parent{{ name: 2, child: alloc Child{{ name: 0 }} }};\n\
+            w := a.downgrade();\n\
+            w = b.downgrade();\n\
+            return 0;\n\
+        }}\n"
+    );
+    let out = c(&src);
+    // The reassignment must release the previous referent's weak count.
+    assert!(
+        out.contains("dray_rc_weak_release"),
+        "weak reassign must release old: {out}"
+    );
+}
+
+#[test]
+fn a_heap_slice_field_is_released_through_its_ptr() {
+    let out = c("Buf :: struct { data: @[]uint8, n: int32 }\n\
+                 make :: proc(k: int32) -> Buf {\n\
+                     b := alloc [k]uint8;\n\
+                     return Buf{ data: b, n: k };\n\
+                 }\n\
+                 main :: proc() -> int32 { x := make(4); return x.n; }\n");
+    assert!(
+        out.contains("dray_rc_release(self->data.ptr)"),
+        "heap-slice field must be released via .ptr: {out}"
+    );
+}
+
+#[test]
+fn e2e_heap_slice_field_runs_without_leaking() {
+    let src = "rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+               Buf :: struct { data: @[]uint8, n: int32 }\n\
+               make :: proc(k: int32) -> Buf {\n\
+                   b := alloc [k]uint8;\n\
+                   return Buf{ data: b, n: k };\n\
+               }\n\
+               main :: proc() -> int32 {\n\
+                   x := make(8);\n\
+                   return x.n;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 8);
+    }
+}

@@ -1654,6 +1654,15 @@ fn drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
     ));
     for f in &sd.fields {
         match &f.ty {
+            Ty::Rc(_) if heap_slice_elem(&f.ty).is_some() => {
+                body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
+                    tamago::Expr::new_ident_with_str("dray_rc_release"),
+                    vec![tamago::Expr::new_mem_access_with_str(
+                        self_field("self", &f.name),
+                        "ptr",
+                    )],
+                )));
+            }
             Ty::Rc(_) => {
                 body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
                     tamago::Expr::new_ident_with_str("dray_rc_release"),

@@ -162,21 +162,42 @@ struct LoadedModule {
     path: String,
 }
 
-fn resolve_import_path(dir: &Path, path: &str) -> Result<PathBuf, BuildError> {
-    let with_ext = if Path::new(path).extension().is_some() {
-        dir.join(path)
+fn resolve_import_path(dir: &Path, path: &str, lib: Option<&Path>) -> Result<PathBuf, BuildError> {
+    let filename = if Path::new(path).extension().is_some() {
+        path.to_string()
     } else {
-        dir.join(format!("{path}.dray"))
+        format!("{path}.dray")
     };
-    std::fs::canonicalize(&with_ext)
-        .map_err(|e| BuildError::Parse(vec![format!("cannot import \"{path}\": {e}")]))
+
+    if let Ok(canon) = std::fs::canonicalize(dir.join(&filename)) {
+        return Ok(canon);
+    }
+    if let Some(lib) = lib
+        && let Ok(canon) = std::fs::canonicalize(lib.join(&filename))
+    {
+        return Ok(canon);
+    }
+
+    Err(BuildError::Parse(vec![format!(
+        "cannot import \"{path}\": not found next to the file or in the lib directory"
+    )]))
 }
 
-fn build_module_graph(loaded: &[LoadedModule]) -> dray_hir::ModuleGraph {
+fn build_module_graph(
+    loaded: &[LoadedModule],
+    prelude_index: Option<usize>,
+) -> dray_hir::ModuleGraph {
     let files = loaded
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(i, m)| {
             let mut fi = dray_hir::FileImports::default();
+            if let Some(p) = prelude_index
+                && i != p
+            {
+                fi.globs.push(p);
+            }
+
             for (imp, target) in &m.imports {
                 match &imp.only {
                     // `alias :: import("m")` qualified only
@@ -200,6 +221,7 @@ fn build_module_graph(loaded: &[LoadedModule]) -> dray_hir::ModuleGraph {
 fn source_to_c_with_imports(
     entry_src: &str,
     entry_path: &Path,
+    prelude: Option<&Path>,
 ) -> Result<(dray_codegen::CModules, Vec<String>), BuildError> {
     let entry_canon =
         std::fs::canonicalize(entry_path).unwrap_or_else(|_| entry_path.to_path_buf());
@@ -209,6 +231,23 @@ fn source_to_c_with_imports(
     index_of.insert(entry_canon.clone(), 0);
     queue.push_back((entry_src.to_string(), entry_canon.clone()));
     let mut pending: Vec<Option<LoadedModule>> = vec![None];
+
+    let prelude_index = match prelude {
+        Some(p) => match std::fs::canonicalize(p) {
+            Ok(canon) if canon != entry_canon => {
+                let i = pending.len();
+                index_of.insert(canon.clone(), i);
+                pending.push(None);
+                let src = std::fs::read_to_string(&canon).map_err(|e| {
+                    BuildError::Parse(vec![format!("cannot read the prelude: {e}")])
+                })?;
+                queue.push_back((src, canon));
+                Some(i)
+            }
+            _ => None,
+        },
+        None => None,
+    };
 
     while let Some((src, path)) = queue.pop_front() {
         let parsed = parse(&src);
@@ -228,7 +267,7 @@ fn source_to_c_with_imports(
         let mut edges: Vec<(dray_syntax::ImportInfo, usize)> = Vec::new();
 
         for imp in dray_syntax::imports(&parsed.root) {
-            let canon = resolve_import_path(&dir, &imp.path)?;
+            let canon = resolve_import_path(&dir, &imp.path, prelude.and_then(|p| p.parent()))?;
             let target = match index_of.get(&canon) {
                 Some(&i) => i,
                 None => {
@@ -263,7 +302,7 @@ fn source_to_c_with_imports(
         index_paths[i] = path.clone();
     }
 
-    let graph = build_module_graph(&loaded);
+    let graph = build_module_graph(&loaded, prelude_index);
     let roots: Vec<&dray_syntax::SyntaxNode> = loaded.iter().map(|m| &m.parsed.root).collect();
     let (hir, resolve_errors) = dray_hir::lower_files_with_graph(&roots, &graph);
     if !resolve_errors.is_empty() {
@@ -319,8 +358,12 @@ pub fn source_to_c_from_file(src: &str, file: &str) -> Result<String, BuildError
     dray_codegen::ir_to_c(&ir).map_err(|e| BuildError::Codegen(e.to_string()))
 }
 
-pub fn emit_c_from_file(src: &str, entry_path: &Path) -> Result<String, BuildError> {
-    let (modules, stems) = source_to_c_with_imports(src, entry_path)?;
+pub fn emit_c_from_file(
+    src: &str,
+    entry_path: &Path,
+    prelude: Option<&Path>,
+) -> Result<String, BuildError> {
+    let (modules, stems) = source_to_c_with_imports(src, entry_path, prelude)?;
     let mut out = String::new();
     out.push_str(&format!("// ==== header: {HEADER_NAME} ====\n"));
     out.push_str(&modules.header);
@@ -383,10 +426,10 @@ fn build_dir(opts: &BuildOptions, out_path: &Path) -> PathBuf {
 /// Write `contents` to `path` only if it differs from what is already there, so
 /// an unchanged file keeps its modification time
 fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<bool> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == contents {
-            return Ok(false);
-        }
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == contents
+    {
+        return Ok(false);
     }
     std::fs::write(path, contents)?;
     Ok(true)
@@ -395,10 +438,10 @@ fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<bool> {
 /// Copy `from` to `to` only if the destination differs
 fn copy_if_changed(from: &Path, to: &Path) -> std::io::Result<()> {
     let src = std::fs::read(from)?;
-    if let Ok(dst) = std::fs::read(to) {
-        if dst == src {
-            return Ok(());
-        }
+    if let Ok(dst) = std::fs::read(to)
+        && dst == src
+    {
+        return Ok(());
     }
     std::fs::write(to, src)?;
     Ok(())
@@ -435,7 +478,11 @@ pub fn build_file(
 ) -> Result<PathBuf, BuildError> {
     let src = std::fs::read_to_string(src_path)?;
     let abs_src = std::fs::canonicalize(src_path).unwrap_or_else(|_| src_path.to_path_buf());
-    let (cmodules, stems) = source_to_c_with_imports(&src, &abs_src)?;
+    let prelude = system_lib_dir(opts)
+        .ok()
+        .and_then(|d| d.parent().map(|p| p.join("prelude.dray")));
+    let prelude_ref = prelude.as_deref().filter(|p| p.exists());
+    let (cmodules, stems) = source_to_c_with_imports(&src, &abs_src, prelude_ref)?;
 
     let dir = build_dir(opts, out_path);
     std::fs::create_dir_all(&dir)?;

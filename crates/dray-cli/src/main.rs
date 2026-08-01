@@ -179,6 +179,7 @@ fn emit_c_cmd(args: &[String]) -> Result<(), CliError> {
         emit_c_from_file(
             &src,
             &std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path)),
+            None,
         )
     };
     match generated {

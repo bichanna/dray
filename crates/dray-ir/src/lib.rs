@@ -600,13 +600,45 @@ impl Lowerer {
             }
             self.uses_rc = true;
             out.push(Stmt::Release(old));
-        } else {
+            return;
+        }
+
+        let weak_target = matches!(op, AssignOp::Assign)
+            && matches!(target.ty, Ty::Weak(_))
+            && matches!(&target.kind, ExprKind::Name { name, .. } if is_live_weak_local(scopes, name));
+        if weak_target {
+            let ExprKind::Name {
+                name: target_name, ..
+            } = &target.kind
+            else {
+                unreachable!("weak_target guaranteed a Name above");
+            };
+            let old = self.fresh_temp(target.ty.clone());
+            out.push(Stmt::Let {
+                name: old.clone(),
+                ty: target.ty.clone(),
+                init: target.clone(),
+            });
             out.push(Stmt::Assign {
                 target: target.clone(),
                 op,
                 value: value.clone(),
             });
+
+            if !matches!(value.kind, ExprKind::Downgrade(_)) {
+                out.push(Stmt::WeakRetain(target_name.clone()));
+            }
+            out.push(Stmt::WeakRelease(old));
+            self.uses_rc = true;
+
+            return;
         }
+
+        out.push(Stmt::Assign {
+            target: target.clone(),
+            op,
+            value: value.clone(),
+        });
     }
 
     fn emit_field_retains(&mut self, e: &Expr, out: &mut Vec<Stmt>) {
@@ -758,6 +790,14 @@ fn is_live_rc_local(scopes: &Scopes, name: &str) -> bool {
         scope
             .iter()
             .any(|c| matches!(c, Cleanup::Strong(n) | Cleanup::StrongArray(n) if n == name))
+    })
+}
+
+fn is_live_weak_local(scopes: &Scopes, name: &str) -> bool {
+    scopes.iter().any(|scope| {
+        scope
+            .iter()
+            .any(|c| matches!(c, Cleanup::Weak(n) if n == name))
     })
 }
 
