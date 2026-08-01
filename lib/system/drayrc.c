@@ -5,6 +5,13 @@
 DrayI64 dray_rc_live_count = 0;
 
 void *dray_rc_alloc(DraySize payload, DrayDropFn drop) {
+  void *p = dray_rc_try_alloc(payload, drop);
+  if (!p)
+    dray_alloc_fail(sizeof(DrayRcHeader) + payload);
+  return p;
+}
+
+void *dray_rc_try_alloc(DraySize payload, DrayDropFn drop) {
   DrayRcHeader *h = (DrayRcHeader *)calloc(1, sizeof(DrayRcHeader) + payload);
   if (!h)
     return NULL;

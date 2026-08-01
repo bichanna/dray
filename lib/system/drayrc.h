@@ -32,6 +32,10 @@ extern DrayI64 dray_rc_live_count;
 /* Allocate `payload` zeroed bytes with a fresh header (strong 1, weak 0). */
 void *dray_rc_alloc(DraySize payload, DrayDropFn drop);
 
+/* Fallible allocation: returns NULL on failure instead of aborting, for
+ * `try_alloc`. */
+void *dray_rc_try_alloc(DraySize payload, DrayDropFn drop);
+
 /* Allocate `count` elements of `stride` bytes each, zeroed, recording the count
  * in the header. `drop` runs once for the whole payload, not per element: an
  * array drop function loops using `dray_rc_count`. */

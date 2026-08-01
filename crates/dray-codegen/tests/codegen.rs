@@ -1481,3 +1481,47 @@ fn per_module_line_directives_name_each_modules_own_file() {
         cm.modules[1]
     );
 }
+
+#[test]
+fn e2e_try_alloc_scalar_yields_some_on_success() {
+    let src = "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+               main :: proc() -> int32 {\n\
+                   r := try_alloc int32;\n\
+                   switch r {\n\
+                   case Maybe.Some(p): *p = 42; return *p;\n\
+                   case Maybe.None: return 1;\n\
+                   }\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn e2e_try_alloc_struct_yields_a_usable_pointer() {
+    let src = "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+               Node :: struct { value: int32, next: @Node }\n\
+               main :: proc() -> int32 {\n\
+                   r := try_alloc Node;\n\
+                   switch r {\n\
+                   case Maybe.Some(n): n.value = 9; return n.value;\n\
+                   case Maybe.None: return 1;\n\
+                   }\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 9);
+    }
+}
+
+#[test]
+fn try_alloc_calls_the_non_aborting_allocator() {
+    let out = c("Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                 main :: proc() -> int32 {\n\
+                     r := try_alloc int32;\n\
+                     switch r { case Maybe.Some(p): return 0; case Maybe.None: return 1; }\n\
+                 }\n");
+    assert!(
+        out.contains("dray_rc_try_alloc"),
+        "must use the fallible allocator: {out}"
+    );
+}

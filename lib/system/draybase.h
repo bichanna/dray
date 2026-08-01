@@ -91,6 +91,11 @@ DRAY_NORETURN void dray_index_fail(DrayI64 index, DrayI64 len);
 DRAY_NORETURN void dray_range_fail(DrayI64 lo, DrayI64 hi, DrayI64 len);
 DRAY_NORETURN void dray_range_from_fail(DrayI64 lo, DrayI64 len);
 
+/* Aborts when an `alloc` cannot get memory. `try_alloc` handles failure in the
+ * program instead, so this fires only for plain `alloc`. Reports the byte size
+ * asked for, so a failure says how much was wanted, not just that it failed. */
+DRAY_NORETURN void dray_alloc_fail(DraySize bytes);
+
 /* Returns `index` when it is in range. Used where the length is a compile-time
  * constant, so the generated C reads `arr[dray_check_index(i, 4)]`. */
 DrayI64 dray_check_index(DrayI64 index, DrayI64 len);

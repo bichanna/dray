@@ -179,9 +179,38 @@ fn alloc_lowers_cleanly() {
 }
 
 #[test]
-fn try_alloc_is_still_a_clean_error() {
+fn try_alloc_needs_a_maybe_enum() {
     let errs = resolve_errors("f :: proc() {\n    x := try_alloc int32;\n}\n");
-    assert!(errs.iter().any(|m| m.contains("try_alloc")), "{errs:?}");
+    assert!(
+        errs.iter().any(|m| m.contains("Maybe")),
+        "should ask for a Maybe: {errs:?}"
+    );
+}
+
+#[test]
+fn try_alloc_lowers_cleanly_with_a_maybe() {
+    let errs = resolve_errors(
+        "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+         f :: proc() -> int32 {\n\
+             r := try_alloc int32;\n\
+             switch r { case Maybe.Some(p): return 0; case Maybe.None: return 1; }\n\
+         }\n",
+    );
+    assert!(errs.is_empty(), "try_alloc should lower cleanly: {errs:?}");
+}
+
+#[test]
+fn try_alloc_rejects_a_field_initializer() {
+    let errs = resolve_errors(
+        "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+         Node :: struct { value: int32 }\n\
+         f :: proc() {\n    x := try_alloc Node{ value: 1 };\n}\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("try_alloc") && m.contains("initializer")),
+        "{errs:?}"
+    );
 }
 
 #[test]

@@ -98,14 +98,34 @@ impl Default for BuildOptions {
     }
 }
 
+fn cc_spawn_error(cc: &str, e: std::io::Error) -> BuildError {
+    BuildError::CC(format!(
+        "could not run the C compiler `{cc}` ({e}). Install one, or set $CC to a compiler that \
+         exists (for example `CC=gcc` or `CC=clang`)."
+    ))
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_diagnostic(map: &dray_ir::SourceMap, offset: u32, message: &str) -> String {
+    let (line, col) = map.line_col(offset);
+    format!("{}:{}:{}: {}", map.file(), line, col, message)
+}
+
 fn source_to_hir(src: &str) -> Result<dray_hir::Hir, BuildError> {
     let parsed = parse(src);
+    let map = dray_ir::SourceMap::new("<input>", src);
     if !parsed.errors.is_empty() {
         return Err(BuildError::Parse(
             parsed
                 .errors
                 .iter()
-                .map(|e| format!("{}..{}: {}", e.span.start, e.span.end, e.message))
+                .map(|e| format_diagnostic(&map, e.span.start, &e.message))
                 .collect(),
         ));
     }
@@ -115,7 +135,7 @@ fn source_to_hir(src: &str) -> Result<dray_hir::Hir, BuildError> {
         return Err(BuildError::Resolve(
             resolve_errors
                 .iter()
-                .map(|e| format!("{}..{}: {}", e.span.start, e.span.end, e.message))
+                .map(|e| format_diagnostic(&map, e.span.start, &e.message))
                 .collect(),
         ));
     }
@@ -193,19 +213,12 @@ fn source_to_c_with_imports(
     while let Some((src, path)) = queue.pop_front() {
         let parsed = parse(&src);
         if !parsed.errors.is_empty() {
+            let map = dray_ir::SourceMap::new(path.display().to_string(), &src);
             return Err(BuildError::Parse(
                 parsed
                     .errors
                     .iter()
-                    .map(|e| {
-                        format!(
-                            "{}: {}..{}: {}",
-                            path.display(),
-                            e.span.start,
-                            e.span.end,
-                            e.message
-                        )
-                    })
+                    .map(|e| format_diagnostic(&map, e.span.start, &e.message))
                     .collect(),
             ));
         }
@@ -254,10 +267,17 @@ fn source_to_c_with_imports(
     let roots: Vec<&dray_syntax::SyntaxNode> = loaded.iter().map(|m| &m.parsed.root).collect();
     let (hir, resolve_errors) = dray_hir::lower_files_with_graph(&roots, &graph);
     if !resolve_errors.is_empty() {
+        let maps: Vec<dray_ir::SourceMap> = loaded
+            .iter()
+            .map(|m| dray_ir::SourceMap::new(m.path.clone(), &m.src))
+            .collect();
         return Err(BuildError::Resolve(
             resolve_errors
                 .iter()
-                .map(|e| format!("{}..{}: {}", e.span.start, e.span.end, e.message))
+                .map(|e| match maps.get(e.file) {
+                    Some(map) => format_diagnostic(map, e.span.start, &e.message),
+                    None => format!("{}..{}: {}", e.span.start, e.span.end, e.message),
+                })
                 .collect(),
         ));
     }
@@ -297,6 +317,22 @@ pub fn source_to_c_from_file(src: &str, file: &str) -> Result<String, BuildError
     let mut ir = source_to_ir(src)?;
     ir.source = Some(dray_ir::SourceMap::new(file, src));
     dray_codegen::ir_to_c(&ir).map_err(|e| BuildError::Codegen(e.to_string()))
+}
+
+pub fn emit_c_from_file(src: &str, entry_path: &Path) -> Result<String, BuildError> {
+    let (modules, stems) = source_to_c_with_imports(src, entry_path)?;
+    let mut out = String::new();
+    out.push_str(&format!("// ==== header: {HEADER_NAME} ====\n"));
+    out.push_str(&modules.header);
+    for (i, module_c) in modules.modules.iter().enumerate() {
+        let name = stems
+            .get(i)
+            .map(|s| format!("{s}.c"))
+            .unwrap_or_else(|| format!("module{i}.c"));
+        out.push_str(&format!("\n// ==== file: {name} ====\n"));
+        out.push_str(module_c);
+    }
+    Ok(out)
 }
 
 /// Build a Dray source file into an executable at `out_path`. Returns the path
@@ -464,39 +500,42 @@ pub fn build_file(
             objects.push(obj);
             continue;
         }
-        let status = invocation.compile_object(c, &obj).status().map_err(|e| {
-            BuildError::CC(format!(
-                "failed to run `{}` (is a C compiler installed?): {e}",
-                opts.cc
-            ))
-        })?;
-        if !status.success() {
+        let output = invocation
+            .compile_object(c, &obj)
+            .output()
+            .map_err(|e| cc_spawn_error(&opts.cc, e))?;
+        if !output.status.success() {
+            // Generated C failing to compile is a compiler bug, not a user
+            // error — say so, and show what the C compiler reported.
             return Err(BuildError::CC(format!(
-                "`{}` failed compiling {}; generated C left in {}",
-                opts.cc,
+                "internal error: the C generated for {} did not compile — this is a bug in Dray, \
+                 not your program. The generated C is in {} so it can be inspected or reported.\n\n\
+                 {} said:\n{}",
                 c.display(),
-                dir.display()
+                dir.display(),
+                opts.cc,
+                indent(&String::from_utf8_lossy(&output.stderr)),
             )));
         }
         objects.push(obj);
     }
 
-    let status = invocation
+    let output = invocation
         .link_objects(&objects, out_path)
-        .status()
-        .map_err(|e| {
-            BuildError::CC(format!(
-                "failed to run `{}` (is a C compiler installed?): {e}",
-                opts.cc
-            ))
-        })?;
+        .output()
+        .map_err(|e| cc_spawn_error(&opts.cc, e))?;
 
-    if !status.success() {
+    if !output.status.success() {
+        // A link failure on generated objects is likewise a compiler/runtime
+        // bug: a missing symbol means codegen referenced something the runtime
+        // does not define. Surface the linker's own message, which names it.
         return Err(BuildError::CC(format!(
-            "`{}` exited with {}; generated C left in {}",
+            "internal error: linking failed. This is likely a bug in Dray. A missing symbol usually means \
+             the generated code referenced a runtime function that is not linked in. Objects are in \
+             {}.\n\n{} said:\n{}",
+            dir.display(),
             opts.cc,
-            status,
-            dir.display()
+            indent(&String::from_utf8_lossy(&output.stderr)),
         )));
     }
 

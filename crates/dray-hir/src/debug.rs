@@ -259,6 +259,7 @@ pub fn expr(e: &Expr) -> String {
             }
         }
         ExprKind::AllocArray { elem, count } => format!("alloc [{}]{}", expr(count), ty(elem)),
+        ExprKind::TryAlloc { inner, .. } => format!("try_{}", expr(inner)),
         ExprKind::Paren(inner) => format!("({})", expr(inner)),
     };
     format!("{inner}:{}", ty(&e.ty))

@@ -13,6 +13,7 @@ use crate::types::{is_type, lower_type, name_to_ty};
 pub struct ResolveError {
     pub message: String,
     pub span: Span,
+    pub file: usize,
 }
 
 pub fn lower(root: &SyntaxNode) -> (Hir, Vec<ResolveError>) {
@@ -2972,14 +2973,48 @@ impl Lowerer {
         }
     }
 
-    /// Lower `alloc T` or `alloc T{ field: value, ... }`. The composite form
-    /// carries per-field initializers.
     fn lower_alloc(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
-        if node.token_of_kind(SyntaxKind::KwTryAlloc).is_some() {
-            self.err(node.span(), "try_alloc is not lowered yet; use `alloc`");
+        let is_try = node.token_of_kind(SyntaxKind::KwTryAlloc).is_some();
+        if is_try && node.child_of_kind(SyntaxKind::CompositeLit).is_some() {
+            self.err(
+                node.span(),
+                "`try_alloc` does not take a `{ ... }` initializer; allocate with `try_alloc T`, then fill fields after checking the result",
+            );
             return (ExprKind::Unresolved("try_alloc".into()), Ty::Infer);
         }
 
+        let (kind, ty) = self.lower_alloc_inner(node);
+        if !is_try {
+            return (kind, ty);
+        }
+
+        let Ty::Rc(pointee) = &ty else {
+            return (kind, ty);
+        };
+
+        if !self.enums.contains_key("Maybe") {
+            self.err(
+                node.span(),
+                "`try_alloc` produces a `Maybe(@T)`, but no `Maybe` enum is declared",
+            );
+            return (ExprKind::Unresolved("try_alloc".into()), Ty::Infer);
+        }
+
+        let maybe = Ty::App("Maybe".to_string(), vec![Ty::Rc(pointee.clone())]);
+        (
+            ExprKind::TryAlloc {
+                inner: Box::new(Expr {
+                    kind,
+                    ty: ty.clone(),
+                    span: node.span(),
+                }),
+                result: maybe.clone(),
+            },
+            maybe,
+        )
+    }
+
+    fn lower_alloc_inner(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         // Composite form: the child is a CompositeLit wrapping the type + fields.
         if let Some(lit) = node.child_of_kind(SyntaxKind::CompositeLit) {
             return self.lower_composite_alloc(&lit);
@@ -3463,6 +3498,7 @@ impl Lowerer {
         self.errors.push(ResolveError {
             message: message.into(),
             span,
+            file: self.current_file,
         });
     }
 }

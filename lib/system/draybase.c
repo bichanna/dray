@@ -29,6 +29,12 @@ DrayI64 dray_check_index(DrayI64 index, DrayI64 len) {
   return index;
 }
 
+void dray_alloc_fail(DraySize bytes) {
+  fprintf(stderr, "dray: out of memory allocating %llu bytes\n",
+          (unsigned long long)bytes);
+  abort();
+}
+
 void dray_unreachable(void) {
   fprintf(stderr, "dray: reached a branch the compiler proved unreachable\n");
   abort();

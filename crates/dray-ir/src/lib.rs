@@ -63,6 +63,19 @@ impl SourceMap {
             .partition_point(|&start| start <= at as u32);
         Some((self.file.clone(), idx as u64))
     }
+
+    pub fn line_col(&self, offset: u32) -> (u32, u32) {
+        let line = self
+            .line_starts
+            .partition_point(|&start| start <= offset)
+            .max(1);
+        let col = offset.saturating_sub(self.line_starts[line - 1]) + 1;
+        (line as u32, col)
+    }
+
+    pub fn file(&self) -> &str {
+        &self.file
+    }
 }
 
 impl Ir {
@@ -608,6 +621,10 @@ impl Lowerer {
             // A fresh heap array owns nothing to retain; its elements start
             // zeroed. The count is an ordinary value, not an RC reference.
             ExprKind::AllocArray { .. } => self.uses_rc = true,
+            ExprKind::TryAlloc { inner, .. } => {
+                self.uses_rc = true;
+                self.emit_field_retains(inner, out);
+            }
             ExprKind::StructLit { fields, .. } => {
                 for (_, val) in fields {
                     self.emit_field_retains(val, out);
@@ -757,4 +774,27 @@ fn transferred_local(scopes: &Scopes, e: &Expr) -> Option<String> {
 
 fn ends_in_return(stmts: &[dray_hir::Stmt]) -> bool {
     matches!(stmts.last(), Some(dray_hir::Stmt::Return(_)))
+}
+
+#[cfg(test)]
+mod source_map_tests {
+    use super::SourceMap;
+
+    #[test]
+    fn line_col_is_one_based_and_tracks_newlines() {
+        //         offset: 0123 4 56789...
+        let src = "ab\ncde\nf";
+        let m = SourceMap::new("t.dray", src);
+        assert_eq!(m.line_col(0), (1, 1)); // 'a'
+        assert_eq!(m.line_col(1), (1, 2)); // 'b'
+        assert_eq!(m.line_col(3), (2, 1)); // 'c' (first char after first \n)
+        assert_eq!(m.line_col(5), (2, 3)); // 'e'
+        assert_eq!(m.line_col(7), (3, 1)); // 'f'
+    }
+
+    #[test]
+    fn file_name_is_reported() {
+        let m = SourceMap::new("path/to/mod.dray", "x");
+        assert_eq!(m.file(), "path/to/mod.dray");
+    }
 }

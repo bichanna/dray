@@ -5,7 +5,7 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use dray_driver::{BuildOptions, build_file, source_to_c, source_to_c_from_file, source_to_ir};
+use dray_driver::{BuildOptions, build_file, emit_c_from_file, source_to_c, source_to_ir};
 use dray_hir::{dump_hir, lower};
 use dray_ir::dump_ir;
 use dray_syntax::{DumpOptions, dump_cst_with, dump_tokens, dump_tokens_no_trivia, parse};
@@ -147,9 +147,11 @@ fn dump_cst_cmd(args: &[String]) -> Result<(), CliError> {
 
     // Spit out in stderr instead
     if !parsed.errors.is_empty() {
+        let map = dray_ir::SourceMap::new("<input>", &src);
         eprintln!("\n{} parse error(s):", parsed.errors.len());
         for e in &parsed.errors {
-            eprintln!("  {}..{}: {}", e.span.start, e.span.end, e.message);
+            let (line, col) = map.line_col(e.span.start);
+            eprintln!("  {line}:{col}: {}", e.message);
         }
     }
     Ok(())
@@ -174,12 +176,9 @@ fn emit_c_cmd(args: &[String]) -> Result<(), CliError> {
     let generated = if path == "-" {
         source_to_c(&src)
     } else {
-        source_to_c_from_file(
+        emit_c_from_file(
             &src,
-            &std::fs::canonicalize(path)
-                .unwrap_or_else(|_| std::path::PathBuf::from(path))
-                .display()
-                .to_string(),
+            &std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path)),
         )
     };
     match generated {

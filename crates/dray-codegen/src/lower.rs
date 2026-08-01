@@ -384,6 +384,7 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
         }
         ExprKind::Cast { operand, .. } => expr_uses_name(operand, name),
         ExprKind::Downgrade(inner) | ExprKind::Upgrade(inner) => expr_uses_name(inner, name),
+        ExprKind::TryAlloc { inner, .. } => expr_uses_name(inner, name),
         ExprKind::Alloc { fields, .. } | ExprKind::StructLit { fields, .. } => {
             fields.iter().any(|(_, v)| expr_uses_name(v, name))
         }
@@ -630,6 +631,40 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
                 vec![lower_expr(ir, inner)?],
             );
             T::new_fn_call(T::new_ident(upgrade_fn_name(&e.ty)), vec![live])
+        }
+        ExprKind::TryAlloc { inner, result } => {
+            let Ty::Rc(pointee) = &inner.ty else {
+                return Err(CodegenError::new(
+                    "internal: try_alloc inner was not an `@T`".to_string(),
+                ));
+            };
+            let (size, drop_arg, cast_ty) = match pointee.as_ref() {
+                Ty::Named(name) => {
+                    let struct_ty = Type::base(BaseType::Struct(name.clone()));
+                    let drop = if ir
+                        .structs
+                        .iter()
+                        .find(|s| &s.name == name)
+                        .is_some_and(|sd| has_rc_field(ir, sd))
+                    {
+                        T::new_ident(format!("dray_drop_{name}"))
+                    } else {
+                        T::new_null()
+                    };
+                    (T::new_sizeof(struct_ty.clone()), drop, Type::ptr(struct_ty))
+                }
+                scalar => (
+                    T::new_sizeof(lower_ty(scalar)?),
+                    T::new_null(),
+                    Type::ptr(lower_ty(scalar)?),
+                ),
+            };
+            let raw = T::new_fn_call(
+                T::new_ident_with_str("dray_rc_try_alloc"),
+                vec![size, drop_arg],
+            );
+            let ptr = T::new_cast(cast_ty, raw);
+            T::new_fn_call(T::new_ident(upgrade_fn_name(result)), vec![ptr])
         }
         ExprKind::ArrayLit { elements, .. } => {
             let mut values = Vec::with_capacity(elements.len());
@@ -1351,7 +1386,9 @@ fn upgrade_result_types(ir: &Ir) -> Vec<Ty> {
     for item in &ir.items {
         if let Item::Proc(p) = item {
             walk_stmt_exprs(&p.body, &mut |e| {
-                if matches!(e.kind, ExprKind::Upgrade(_)) && !found.contains(&e.ty) {
+                let produces_maybe = matches!(e.kind, ExprKind::Upgrade(_))
+                    || matches!(e.kind, ExprKind::TryAlloc { .. });
+                if produces_maybe && !found.contains(&e.ty) {
                     found.push(e.ty.clone());
                 }
             });
@@ -1405,6 +1442,7 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
         ExprKind::Unary { operand, .. } => walk_exprs(operand, f),
         ExprKind::Paren(inner) | ExprKind::Cast { operand: inner, .. } => walk_exprs(inner, f),
         ExprKind::Downgrade(inner) | ExprKind::Upgrade(inner) => walk_exprs(inner, f),
+        ExprKind::TryAlloc { inner, .. } => walk_exprs(inner, f),
         ExprKind::Binary { lhs, rhs, .. } => {
             walk_exprs(lhs, f);
             walk_exprs(rhs, f);
