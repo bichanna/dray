@@ -1688,3 +1688,44 @@ fn a_plain_string_literal_has_no_trailing_nul() {
         "expected exact bytes: {out}"
     );
 }
+
+#[test]
+fn an_rc_call_result_used_via_field_is_released_once() {
+    // A proc returning `@[]uint8`, whose result is used only through `.ptr` in a
+    // statement, must be hoisted to a temp and released via its `.ptr`
+    let src = "sink :: extern \"sink\" proc(p: *uint8) -> int32;\n\
+               buf :: proc() -> @[]uint8 {\n    return alloc [4]uint8;\n}\n\
+               main :: proc() -> int32 {\n    sink(buf().ptr);\n    return 0;\n}\n";
+    let out = c(src);
+    assert!(
+        out.contains("__rc_tmp_0 = buf()"),
+        "call should be hoisted: {out}"
+    );
+    assert!(
+        out.matches("dray_rc_release(__rc_tmp_0.ptr)").count() == 1,
+        "should release the temp's .ptr once: {out}"
+    );
+}
+
+#[test]
+fn a_bare_rc_call_statement_is_released() {
+    let src = "buf :: proc() -> @[]uint8 {\n    return alloc [4]uint8;\n}\n\
+               main :: proc() -> int32 {\n    buf();\n    return 0;\n}\n";
+    let out = c(src);
+    assert!(
+        out.contains("dray_rc_release(__rc_tmp_0.ptr)"),
+        "bare RC call result should be released: {out}"
+    );
+}
+
+#[test]
+fn a_non_rc_call_result_is_not_hoisted() {
+    let src = "n :: proc() -> int32 {\n    return 5;\n}\n\
+               sink :: extern \"sink\" proc(x: int32) -> int32;\n\
+               main :: proc() -> int32 {\n    sink(n());\n    return 0;\n}\n";
+    let out = c(src);
+    assert!(
+        !out.contains("__rc_tmp"),
+        "no RC temp for a non-RC call: {out}"
+    );
+}

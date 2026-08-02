@@ -514,10 +514,9 @@ pub fn build_file(
 ) -> Result<PathBuf, BuildError> {
     let src = std::fs::read_to_string(src_path)?;
     let abs_src = std::fs::canonicalize(src_path).unwrap_or_else(|_| src_path.to_path_buf());
+    let lib_system = system_lib_dir(opts)?;
+    let lib_root = lib_system.parent().map(Path::to_path_buf);
     let preludes = prelude_paths(opts);
-    let lib_root = system_lib_dir(opts)
-        .ok()
-        .and_then(|d| d.parent().map(Path::to_path_buf));
     let (cmodules, stems) =
         source_to_c_with_imports(&src, &abs_src, &preludes, lib_root.as_deref())?;
 
@@ -546,7 +545,7 @@ pub fn build_file(
         c_paths.push(path);
     }
 
-    let lib = system_lib_dir(opts)?;
+    let lib = &lib_system;
     let base_h = dir.join("draybase.h");
     let base_c = dir.join("draybase.c");
     let rc_h = dir.join("drayrc.h");

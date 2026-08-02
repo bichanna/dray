@@ -390,7 +390,25 @@ impl Lowerer {
             H::Continue => out.push(Stmt::Continue),
             H::Expr(e) => {
                 self.emit_field_retains(e, out);
-                out.push(Stmt::Expr(e.clone()));
+
+                let mut temps: Vec<(String, bool)> = Vec::new();
+                let mut rewritten = e.clone();
+                self.hoist_rc_call_results(&mut rewritten, out, &mut temps);
+
+                if self.is_owning_rc_call(&rewritten) {
+                    self.hoist_child(&mut rewritten, out, &mut temps);
+                } else {
+                    out.push(Stmt::Expr(rewritten));
+                }
+
+                for (t, is_slice) in temps {
+                    if is_slice {
+                        out.push(Stmt::ReleaseArray(t));
+                    } else {
+                        out.push(Stmt::Release(t));
+                    }
+                    self.uses_rc = true;
+                }
             }
             H::Block(body) => out.push(Stmt::Block(self.block(body, scopes))),
             H::ScopedBlock(body) => out.push(Stmt::ScopedBlock(self.block(body, scopes))),
@@ -704,6 +722,78 @@ impl Lowerer {
     fn emit_retain(&mut self, name: String, out: &mut Vec<Stmt>) {
         self.uses_rc = true;
         out.push(Stmt::Retain(name));
+    }
+
+    /// Whether an expression is a call that returns an owned RC value. Such a
+    /// value, used as a subexpression, has no binding to own it, so its
+    /// allocation would leak or be freed midexpression
+    fn is_owning_rc_call(&self, e: &Expr) -> bool {
+        matches!(e.ty, Ty::Rc(_))
+            && matches!(e.kind, ExprKind::Call { .. } | ExprKind::GenericCall { .. })
+    }
+
+    fn hoist_rc_call_results(
+        &mut self,
+        e: &mut Expr,
+        out: &mut Vec<Stmt>,
+        temps: &mut Vec<(String, bool)>,
+    ) {
+        match &mut e.kind {
+            ExprKind::Field { recv, .. } => {
+                self.hoist_child(recv, out, temps);
+            }
+            ExprKind::Index { base, index } => {
+                self.hoist_child(base, out, temps);
+                self.hoist_child(index, out, temps);
+            }
+            ExprKind::Cast { operand, .. } => {
+                self.hoist_child(operand, out, temps);
+            }
+            ExprKind::Unary { operand, .. } => {
+                self.hoist_child(operand, out, temps);
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.hoist_child(lhs, out, temps);
+                self.hoist_child(rhs, out, temps);
+            }
+            ExprKind::Paren(inner) => {
+                self.hoist_child(inner, out, temps);
+            }
+            ExprKind::Call { callee, args } => {
+                self.hoist_child(callee, out, temps);
+                for a in args.iter_mut() {
+                    self.hoist_child(a, out, temps);
+                }
+            }
+            ExprKind::GenericCall { args, .. } => {
+                for a in args.iter_mut() {
+                    self.hoist_child(a, out, temps);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn hoist_child(
+        &mut self,
+        child: &mut Expr,
+        out: &mut Vec<Stmt>,
+        temps: &mut Vec<(String, bool)>,
+    ) {
+        self.hoist_rc_call_results(child, out, temps);
+        if self.is_owning_rc_call(child) {
+            let ty = child.ty.clone();
+            let is_slice = matches!(&ty, Ty::Rc(inner) if matches!(&**inner, Ty::Slice(_)));
+            let name = self.fresh_temp(ty.clone());
+            let call = std::mem::replace(child, self.name_expr(&name, ty.clone(), child.span));
+            out.push(Stmt::Let {
+                name: name.clone(),
+                ty,
+                init: call,
+            });
+            temps.push((name, is_slice));
+            self.uses_rc = true;
+        }
     }
 
     fn holds_rc(&self, ty: &Ty) -> bool {

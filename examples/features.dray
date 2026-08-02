@@ -30,7 +30,7 @@ sum_squares :: proc(n: int32) -> int32 {
 main :: proc() -> int32 {
     // Heap array use
     squares := sum_squares(6);
-    printf(cast(*cchar) "sum of first 6 squares = %d\n".ptr, squares);
+    printf(c"sum of first 6 squares = %d\n", squares);
 
     // RC & weak references: a parent owns a child that points weakly back,
     // so there is no reference cycle to leak.
@@ -38,16 +38,16 @@ main :: proc() -> int32 {
     p := alloc Parent{ id: 42, child: c };
     c.parent = p.downgrade();
 
-    printf(cast(*cchar) "live allocations while linked = %lld\n".ptr, rc_live());
+    printf(c"live allocations while linked = %lld\n", rc_live());
 
     // Upgrading a weak reference yields a Maybe: Some if the parent is alive
     reached := 0;
     switch c.parent.upgrade() {
     case Maybe.Some(up):
-        printf(cast(*cchar) "child reached parent %d\n".ptr, up.id);
+        printf(c"child reached parent %d\n", up.id);
         reached = up.id;
     case Maybe.None:
-        printf(cast(*cchar) "parent already gone\n".ptr);
+        printf(c"parent already gone\n");
     }
 
     return squares + reached;
