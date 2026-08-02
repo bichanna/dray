@@ -192,6 +192,7 @@ pub fn expr(e: &Expr) -> String {
         ExprKind::Int(v) => v.to_string(),
         ExprKind::Float(v) => v.to_string(),
         ExprKind::Str(s) => format!("{s:?}"),
+        ExprKind::CStr(s) => format!("c{s:?}"),
         ExprKind::Char(c) => format!("'{c}'"),
         ExprKind::Bool(b) => b.to_string(),
         ExprKind::Name { def, name } => format!("{name}#{}", def.0),

@@ -588,6 +588,7 @@ fn each_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
+        | ExprKind::CStr(_)
         | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::SizeOf(_)
@@ -667,6 +668,7 @@ fn each_ty_in_expr(e: &mut Expr, f: &mut impl FnMut(&mut Ty)) {
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
+        | ExprKind::CStr(_)
         | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::Name { .. }

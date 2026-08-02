@@ -1407,6 +1407,10 @@ impl Lowerer {
                     signed: false,
                 })),
             ),
+            SyntaxKind::CStringLit => {
+                let inner = text.strip_prefix('c').unwrap_or(text);
+                (ExprKind::CStr(unquote(inner)), Ty::Ptr(Box::new(Ty::CChar)))
+            }
             SyntaxKind::RuneLit => match decode_rune(text) {
                 Ok(c) => (ExprKind::Char(c), Ty::i8()),
                 Err(m) => {
@@ -2650,12 +2654,17 @@ impl Lowerer {
             | Ty::Rc(inner)
             | Ty::Weak(inner)
             | Ty::Array(inner, _)
-            | Ty::Slice(inner) => self.check_type(inner, type_params, span),
+            | Ty::Slice(inner) => {
+                if matches!(**inner, Ty::CChar) {
+                    return;
+                }
+                self.check_type(inner, type_params, span);
+            }
             Ty::CChar => {
                 if !self.in_extern {
                     self.err(
                         span,
-                        "`cchar` is only for the C boundary: an `extern` signature or a `cast`; use `int8` elsewhere",
+                        "`cchar` is only for the C boundary: an `extern` signature, a `cast`, or as the element of a pointer/array/slice (a C string); use `int8` elsewhere",
                     );
                 }
             }

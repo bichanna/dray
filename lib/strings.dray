@@ -62,13 +62,13 @@ pub equals :: proc[s: String](other: String) -> bool {
 
 // A NUL-terminated heap copy, for C APIs that expect `char *`. Pass its `.ptr`.
 // This is the safe boundary: a String is not NUL-terminated on its own.
-pub to_c_str :: proc[s: String]() -> @[]uint8 {
-    buf := alloc [s.length + 1]uint8;
+pub to_c_str :: proc[s: String]() -> @[]cchar {
+    buf := alloc [s.length + 1]cchar;
     i := 0;
     for i < s.length {
-        buf[i] = s.data[i];
+        buf[i] = cast(cchar) s.data[i];
         i += 1;
     }
-    buf[s.length] = 0;
+    buf[s.length] = cast(cchar) 0;
     return buf;
 }

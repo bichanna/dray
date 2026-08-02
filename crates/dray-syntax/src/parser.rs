@@ -1114,6 +1114,7 @@ impl<'a> Parser<'a> {
             TokenKind::IntLit
             | TokenKind::FloatLit
             | TokenKind::StringLit
+            | TokenKind::CStringLit
             | TokenKind::RuneLit
             | TokenKind::KwTrue
             | TokenKind::KwFalse => {

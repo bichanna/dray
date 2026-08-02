@@ -207,6 +207,7 @@ pub enum ExprKind {
     Int(i64),
     Float(f64),
     Str(String),
+    CStr(String),
     Char(char),
     Bool(bool),
     /// A resolved reference to a definition (var/param/proc/extern).

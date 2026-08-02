@@ -1656,3 +1656,35 @@ fn e2e_a_string_literal_keeps_its_bytes_past_an_interior_nul() {
         assert_eq!(code, 100); // 'd'
     }
 }
+
+#[test]
+fn a_c_string_literal_is_a_real_c_string() {
+    let out = c(
+        "printf :: extern \"printf\" proc(fmt: *cchar, ...) -> int32;\n\
+                 main :: proc() -> int32 {\n    printf(c\"hi\\n\");\n    return 0;\n}\n",
+    );
+    assert!(
+        out.contains("\"hi\\n\""),
+        "expected a C string literal: {out}"
+    );
+}
+
+#[test]
+fn e2e_a_c_string_literal_prints() {
+    let out = c(
+        "printf :: extern \"printf\" proc(fmt: *cchar, ...) -> int32;\n\
+                 main :: proc() -> int32 {\n    printf(c\"ok\\n\");\n    return 7;\n}\n",
+    );
+    if let Some(code) = compile_and_run(&out) {
+        assert_eq!(code, 7);
+    }
+}
+
+#[test]
+fn a_plain_string_literal_has_no_trailing_nul() {
+    let out = c("main :: proc() -> int32 {\n    s := \"hi\";\n    return s.len;\n}\n");
+    assert!(
+        out.contains("dray_str_0[] = { 104, 105 }"),
+        "expected exact bytes: {out}"
+    );
+}

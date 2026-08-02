@@ -13,6 +13,7 @@ pub enum SyntaxKind {
     IntLit,
     FloatLit,
     StringLit,
+    CStringLit,
     RuneLit,
     // Identifiers / keywords
     Ident,
@@ -227,6 +228,7 @@ impl SyntaxKind {
             TokenKind::IntLit => SyntaxKind::IntLit,
             TokenKind::FloatLit => SyntaxKind::FloatLit,
             TokenKind::StringLit => SyntaxKind::StringLit,
+            TokenKind::CStringLit => SyntaxKind::CStringLit,
             TokenKind::RuneLit => SyntaxKind::RuneLit,
             TokenKind::Ident => SyntaxKind::Ident,
             TokenKind::KwProc => SyntaxKind::KwProc,

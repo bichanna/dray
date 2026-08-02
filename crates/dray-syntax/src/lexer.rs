@@ -96,6 +96,11 @@ impl<'a> Lexer<'a> {
             b'"' => self.string(start),
             b'\'' => self.rune(start),
 
+            b'c' if self.peek2() == Some(b'"') => {
+                self.pos += 1; // consume the `c` prefix
+                self.c_string(start)
+            }
+
             b if is_ident_start(b) => self.ident_or_keyword(start),
             b if b.is_ascii_digit() => self.number(start),
 
@@ -166,6 +171,10 @@ impl<'a> Lexer<'a> {
     // ── strings & runes ─────────────────────────────────────────────────────
 
     fn string(&mut self, start: usize) -> Token {
+        self.string_with(start, TokenKind::StringLit)
+    }
+
+    fn string_with(&mut self, start: usize, kind: TokenKind) -> Token {
         self.pos += 1; // opening quote
         loop {
             match self.peek() {
@@ -174,7 +183,7 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'"') => {
                     self.pos += 1; // closing quote
-                    return self.tok(TokenKind::StringLit, start);
+                    return self.tok(kind, start);
                 }
                 Some(b'\\') => {
                     if let Err(e) = self.eat_escape() {
@@ -187,6 +196,10 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+    }
+
+    fn c_string(&mut self, start: usize) -> Token {
+        self.string_with(start, TokenKind::CStringLit)
     }
 
     fn rune(&mut self, start: usize) -> Token {

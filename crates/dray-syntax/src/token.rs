@@ -63,6 +63,8 @@ pub enum TokenKind {
     FloatLit,
     /// A double-quoted string literal, e.g. `"hi"`. Span includes both quotes.
     StringLit,
+    /// `c"..."` a NUL-terminated C string literal, typed `*cchar`
+    CStringLit,
     /// A single-quoted rune literal, e.g. `'a'`. Span includes both quotes.
     RuneLit,
 

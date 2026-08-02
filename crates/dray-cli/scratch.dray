@@ -1,0 +1,17 @@
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+s :: import("strings");
+
+main :: proc() -> int32 {
+    hello := s.from("Hello");
+    world := s.from(", world!");
+    msg := hello.concat(world);
+
+    printf(c"msg: '%s'\n", msg.to_c_str().ptr);
+    printf(c"length = %d\n", msg.len());
+
+    if hello.equals(s.from("Hello")) {
+        printf(c"greeting matches\n");
+    }
+
+    return msg.len();
+}

@@ -417,6 +417,7 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
+        | ExprKind::CStr(_)
         | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::SizeOf(_)
@@ -591,6 +592,7 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
             )
         }
         ExprKind::Char(c) => T::Char(*c),
+        ExprKind::CStr(text) => T::new_cast(Type::ptr(lower_ty(&Ty::CChar)?), T::Str(text.clone())),
         ExprKind::Bool(b) => T::Bool(*b),
         ExprKind::Name { def, name } => T::new_ident(c_name(ir, *def, name)),
         ExprKind::Unresolved(n) => {
@@ -1082,12 +1084,20 @@ fn string_literal_globals(ir: &Ir) -> Vec<GlobalStatement> {
         .iter()
         .enumerate()
         .map(|(i, text)| {
-            let mut listed: Vec<String> = text.as_bytes().iter().map(|b| b.to_string()).collect();
-            listed.push("0".to_string());
+            let bytes = text.as_bytes();
+            let listed = if bytes.is_empty() {
+                "0".to_string()
+            } else {
+                bytes
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             GlobalStatement::Raw(format!(
                 "DRAY_UNUSED static const DrayU8 {}[] = {{ {} }};",
                 string_literal_symbol(i),
-                listed.join(", ")
+                listed
             ))
         })
         .collect()
