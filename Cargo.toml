@@ -11,6 +11,8 @@ members = [
     "tools/dray-lsp",
 ]
 
+default-members = ["crates/dray-cli"]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
