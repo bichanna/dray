@@ -170,6 +170,8 @@ pub enum Stmt {
     },
     /// strong += 1
     Retain(String),
+    /// strong += 1 on a `@[]T` value, reaching the payload through `.ptr`
+    RetainArray(String),
     /// strong -= 1, free at zero
     Release(String),
     /// strong -= 1 on a `@[]T` local reaching the payload through `.ptr`
@@ -547,10 +549,12 @@ impl Lowerer {
 
         match expr {
             Some(e) if transferred.is_some() => {
+                self.emit_field_retains(e, out);
                 self.release(&live, out);
                 out.push(Stmt::Return(Some(e.clone())));
             }
             Some(e) if !live.is_empty() => {
+                self.emit_field_retains(e, out);
                 let tmp = self.fresh_temp(e.ty.clone());
                 let name_expr = self.name_expr(&tmp, e.ty.clone(), e.span);
                 out.push(Stmt::Let {
@@ -715,7 +719,12 @@ impl Lowerer {
         if matches!(val.ty, Ty::Rc(_))
             && let ExprKind::Name { name, .. } = &val.kind
         {
-            self.emit_retain(name.clone(), out);
+            if matches!(&val.ty, Ty::Rc(inner) if matches!(&**inner, Ty::Slice(_))) {
+                self.uses_rc = true;
+                out.push(Stmt::RetainArray(name.clone()));
+            } else {
+                self.emit_retain(name.clone(), out);
+            }
         }
     }
 

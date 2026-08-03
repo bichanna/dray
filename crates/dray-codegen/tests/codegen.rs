@@ -1729,3 +1729,41 @@ fn a_non_rc_call_result_is_not_hoisted() {
         "no RC temp for a non-RC call: {out}"
     );
 }
+
+#[test]
+fn a_returned_struct_retains_its_rc_heap_slice_field() {
+    let src = "Str :: struct { data: @[]uint8, len: int32 }\n\
+               build :: proc() -> Str {\n\
+                   buf := alloc [3]uint8;\n\
+                   return Str{ data: buf, len: 3 };\n\
+               }\n\
+               main :: proc() -> int32 {\n    s := build();\n    return s.len;\n}\n";
+    let out = c(src);
+    // Retain through `.ptr` (heap slice), matching the release of the local.
+    assert!(
+        out.contains("dray_rc_retain(buf.ptr)"),
+        "heap-slice field should be retained through .ptr: {out}"
+    );
+    if let Some(code) = compile_and_run(&out) {
+        assert_eq!(code, 3);
+    }
+}
+
+#[test]
+fn a_returned_struct_retains_its_plain_rc_field() {
+    let src = "Node :: struct { v: int32 }\n\
+               Wrap :: struct { node: @Node }\n\
+               build :: proc() -> Wrap {\n\
+                   n := alloc Node{ v: 9 };\n\
+                   return Wrap{ node: n };\n\
+               }\n\
+               main :: proc() -> int32 {\n    w := build();\n    return w.node.v;\n}\n";
+    let out = c(src);
+    assert!(
+        out.contains("dray_rc_retain(n)"),
+        "plain @T field should be retained directly: {out}"
+    );
+    if let Some(code) = compile_and_run(&out) {
+        assert_eq!(code, 9);
+    }
+}

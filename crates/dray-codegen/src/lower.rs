@@ -321,6 +321,13 @@ fn lower_stmt(ir: &Ir, s: &Stmt) -> Result<tamago::Statement> {
             ))
         }
         Stmt::Retain(name) => Statement::Expr(rc_call("dray_rc_retain", name)),
+        Stmt::RetainArray(name) => Statement::Expr(tamago::Expr::new_fn_call(
+            tamago::Expr::new_ident_with_str("dray_rc_retain"),
+            vec![tamago::Expr::new_mem_access(
+                tamago::Expr::new_ident(c_ident(name)),
+                "ptr".to_string(),
+            )],
+        )),
         Stmt::Release(name) | Stmt::Free(name) => Statement::Expr(rc_call("dray_rc_release", name)),
         Stmt::ReleaseArray(name) => Statement::Expr(tamago::Expr::new_fn_call(
             tamago::Expr::new_ident_with_str("dray_rc_release"),
@@ -351,6 +358,7 @@ fn stmt_uses_name(s: &Stmt, name: &str) -> bool {
         Stmt::Located { stmt, .. } => stmt_uses_name(stmt, name),
         Stmt::DropValue { name: n, .. } => n == name,
         Stmt::Retain(n)
+        | Stmt::RetainArray(n)
         | Stmt::ReleaseArray(n)
         | Stmt::Release(n)
         | Stmt::Free(n)

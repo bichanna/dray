@@ -171,6 +171,7 @@ fn dump_stmt(s: &Stmt, depth: usize, out: &mut String) {
         }
         // The RC ops the pass inserted — the whole reason this dump exists.
         Stmt::Retain(n) => out.push_str(&format!("{pad}retain {n}\n")),
+        Stmt::RetainArray(n) => out.push_str(&format!("{pad}retain_array {n}\n")),
         Stmt::Release(n) => out.push_str(&format!("{pad}release {n}\n")),
         Stmt::ReleaseArray(n) => out.push_str(&format!("{pad}release_array {n}\n")),
         Stmt::WeakRetain(n) => out.push_str(&format!("{pad}weak_retain {n}\n")),
