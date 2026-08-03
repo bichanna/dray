@@ -295,6 +295,10 @@ pub fn ty(t: &Ty) -> String {
         Ty::Slice(elem) => format!("[]{}", ty(elem)),
         Ty::Rc(inner) => format!("@{}", ty(inner)),
         Ty::Weak(inner) => format!("Weak(@{})", ty(inner)),
+        Ty::Proc { params, ret } => {
+            let ps: Vec<String> = params.iter().map(ty).collect();
+            format!("proc({}) -> {}", ps.join(", "), ty(ret))
+        }
         Ty::Named(n) => n.clone(),
         Ty::App(n, args) => {
             let a: Vec<String> = args.iter().map(ty).collect();

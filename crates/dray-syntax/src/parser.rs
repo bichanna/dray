@@ -440,6 +440,21 @@ impl<'a> Parser<'a> {
     }
 
     /// `identifier "::" proc ( ParamList ) [ "->" Type ] Block`
+    fn proc_lit(&mut self) {
+        self.start(SyntaxKind::ProcLit);
+        self.expect(TokenKind::KwProc, "'proc'");
+        self.param_list();
+        if self.at(TokenKind::Arrow) {
+            self.ret_type();
+        }
+        if self.at(TokenKind::LBrace) {
+            self.block();
+        } else {
+            self.error_at(self.cur_span(), "expected '{' to begin the proc body");
+        }
+        self.finish_node();
+    }
+
     fn proc_def(&mut self) {
         self.start(SyntaxKind::ProcDef);
         self.eat(TokenKind::KwPub);
@@ -494,6 +509,21 @@ impl<'a> Parser<'a> {
             if self.at(TokenKind::RParen) {
                 let span = self.cur_span();
                 self.error_at(span, "expected a parameter after `,`");
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "')'");
+        self.finish_node();
+    }
+
+    fn proc_type_params(&mut self) {
+        self.start(SyntaxKind::ParamList);
+        self.expect(TokenKind::LParen, "'('");
+        while !self.at(TokenKind::RParen) && !self.at_eof() {
+            self.start(SyntaxKind::Param);
+            self.type_ref();
+            self.finish_node();
+            if !self.eat(TokenKind::Comma) {
                 break;
             }
         }
@@ -566,6 +596,15 @@ impl<'a> Parser<'a> {
     /// Proc types and variadic types are deferred.
     fn type_ref(&mut self) {
         match self.peek() {
+            TokenKind::KwProc => {
+                self.start(SyntaxKind::ProcType);
+                self.bump(); // proc
+                self.proc_type_params();
+                if self.at(TokenKind::Arrow) {
+                    self.ret_type();
+                }
+                self.finish_node();
+            }
             TokenKind::Star => {
                 self.start(SyntaxKind::PointerType);
                 self.bump();
@@ -1128,6 +1167,7 @@ impl<'a> Parser<'a> {
                 self.finish_node();
             }
             TokenKind::KwAlloc | TokenKind::KwTryAlloc => self.alloc_expr(),
+            TokenKind::KwProc => self.proc_lit(),
             TokenKind::LBracket => {
                 self.start(SyntaxKind::CompositeLit);
                 self.type_ref();

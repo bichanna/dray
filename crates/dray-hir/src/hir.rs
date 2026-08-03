@@ -377,6 +377,10 @@ pub enum Ty {
     Slice(Box<Ty>),
     Named(String),
     App(String, Vec<Ty>),
+    Proc {
+        params: Vec<Ty>,
+        ret: Box<Ty>,
+    },
     Infer,
 }
 

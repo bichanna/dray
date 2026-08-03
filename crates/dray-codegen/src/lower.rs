@@ -865,6 +865,10 @@ fn lower_ty(t: &Ty) -> Result<Type> {
         Ty::Named(n) => Type::base(B::Struct(n.clone())),
         Ty::Array(elem, n) => Type::array(lower_ty(elem)?, Some(tamago::Expr::Int(*n as i64))),
         Ty::Slice(elem) => Type::base(B::Struct(slice_struct_name(elem))),
+        Ty::Proc { params, ret } => {
+            let cparams = params.iter().map(lower_ty).collect::<Result<Vec<_>>>()?;
+            Type::ptr(Type::func(lower_ty(ret)?, cparams, false))
+        }
         Ty::App(name, _) => {
             return Err(CodegenError::new(format!(
                 "internal: un-monomorphized generic `{name}` reached codegen"
@@ -1616,6 +1620,10 @@ fn mangle_c_ty(ty: &Ty) -> String {
         Ty::Weak(inner) => format!("weak_{}", mangle_c_ty(inner)),
         Ty::Array(elem, n) => format!("arr{n}_{}", mangle_c_ty(elem)),
         Ty::Slice(elem) => format!("slice_{}", mangle_c_ty(elem)),
+        Ty::Proc { params, ret } => {
+            let ps: Vec<String> = params.iter().map(mangle_c_ty).collect();
+            format!("proc_{}_ret_{}", ps.join("_"), mangle_c_ty(ret))
+        }
         // Generics are gone by codegen and `Infer` never reaches a real type.
         Ty::App(..) | Ty::Infer => "unknown".to_string(),
     }

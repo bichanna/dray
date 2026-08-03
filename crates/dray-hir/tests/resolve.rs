@@ -1713,3 +1713,68 @@ fn a_local_from_a_nested_block_is_not_visible_outside_it() {
         "y should be out of scope after the block: {errs:?}"
     );
 }
+
+#[test]
+fn an_anonymous_proc_cannot_capture_a_local() {
+    let errs = resolve_errors(
+        "f :: proc() -> int32 {\n    y := 10;\n    g := proc() -> int32 { return y; };\n    return g();\n}\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("capture") && m.contains('y')),
+        "capturing a local must error: {errs:?}"
+    );
+}
+
+#[test]
+fn an_anonymous_proc_cannot_capture_a_parameter() {
+    let errs = resolve_errors(
+        "f :: proc(p: int32) -> int32 {\n    g := proc() -> int32 { return p; };\n    return g();\n}\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("capture") && m.contains('p')),
+        "capturing a parameter must error: {errs:?}"
+    );
+}
+
+#[test]
+fn an_anonymous_proc_may_reference_a_top_level_proc() {
+    let errs = resolve_errors(
+        "helper :: proc(x: int32) -> int32 { return x; }\n\
+         f :: proc() -> int32 {\n    g := proc(n: int32) -> int32 { return helper(n); };\n    return g(1);\n}\n",
+    );
+    assert!(
+        errs.is_empty(),
+        "referencing a top-level proc is fine: {errs:?}"
+    );
+}
+
+#[test]
+fn an_anonymous_proc_may_use_its_own_locals_and_params() {
+    let errs = resolve_errors(
+        "f :: proc() -> int32 {\n    g := proc(n: int32) -> int32 { m := n + 1; return m; };\n    return g(1);\n}\n",
+    );
+    assert!(errs.is_empty(), "own locals/params are fine: {errs:?}");
+}
+
+#[test]
+fn an_if_init_binding_is_visible_in_both_branches() {
+    let errs = resolve_errors(
+        "f :: proc() -> int32 {\n    if x := 1; x > 0 {\n        return x;\n    } else {\n        return x + 1;\n    }\n}\n",
+    );
+    assert!(
+        errs.is_empty(),
+        "if-init binding visible in both branches: {errs:?}"
+    );
+}
+
+#[test]
+fn an_if_init_binding_is_not_visible_after_the_if() {
+    let errs =
+        resolve_errors("f :: proc() -> int32 {\n    if x := 1; x > 0 {\n    }\n    return x;\n}\n");
+    assert!(
+        errs.iter().any(|m| m.contains('x')),
+        "if-init binding must not leak past the if: {errs:?}"
+    );
+}

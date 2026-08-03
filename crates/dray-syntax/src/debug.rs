@@ -344,6 +344,7 @@ pub fn kind_name(kind: SyntaxKind) -> &'static str {
         // node kinds → nonterminal names
         SyntaxKind::SourceFile => "SourceFile",
         SyntaxKind::ProcDef => "ProcDef",
+        SyntaxKind::ProcLit => "ProcLit",
         SyntaxKind::CHeaderDecl => "CHeaderDecl",
         SyntaxKind::ImportDecl => "ImportDecl",
         SyntaxKind::ImportOnly => "ImportOnly",
@@ -372,6 +373,7 @@ pub fn kind_name(kind: SyntaxKind) -> &'static str {
         SyntaxKind::ContinueStmt => "ContinueStmt",
         SyntaxKind::ExprStmt => "ExprStmt",
         SyntaxKind::PointerType => "PointerType",
+        SyntaxKind::ProcType => "ProcType",
         SyntaxKind::RcPointerType => "RcPointerType",
         SyntaxKind::SliceType => "SliceType",
         SyntaxKind::ArrayType => "ArrayType",

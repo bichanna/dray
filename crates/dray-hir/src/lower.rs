@@ -102,6 +102,8 @@ struct Lowerer {
     variadic_procs: HashSet<String>,
     /// The declared return type of the proc being lowered, to check `return`.
     current_ret: Ty,
+    /// Scope depths at which an enclosing proc literal begins
+    proc_lit_boundaries: Vec<usize>,
     /// Counter for compiler-generated local names.
     temp: u32,
     /// True while lowering an `extern` declaration, where `cchar` is allowed
@@ -180,6 +182,7 @@ impl Lowerer {
             variadic_procs: HashSet::new(),
             proc_param_types: HashMap::new(),
             current_ret: Ty::Void,
+            proc_lit_boundaries: Vec::new(),
             temp: 0,
             in_extern: false,
             zeroing: Vec::new(),
@@ -502,6 +505,34 @@ impl Lowerer {
         self.resolve_module_name(name)
     }
 
+    fn resolve_with_scope(&self, name: &str) -> Option<(DefId, Option<usize>)> {
+        for (i, scope) in self.scopes.iter().enumerate().skip(1).rev() {
+            if let Some(&id) = scope.names.get(name) {
+                return Some((id, Some(i)));
+            }
+        }
+        self.resolve_module_name(name).map(|id| (id, None))
+    }
+
+    fn capture_is_allowed(&self, def: DefId, found_scope: Option<usize>) -> bool {
+        let Some(&boundary) = self.proc_lit_boundaries.last() else {
+            return true; // not inside a proc literal
+        };
+
+        let Some(scope) = found_scope else {
+            return true; // a module/global name
+        };
+
+        if scope >= boundary {
+            return true; // declared inside the proc literal itself
+        }
+
+        !matches!(
+            self.defs[def.0 as usize].kind,
+            DefKind::Local | DefKind::Param
+        )
+    }
+
     /// Look a name up in the module namespace, honouring cross-file visibility:
     /// a candidate from the current file always wins. Otherwise, it must be both
     /// `pub` and brought into scope by one of this file's imports
@@ -587,6 +618,62 @@ impl Lowerer {
             body,
             file: self.current_file,
         }));
+    }
+
+    fn lower_proc_lit(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
+        let name = self.fresh_name("anon_proc");
+        let ret = self.return_type(node);
+
+        // Reserve the def now so the returned reference points at it. Its type is
+        // the proc's own signature, filled in once params are known.
+        let def = self.add_def(name.clone(), DefKind::Proc, Ty::Infer);
+
+        // Save and reset per-proc state (a proc literal is its own function).
+        let saved_ret = std::mem::replace(&mut self.current_ret, ret.clone());
+        let saved_type_params = std::mem::take(&mut self.type_params_in_scope);
+
+        self.push_scope();
+        // The boundary is the scope index the proc literal's own locals live in;
+        // anything found below it must be a compile-time definition.
+        self.proc_lit_boundaries.push(self.scopes.len() - 1);
+
+        let params = self.lower_params(node);
+        let body = match node.child_of_kind(SyntaxKind::Block) {
+            Some(b) => {
+                let errors_before = self.errors.len();
+                let body = self.lower_block(&b);
+                self.check_definite_return(&name, &ret, &body, errors_before, closing_brace(&b));
+                body
+            }
+            None => {
+                self.err(node.span(), "an anonymous proc needs a body");
+                Vec::new()
+            }
+        };
+
+        self.proc_lit_boundaries.pop();
+        self.pop_scope();
+        self.current_ret = saved_ret;
+        self.type_params_in_scope = saved_type_params;
+
+        let proc_ty = Ty::Proc {
+            params: params.iter().map(|p| p.ty.clone()).collect(),
+            ret: Box::new(ret.clone()),
+        };
+        self.defs[def.0 as usize].ty = proc_ty.clone();
+
+        self.items.push(Item::Proc(Proc {
+            def,
+            name: name.clone(),
+            receiver: None,
+            type_params: Vec::new(),
+            params,
+            ret,
+            body,
+            file: self.current_file,
+        }));
+
+        (ExprKind::Name { def, name }, proc_ty)
     }
 
     /// Lower the receiver clause into a `Param`, binding its name in the current
@@ -1056,10 +1143,30 @@ impl Lowerer {
     }
 
     fn lower_if(&mut self, node: &SyntaxNode) -> Option<Stmt> {
-        if node.child_of_kind(SyntaxKind::VarDecl).is_some() {
-            self.err(node.span(), "if-init clauses are not lowered yet");
-            return None;
+        // An if-init clause (`if x := e; cond { ... }`) binds `x` for the
+        // condition and both branches, but not after the `if`. Lower it to a
+        // scoped block holding the init statement followed by the plain `if`, so
+        // the binding's scope is exactly the `if` and its branches.
+        if let Some(init_node) = node.child_of_kind(SyntaxKind::VarDecl) {
+            self.push_scope();
+            let init = self.lower_var_decl(&init_node);
+            let inner = self.lower_if_without_init(node);
+            self.pop_scope();
+            let mut body = Vec::new();
+            if let Some(init) = init {
+                body.push(init);
+            }
+            if let Some(inner) = inner {
+                body.push(inner);
+            }
+            return Some(Stmt::ScopedBlock(body));
         }
+        self.lower_if_without_init(node)
+    }
+
+    /// The plain `if cond { ... } else { ... }` lowering, shared by both the
+    /// bare form and the if-init form (which handles its own init/scope).
+    fn lower_if_without_init(&mut self, node: &SyntaxNode) -> Option<Stmt> {
         let cond = self.condition(node)?;
         let then_branch = node
             .child_of_kind(SyntaxKind::Block)
@@ -1364,6 +1471,7 @@ impl Lowerer {
             SyntaxKind::SliceExpr => self.lower_slice_expr(node),
             SyntaxKind::CastExpr => self.lower_cast(node),
             SyntaxKind::AllocExpr => self.lower_alloc(node),
+            SyntaxKind::ProcLit => self.lower_proc_lit(node),
             SyntaxKind::CompositeLit => self.lower_struct_lit(node, None),
             other => {
                 self.err(span, format!("unsupported expression {other:?}"));
@@ -1426,8 +1534,18 @@ impl Lowerer {
 
     fn lower_name(&mut self, node: &SyntaxNode) -> (ExprKind, Ty) {
         let name = ident_text(node);
-        match self.resolve(&name) {
-            Some(def) => {
+        match self.resolve_with_scope(&name) {
+            Some((def, found_scope)) => {
+                if !self.capture_is_allowed(def, found_scope) {
+                    self.err(
+                        node.span(),
+                        format!(
+                            "an anonymous proc cannot capture `{name}` from the enclosing scope; \
+                             it captures no runtime state (only top-level procs and constants are in scope)"
+                        ),
+                    );
+                    return (ExprKind::Unresolved(name), Ty::Infer);
+                }
                 let ty = self.defs[def.0 as usize].ty.clone();
                 (ExprKind::Name { def, name }, ty)
             }
@@ -1662,7 +1780,13 @@ impl Lowerer {
             );
         }
         self.check_call_args(&callee, &args, node);
-        let ty = callee.ty.clone();
+        // For a proc-typed *value* (a function pointer, e.g. a parameter of proc
+        // type), the call result is the proc's return type. Named procs store
+        // their return type directly as their def type, so those pass through.
+        let ty = match &callee.ty {
+            Ty::Proc { ret, .. } => (**ret).clone(),
+            other => other.clone(),
+        };
         (
             ExprKind::Call {
                 callee: Box::new(callee),
@@ -2668,6 +2792,12 @@ impl Lowerer {
                     );
                 }
             }
+            Ty::Proc { params, ret } => {
+                for p in params {
+                    self.check_type(p, type_params, span);
+                }
+                self.check_type(ret, type_params, span);
+            }
             Ty::Void | Ty::Bool | Ty::Int { .. } | Ty::Float { .. } | Ty::Infer => {}
         }
     }
@@ -3343,6 +3473,16 @@ impl Lowerer {
                 return self.zero_aggregate(ty, n, span, struct_name, field);
             }
             Ty::Array(..) | Ty::Slice(_) | Ty::Weak(_) => ExprKind::ZeroValue(ty.clone()),
+            Ty::Proc { .. } => {
+                self.err(
+                    span,
+                    format!(
+                        "field `{field}` of `{struct_name}` is a proc and has no zero value, \
+                         so it must be given"
+                    ),
+                );
+                return None;
+            }
             Ty::Void | Ty::Infer => {
                 self.err(
                     span,
@@ -3604,6 +3744,10 @@ fn type_name(ty: &Ty) -> String {
         Ty::Slice(elem) => format!("[]{}", type_name(elem)),
         Ty::Rc(inner) => format!("@{}", type_name(inner)),
         Ty::Weak(inner) => format!("Weak(@{})", type_name(inner)),
+        Ty::Proc { params, ret } => {
+            let ps: Vec<String> = params.iter().map(type_name).collect();
+            format!("proc({}) -> {}", ps.join(", "), type_name(ret))
+        }
         Ty::Infer => "?".to_string(),
     }
 }
@@ -3630,6 +3774,7 @@ fn is_expr(kind: SyntaxKind) -> bool {
             | SyntaxKind::CastExpr
             | SyntaxKind::AllocExpr
             | SyntaxKind::CompositeLit
+            | SyntaxKind::ProcLit
     )
 }
 
@@ -3893,6 +4038,10 @@ fn receiver_type_key(ty: &Ty) -> String {
         Ty::Bool => "bool".to_string(),
         Ty::CChar => "cchar".to_string(),
         Ty::Void => "void".to_string(),
+        Ty::Proc { params, ret } => {
+            let ps: Vec<String> = params.iter().map(receiver_type_key).collect();
+            format!("proc_{}_ret_{}", ps.join("_"), receiver_type_key(ret))
+        }
         Ty::Infer => "infer".to_string(),
     }
 }

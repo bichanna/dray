@@ -70,6 +70,28 @@ pub(crate) fn lower_type(node: &SyntaxNode) -> Option<Ty> {
                 Some(Ty::App(name, args))
             }
         }
+        SyntaxKind::ProcType => {
+            let params: Vec<Ty> = node
+                .child_of_kind(SyntaxKind::ParamList)
+                .map(|pl| {
+                    pl.children()
+                        .into_iter()
+                        .filter(|c| c.kind() == SyntaxKind::Param)
+                        .filter_map(|p| p.children().into_iter().find(|c| is_type(c.kind())))
+                        .filter_map(|t| lower_type(&t))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ret = node
+                .child_of_kind(SyntaxKind::RetType)
+                .and_then(|rt| rt.children().into_iter().find(|c| is_type(c.kind())))
+                .and_then(|t| lower_type(&t))
+                .unwrap_or(Ty::Void);
+            Some(Ty::Proc {
+                params,
+                ret: Box::new(ret),
+            })
+        }
         _ => None,
     }
 }
@@ -94,6 +116,7 @@ pub(crate) fn is_type(kind: SyntaxKind) -> bool {
             | SyntaxKind::ArrayType
             | SyntaxKind::GenericType
             | SyntaxKind::QualifiedType
+            | SyntaxKind::ProcType
     )
 }
 

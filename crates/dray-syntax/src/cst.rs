@@ -103,6 +103,7 @@ pub enum SyntaxKind {
     SourceFile,
     /// `[ "pub" ] identifier "::" ConstExpr` for the proc case.
     ProcDef,
+    ProcLit,
     /// `c_header ( string_lit ) ;`
     CHeaderDecl,
     /// `[ "pub" ] ident "::" import ( string_lit ) [ ImportOnly ] ";"`
@@ -170,6 +171,7 @@ pub enum SyntaxKind {
     // types
     /// `*Type`
     PointerType,
+    ProcType,
     /// `@Type`
     RcPointerType,
     /// `[]Type`

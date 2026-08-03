@@ -6,7 +6,7 @@ main :: proc() -> int32 {
     world := s.from(", world!");
     msg := hello.concat(world);
 
-    printf(c"msg: '%s'\n", cast(*cchar) msg.to_c_str().ptr);
+    printf(c"msg: '%s'\n", msg.to_c_str().ptr);
     printf(c"length = %d\n", msg.len());
 
     if hello.equals(s.from("Hello")) {

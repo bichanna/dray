@@ -1,0 +1,49 @@
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+
+fold :: proc(xs: @[]int32, init: int32, op: proc(int32, int32) -> int32) -> int32 {
+    acc := init;
+    for x in xs {
+        acc = op(acc, x);
+    }
+    return acc;
+}
+
+classify :: proc(n: int32) -> int32 {
+    if n < 0 {
+        return 0;   // negative
+    } else if n == 0 {
+        return 1;   // zero
+    }
+    return 2;       // positive
+}
+
+main :: proc() -> int32 {
+    nums := alloc [4]int32;
+    nums[0] = 3;
+    nums[1] = 1;
+    nums[2] = 4;
+    nums[3] = 1;
+
+    // Anonymous procs passed inline. No name, no capture, hoisted to C
+    // functions behind the scenes
+    sum := fold(nums, 0, proc(a: int32, b: int32) -> int32 { return a + b; });
+    max := fold(nums, nums[0], proc(a: int32, b: int32) -> int32 {
+        if a > b {
+            return a;
+        }
+        return b;
+    });
+
+    printf(c"sum = %d\n", sum);
+    printf(c"max = %d\n", max);
+
+    if tag := classify(sum - 9); tag == 1 {
+        printf(c"sum - 9 is zero\n");
+    } else if tag == 2 {
+        printf(c"sum - 9 is positive\n");
+    } else {
+        printf(c"sum - 9 is negative\n");
+    }
+
+    return sum + max;
+}

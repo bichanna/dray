@@ -1767,3 +1767,40 @@ fn a_returned_struct_retains_its_plain_rc_field() {
         assert_eq!(code, 9);
     }
 }
+
+#[test]
+fn e2e_an_anonymous_proc_can_be_called() {
+    let src = "main :: proc() -> int32 {\n\
+                   inc := proc(n: int32) -> int32 { return n + 1; };\n\
+                   return inc(5);\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 6);
+    }
+}
+
+#[test]
+fn an_anonymous_proc_hoists_to_a_file_scope_function() {
+    let out = c("main :: proc() -> int32 {\n\
+                     inc := proc(n: int32) -> int32 { return n + 1; };\n\
+                     return inc(0);\n\
+                 }\n");
+    assert!(out.contains("__dray_anon_proc"), "should hoist: {out}");
+    assert!(
+        out.contains("(*inc)(DrayI32)"),
+        "inc is a function pointer: {out}"
+    );
+}
+
+#[test]
+fn e2e_an_anonymous_proc_passed_to_a_higher_order_proc() {
+    let src = "apply :: proc(f: proc(int32) -> int32, x: int32) -> int32 {\n\
+                   return f(x);\n\
+               }\n\
+               main :: proc() -> int32 {\n\
+                   return apply(proc(n: int32) -> int32 { return n + 1; }, 5);\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 6);
+    }
+}

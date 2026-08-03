@@ -349,6 +349,10 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::Slice(elem) => format!("slice_{}", mangle_ty(elem)),
         Ty::Named(n) => n.clone(),
         Ty::App(n, args) => mangle(n, args),
+        Ty::Proc { params, ret } => {
+            let ps: Vec<String> = params.iter().map(mangle_ty).collect();
+            format!("proc_{}_ret_{}", ps.join("_"), mangle_ty(ret))
+        }
         Ty::Infer => "infer".to_string(),
     }
 }
