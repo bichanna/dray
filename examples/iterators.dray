@@ -1,0 +1,38 @@
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+
+Range :: struct { lo: int32, hi: int32 }
+RangeIter :: struct { cur: int32, hi: int32 }
+
+iterator :: proc[r: Range]() -> @RangeIter {
+    return alloc RangeIter{ cur: r.lo, hi: r.hi };
+}
+
+next :: proc[it: @RangeIter]() -> Maybe(int32) {
+    if it.cur < it.hi {
+        v := it.cur;
+        it.cur += 1;
+        return Maybe(int32).Some(v);
+    }
+
+    return Maybe(int32).None;
+}
+
+main :: proc() -> int32 {
+    total := 0;
+
+    // for-in over a custom type: desugars to iterator()/next() with Maybe
+    r := Range{ lo: 1, hi: 6 };
+    for x in r {
+        printf(c"x = %d\n", x);
+        total += x;
+    }
+
+    for i := 0; i < total {
+        i += 7;
+        if i > total {
+            printf(c"crossed %d at i = %d\n", total, i);
+        }
+    }
+
+    return total;   // 1+2+3+4+5 = 15
+}

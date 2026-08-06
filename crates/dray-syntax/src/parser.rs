@@ -920,12 +920,13 @@ impl<'a> Parser<'a> {
             if !self.at(TokenKind::Semi) {
                 self.simple_stmt(false); // init
             }
+
             self.expect(TokenKind::Semi, "';' after the for-init");
-            if !self.at(TokenKind::Semi) {
+            if !self.at(TokenKind::Semi) && !self.at(TokenKind::LBrace) {
                 self.condition(); // condition (lenient: may be empty)
             }
-            self.expect(TokenKind::Semi, "';' after the for-condition");
-            if !self.at(TokenKind::LBrace) {
+
+            if self.eat(TokenKind::Semi) && !self.at(TokenKind::LBrace) {
                 self.simple_stmt(false); // post
             }
         } else {
@@ -973,6 +974,8 @@ impl<'a> Parser<'a> {
         let mut i = self.pos;
         let mut paren = 0i32;
         let mut brack = 0i32;
+        let mut brace = 0i32;
+        let mut seen_assign = false;
         while let Some(tok) = self.tokens.get(i) {
             if tok.is_trivia() || matches!(tok.kind, TokenKind::Error(_)) {
                 i += 1;
@@ -983,8 +986,21 @@ impl<'a> Parser<'a> {
                 TokenKind::RParen => paren -= 1,
                 TokenKind::LBracket => brack += 1,
                 TokenKind::RBracket => brack -= 1,
-                TokenKind::Semi if paren <= 0 && brack <= 0 => return true,
-                TokenKind::LBrace if paren <= 0 && brack <= 0 => return false,
+                TokenKind::ColonEq | TokenKind::ColonColonEq | TokenKind::Eq
+                    if paren <= 0 && brack <= 0 && brace <= 0 =>
+                {
+                    seen_assign = true;
+                }
+                TokenKind::LBrace if paren <= 0 && brack <= 0 && brace <= 0 => {
+                    if seen_assign {
+                        brace += 1; // a struct literal brace inside the init
+                    } else {
+                        return false; // the loop body
+                    }
+                }
+                TokenKind::LBrace => brace += 1,
+                TokenKind::RBrace => brace -= 1,
+                TokenKind::Semi if paren <= 0 && brack <= 0 && brace <= 0 => return true,
                 TokenKind::Eof => return false,
                 _ => {}
             }

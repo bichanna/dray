@@ -301,16 +301,14 @@ impl Lowerer {
                     }
                 }
                 SyntaxKind::ImportDecl => {
-                    if let Some(alias) = first_ident(decl) {
-                        if let Some(&target) = self
+                    if let Some(alias) = first_ident(decl)
+                        && let Some(&target) = self
                             .modules
                             .get(self.current_file)
                             .and_then(|m| m.aliases.get(&alias))
-                        {
-                            let id =
-                                self.add_def(alias.clone(), DefKind::Module { target }, Ty::Void);
-                            self.bind_module_vis(alias, id, decl.span(), false);
-                        }
+                    {
+                        let id = self.add_def(alias.clone(), DefKind::Module { target }, Ty::Void);
+                        self.bind_module_vis(alias, id, decl.span(), false);
                     }
                 }
                 _ => {}
@@ -1208,30 +1206,14 @@ impl Lowerer {
         let sequence = self.lower_expr(&seq_node);
         let elem_ty = match &sequence.ty {
             Ty::Array(elem, _) | Ty::Slice(elem) => (**elem).clone(),
-            Ty::Rc(inner) => match &**inner {
-                Ty::Slice(elem) => (**elem).clone(),
-                _ => {
-                    self.err(
-                        seq_node.span(),
-                        format!(
-                            "only an array or slice can be iterated with `for ... in`, not `{}`",
-                            type_name(&sequence.ty)
-                        ),
-                    );
-                    return None;
-                }
-            },
-            Ty::Infer => Ty::Infer,
-            other => {
-                self.err(
-                    seq_node.span(),
-                    format!(
-                        "only an array or slice can be iterated with `for ... in`, not `{}`",
-                        type_name(other)
-                    ),
-                );
-                return None;
+            Ty::Rc(inner) if matches!(&**inner, Ty::Slice(_)) => {
+                let Ty::Slice(elem) = &**inner else {
+                    return self.lower_for_in_iterator(node, sequence, element_name, span);
+                };
+                (**elem).clone()
             }
+            Ty::Infer => Ty::Infer,
+            _ => return self.lower_for_in_iterator(node, sequence, element_name, span),
         };
 
         let needs_temp = matches!(sequence.ty, Ty::Slice(_) | Ty::Rc(_))
@@ -1368,6 +1350,166 @@ impl Lowerer {
             },
             span,
         })
+    }
+
+    /// Lower `for x in c` for a type that provides the iterator protocol:
+    ///
+    /// ```text
+    /// {
+    ///     it := c.iterator();
+    ///     done := false;
+    ///     for !done {
+    ///         switch it.next() {
+    ///         case Maybe.Some(x): <body>
+    ///         case Maybe.None:    done = true;
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    fn lower_for_in_iterator(
+        &mut self,
+        node: &SyntaxNode,
+        sequence: Expr,
+        element_name: String,
+        span: Span,
+    ) -> Option<Stmt> {
+        self.push_scope();
+
+        // it := c.iterator();
+        let Some(iter_expr) = self.build_zero_arg_method(sequence, "iterator", span) else {
+            self.err(
+                span,
+                "to iterate this with `for ... in`, it needs an `iterator()` method \
+                 returning a type with a `next() -> Maybe(T)` method",
+            );
+            self.pop_scope();
+            return None;
+        };
+        let iter_ty = iter_expr.ty.clone();
+        let iter_name = self.fresh_name("iter");
+        let iter_def = self.add_def(iter_name.clone(), DefKind::Local, iter_ty.clone());
+        self.bind_local(iter_name.clone(), iter_def);
+        let bind_iter = Stmt::Let {
+            def: iter_def,
+            name: iter_name.clone(),
+            ty: iter_ty.clone(),
+            init: iter_expr,
+        };
+        let iter_ref = Expr {
+            kind: ExprKind::Name {
+                def: iter_def,
+                name: iter_name,
+            },
+            ty: iter_ty,
+            span,
+        };
+
+        // it.next() : Maybe(T)
+        let Some(next_call) = self.build_zero_arg_method(iter_ref, "next", span) else {
+            self.err(span, "the iterator needs a `next() -> Maybe(T)` method");
+            self.pop_scope();
+            return None;
+        };
+
+        // The element type is the Maybe's type argument
+        let elem_ty = match &next_call.ty {
+            Ty::App(name, args) if name == "Maybe" && args.len() == 1 => args[0].clone(),
+            other => {
+                self.err(
+                    span,
+                    format!(
+                        "`next()` must return `Maybe(T)`, but it returns `{}`",
+                        type_name(other)
+                    ),
+                );
+                self.pop_scope();
+                return None;
+            }
+        };
+
+        // done := false;
+        let done_name = self.fresh_name("done");
+        let done_def = self.add_def(done_name.clone(), DefKind::Local, Ty::Bool);
+        self.bind_local(done_name.clone(), done_def);
+        let bind_done = Stmt::Let {
+            def: done_def,
+            name: done_name.clone(),
+            ty: Ty::Bool,
+            init: Expr {
+                kind: ExprKind::Bool(false),
+                ty: Ty::Bool,
+                span,
+            },
+        };
+        let done_ref = Expr {
+            kind: ExprKind::Name {
+                def: done_def,
+                name: done_name,
+            },
+            ty: Ty::Bool,
+            span,
+        };
+
+        // Loop condition `!done`.
+        let not_done = Expr {
+            kind: ExprKind::Unary {
+                op: UnOp::LogicNot,
+                operand: Box::new(done_ref.clone()),
+            },
+            ty: Ty::Bool,
+            span,
+        };
+
+        self.push_scope();
+        let elem_def = self.add_def(element_name.clone(), DefKind::Local, elem_ty.clone());
+        self.bind_local(element_name.clone(), elem_def);
+        let mut some_body = Vec::new();
+        if let Some(b) = node.child_of_kind(SyntaxKind::Block) {
+            some_body = self.lower_block(&b);
+        }
+        self.pop_scope();
+
+        let switch = Stmt::Switch {
+            scrutinee: next_call,
+            arms: vec![
+                Arm {
+                    pattern: Pattern::Enum {
+                        enum_name: "Maybe".to_string(),
+                        variant: "Some".to_string(),
+                        bindings: vec![element_name],
+                    },
+                    body: some_body,
+                },
+                Arm {
+                    pattern: Pattern::Enum {
+                        enum_name: "Maybe".to_string(),
+                        variant: "None".to_string(),
+                        bindings: Vec::new(),
+                    },
+                    body: vec![Stmt::Assign {
+                        target: done_ref,
+                        op: AssignOp::Assign,
+                        value: Expr {
+                            kind: ExprKind::Bool(true),
+                            ty: Ty::Bool,
+                            span,
+                        },
+                    }],
+                },
+            ],
+        };
+
+        self.pop_scope();
+        Some(Stmt::ScopedBlock(vec![
+            bind_iter,
+            bind_done,
+            Stmt::CFor {
+                init: None,
+                cond: Some(not_done),
+                post: None,
+                body: vec![switch],
+            },
+        ]))
     }
 
     fn lower_for(&mut self, node: &SyntaxNode) -> Option<Stmt> {
@@ -1750,10 +1892,9 @@ impl Lowerer {
         // ordinary expression bc `x.foo` is not a field
         if let Some(cn) = &callee_node
             && cn.kind() == SyntaxKind::FieldExpr
+            && let Some(call) = self.try_method_call(cn, node)
         {
-            if let Some(call) = self.try_method_call(cn, node) {
-                return call;
-            }
+            return call;
         }
 
         let callee = match callee_node {
@@ -1824,16 +1965,16 @@ impl Lowerer {
             }
             return (ExprKind::Unresolved(name.to_string()), Ty::Infer);
         };
-        if let Some(&arity) = self.proc_arity.get(name) {
-            if !fits_arity(args.len(), arity, self.variadic_procs.contains(name)) {
-                self.err(
-                    call_node.span(),
-                    format!(
-                        "proc `{name}` takes {arity} argument(s), but {} were given",
-                        args.len()
-                    ),
-                );
-            }
+        if let Some(&arity) = self.proc_arity.get(name)
+            && !fits_arity(args.len(), arity, self.variadic_procs.contains(name))
+        {
+            self.err(
+                call_node.span(),
+                format!(
+                    "proc `{name}` takes {arity} argument(s), but {} were given",
+                    args.len()
+                ),
+            );
         }
         let ty = self.defs[def.0 as usize].ty.clone();
         let callee = Expr {
@@ -1932,12 +2073,11 @@ impl Lowerer {
             return Some(intrinsic);
         }
 
-        if let Ty::Named(sname) = recv.ty.rc_or_ptr_inner() {
-            if let Some(fields) = self.structs.get(sname) {
-                if fields.iter().any(|f| f.name == name) {
-                    return None;
-                }
-            }
+        if let Ty::Named(sname) = recv.ty.rc_or_ptr_inner()
+            && let Some(fields) = self.structs.get(sname)
+            && fields.iter().any(|f| f.name == name)
+        {
+            return None;
         }
 
         let args = self.call_args(call_node);
@@ -1987,6 +2127,13 @@ impl Lowerer {
                 Some((ExprKind::Unresolved("method".into()), Ty::Infer))
             }
         }
+    }
+
+    fn build_zero_arg_method(&mut self, recv: Expr, name: &str, span: Span) -> Option<Expr> {
+        let key = (receiver_type_key(&recv.ty), name.to_string());
+        let info = self.methods.get(&key).cloned()?;
+        let (kind, ty) = self.build_method_call(info, recv, Vec::new(), span);
+        Some(Expr { kind, ty, span })
     }
 
     fn build_method_call(

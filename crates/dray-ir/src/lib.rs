@@ -452,13 +452,29 @@ impl Lowerer {
                 let init = init.as_ref().map(|s| Box::new(self.single(s, scopes)));
                 let post = post.as_ref().map(|s| Box::new(self.single(s, scopes)));
                 let body = self.block(body, scopes);
-                scopes.pop();
-                out.push(Stmt::CFor {
-                    init,
-                    cond: cond.clone(),
-                    post,
-                    body,
-                });
+                let scope = scopes.pop().unwrap_or_default();
+
+                if scope.is_empty() {
+                    out.push(Stmt::CFor {
+                        init,
+                        cond: cond.clone(),
+                        post,
+                        body,
+                    });
+                } else {
+                    let mut block = Vec::new();
+                    if let Some(init) = init {
+                        block.push(*init);
+                    }
+                    block.push(Stmt::CFor {
+                        init: None,
+                        cond: cond.clone(),
+                        post,
+                        body,
+                    });
+                    self.release(&scope, &mut block);
+                    out.push(Stmt::ScopedBlock(block));
+                }
             }
             H::Switch { scrutinee, arms } => {
                 // Codegen reads the tag once and each arm reads the payload

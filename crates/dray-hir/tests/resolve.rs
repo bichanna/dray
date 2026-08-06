@@ -223,16 +223,12 @@ fn for_in_over_an_array_or_slice_resolves() {
 
 #[test]
 fn for_in_over_a_non_sequence_is_an_error() {
-    // custom iterables need receiver methods, which do not exist yet, so
-    // anything that is not an array or slice is rejected for now
+    // A non-array/slice type is iterated through the iterator protocol; a type
+    // with no `iterator()` method (like `int32`) is rejected.
     let errs = resolve_errors(
         "main :: proc() -> int32 {\n    x := 5;\n    for c in x {\n        return c;\n    }\n    return 0;\n}\n",
     );
-    assert!(
-        errs.iter()
-            .any(|m| m.contains("array or slice can be iterated")),
-        "{errs:?}"
-    );
+    assert!(errs.iter().any(|m| m.contains("iterator()")), "{errs:?}");
 }
 
 #[test]
@@ -1776,5 +1772,27 @@ fn an_if_init_binding_is_not_visible_after_the_if() {
     assert!(
         errs.iter().any(|m| m.contains('x')),
         "if-init binding must not leak past the if: {errs:?}"
+    );
+}
+
+#[test]
+fn a_while_init_binding_is_visible_in_the_condition_and_body() {
+    let errs = resolve_errors(
+        "f :: proc() -> int32 {\n    for i := 0; i < 3 { i += 1; }\n    return 0;\n}\n",
+    );
+    assert!(
+        errs.is_empty(),
+        "while-init binding visible in cond/body: {errs:?}"
+    );
+}
+
+#[test]
+fn a_while_init_binding_is_not_visible_after_the_loop() {
+    let errs = resolve_errors(
+        "f :: proc() -> int32 {\n    for i := 0; i < 3 { i += 1; }\n    return i;\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains('i')),
+        "while-init binding must not leak past the loop: {errs:?}"
     );
 }

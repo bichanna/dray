@@ -1804,3 +1804,79 @@ fn e2e_an_anonymous_proc_passed_to_a_higher_order_proc() {
         assert_eq!(code, 6);
     }
 }
+
+#[test]
+fn e2e_for_in_over_a_custom_iterator() {
+    let src = "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+               Range :: struct { lo: int32, hi: int32 }\n\
+               RangeIter :: struct { cur: int32, hi: int32 }\n\
+               iterator :: proc[r: Range]() -> @RangeIter {\n\
+                   return alloc RangeIter{ cur: r.lo, hi: r.hi };\n\
+               }\n\
+               next :: proc[it: @RangeIter]() -> Maybe(int32) {\n\
+                   if it.cur < it.hi {\n\
+                       v := it.cur;\n\
+                       it.cur = it.cur + 1;\n\
+                       return Maybe(int32).Some(v);\n\
+                   }\n\
+                   return Maybe(int32).None;\n\
+               }\n\
+               main :: proc() -> int32 {\n\
+                   total := 0;\n\
+                   r := Range{ lo: 2, hi: 7 };\n\
+                   for x in r { total += x; }\n\
+                   return total;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 20); // 2+3+4+5+6
+    }
+}
+
+#[test]
+fn a_custom_iterator_loop_exits_via_a_flag_not_a_switch_break() {
+    let src = "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+               Range :: struct { hi: int32 }\n\
+               RangeIter :: struct { cur: int32, hi: int32 }\n\
+               iterator :: proc[r: Range]() -> @RangeIter { return alloc RangeIter{ cur: 0, hi: r.hi }; }\n\
+               next :: proc[it: @RangeIter]() -> Maybe(int32) {\n\
+                   if it.cur < it.hi { v := it.cur; it.cur = it.cur + 1; return Maybe(int32).Some(v); }\n\
+                   return Maybe(int32).None;\n\
+               }\n\
+               main :: proc() -> int32 { n := 0; r := Range{ hi: 3 }; for x in r { n += 1; } return n; }\n";
+    let out = c(src);
+    assert!(
+        out.contains("__dray_done") || out.contains("= true"),
+        "expected a done flag: {out}"
+    );
+    if let Some(code) = compile_and_run(&out) {
+        assert_eq!(code, 3);
+    }
+}
+
+#[test]
+fn e2e_while_init_loop() {
+    let src = "main :: proc() -> int32 {\n\
+                   sum := 0;\n\
+                   for i := 0; i < 5 { sum += i; i += 1; }\n\
+                   return sum;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 10); // 0+1+2+3+4
+    }
+}
+
+#[test]
+fn a_for_init_rc_binding_is_released_after_the_loop() {
+    let src = "rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+               Node :: struct { v: int32 }\n\
+               main :: proc() -> int32 {\n\
+                   for n := alloc Node{ v: 0 }; n.v < 3 { n.v = n.v + 1; }\n\
+                   return cast(int32) rc_live();\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(
+            code, 0,
+            "the for-init @Node must be released after the loop"
+        );
+    }
+}
