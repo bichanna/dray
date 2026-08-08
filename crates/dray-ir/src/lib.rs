@@ -193,6 +193,7 @@ pub struct SwitchArm {
 pub fn lower(hir: &Hir) -> Ir {
     let mut struct_fields: HashMap<String, Vec<Ty>> = HashMap::new();
     let mut enum_payloads: HashMap<String, Vec<Ty>> = HashMap::new();
+    let mut enum_variant_payloads: HashMap<(String, String), Vec<Ty>> = HashMap::new();
 
     for item in &hir.items {
         match item {
@@ -207,6 +208,10 @@ pub fn lower(hir: &Hir) -> Ir {
                     ed.name.clone(),
                     ed.variants.iter().flat_map(|v| v.payload.clone()).collect(),
                 );
+                for v in &ed.variants {
+                    enum_variant_payloads
+                        .insert((ed.name.clone(), v.name.clone()), v.payload.clone());
+                }
             }
             _ => {}
         }
@@ -216,6 +221,7 @@ pub fn lower(hir: &Hir) -> Ir {
         defs: hir.defs.clone(),
         struct_fields,
         enum_payloads,
+        enum_variant_payloads,
         uses_rc: false,
         temp: 0,
         current_file: 0,
@@ -255,6 +261,8 @@ struct Lowerer {
     /// Field types by struct name, and payload types by enum name
     struct_fields: HashMap<String, Vec<Ty>>,
     enum_payloads: HashMap<String, Vec<Ty>>,
+    /// Payload types per (enum, variant), for typing switch arm binding
+    enum_variant_payloads: HashMap<(String, String), Vec<Ty>>,
     uses_rc: bool,
     temp: u32,
     current_file: usize,
@@ -506,7 +514,7 @@ impl Lowerer {
                     .iter()
                     .map(|a| SwitchArm {
                         pattern: a.pattern.clone(),
-                        body: self.block(&a.body, scopes),
+                        body: self.switch_arm_body(a, &scrutinee.ty, scopes),
                     })
                     .collect();
                 out.push(Stmt::Switch {
@@ -844,6 +852,56 @@ impl Lowerer {
                 .any(|t| matches!(t, Ty::Rc(_) | Ty::Weak(_)) || self.holds_rc_inner(t, seen)),
             None => false,
         }
+    }
+
+    fn switch_arm_body(
+        &mut self,
+        arm: &dray_hir::Arm,
+        scrutinee_ty: &Ty,
+        scopes: &mut Scopes,
+    ) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        let mut scope = Vec::new();
+
+        if let Pattern::Enum {
+            enum_name,
+            variant,
+            bindings,
+        } = &arm.pattern
+        {
+            let concrete = match scrutinee_ty {
+                Ty::Named(n) => n.clone(),
+                _ => enum_name.clone(),
+            };
+            let payload = self
+                .enum_variant_payloads
+                .get(&(concrete, variant.clone()))
+                .cloned()
+                .unwrap_or_default();
+
+            for (i, bind) in bindings.iter().enumerate() {
+                if let Some(ty) = payload.get(i)
+                    && let Ty::Rc(inner) = ty
+                {
+                    self.uses_rc = true;
+                    if matches!(&**inner, Ty::Slice(_)) {
+                        out.push(Stmt::RetainArray(bind.clone()));
+                        scope.push(Cleanup::StrongArray(bind.clone()));
+                    } else {
+                        out.push(Stmt::Retain(bind.clone()));
+                        scope.push(Cleanup::Strong(bind.clone()));
+                    }
+                }
+            }
+        }
+
+        scopes.push(scope);
+        out.extend(self.block(&arm.body, scopes));
+        let scope = scopes.pop().unwrap_or_default();
+        if !ends_in_return(&arm.body) {
+            self.release(&scope, &mut out);
+        }
+        out
     }
 
     fn release(&mut self, locals: &[Cleanup], out: &mut Vec<Stmt>) {

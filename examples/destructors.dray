@@ -1,0 +1,40 @@
+printf :: extern "printf" proc(fmt: *cchar, ...) -> int32;
+
+Res :: struct { id: int32, label: @Tag }
+Tag :: struct { n: int32 }
+
+deinit :: proc[self: @Res]() {
+    printf(c"closing resource %d (tag %d)\n", self.id, self.label.n);
+}
+
+Pool :: struct { count: int32 }
+PoolIter :: struct { cur: int32, count: int32 }
+
+iterator :: proc[p: Pool]() -> @PoolIter {
+    return alloc PoolIter{ cur: 0, count: p.count };
+}
+
+next :: proc[it: @PoolIter]() -> Maybe(@Res) {
+    if it.cur < it.count {
+        r := alloc Res{ id: it.cur, label: alloc Tag{ n: it.cur * 10 } };
+        it.cur += 1;
+        return Maybe(@Res).Some(r);
+    }
+    return Maybe(@Res).None;
+}
+
+main :: proc() -> int32 {
+    total := 0;
+
+    // Each element is *owned*: `x` holds its own strong reference for the body
+    // of the iteration, so it stays valid even if it escapes the loop
+    p := Pool{ count: 3 };
+    last := alloc Res{ id: 99, label: alloc Tag{ n: 0 } };
+    for x in p {
+        total += x.id;
+        last = x;
+    }
+
+    printf(c"last surviving id = %d\n", last.id);
+    return 0;
+}

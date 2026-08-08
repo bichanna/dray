@@ -355,10 +355,44 @@ impl Lowerer {
         self.checked_type(&ty_node).or(Some(Ty::Infer))
     }
 
+    /// A destructor has a fixed shape: `deinit :: proc[self: @T]()`. It runs at
+    /// end of life
+    fn check_deinit_shape(&mut self, receiver: &Ty, ret: &Ty, decl: &SyntaxNode) {
+        if !matches!(receiver, Ty::Rc(_)) {
+            self.err(
+                decl.span(),
+                format!(
+                    "a destructor needs an `@` receiver, as in `deinit :: proc[self: @{}]()`",
+                    type_name(receiver)
+                ),
+            );
+        }
+        if runtime_param_count(decl) != 0 {
+            self.err(
+                decl.span(),
+                "a destructor takes no parameter; it is called automatically at end of life",
+            );
+        }
+        if !matches!(ret, Ty::Void) {
+            self.err(
+                decl.span(),
+                format!(
+                    "a destructor returns nothing, but this returns `{}`; there is no caller to \
+                     receive a result",
+                    type_name(ret)
+                ),
+            );
+        }
+    }
+
     fn register_method(&mut self, name: &str, receiver: Ty, decl: &SyntaxNode) {
         let ret = self.return_type(decl);
         let type_params = comptime_type_params(decl);
         let mangled = method_mangled_name(&receiver, name);
+
+        if name == "deinit" {
+            self.check_deinit_shape(&receiver, &ret, decl);
+        }
 
         let is_generic_receiver = matches!(&receiver, Ty::Named(n) if type_params.contains(n));
 

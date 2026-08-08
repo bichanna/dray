@@ -1796,3 +1796,41 @@ fn a_while_init_binding_is_not_visible_after_the_loop() {
         "while-init binding must not leak past the loop: {errs:?}"
     );
 }
+
+#[test]
+fn a_deinit_needs_an_rc_receiver() {
+    let errs = resolve_errors("T :: struct { v: int32 }\ndeinit :: proc[self: T]() { }\n");
+    assert!(
+        errs.iter().any(|m| m.contains("`@` receiver")),
+        "a by-value destructor must be rejected: {errs:?}"
+    );
+}
+
+#[test]
+fn a_deinit_takes_no_parameters() {
+    let errs = resolve_errors("T :: struct { v: int32 }\ndeinit :: proc[self: @T](x: int32) { }\n");
+    assert!(
+        errs.iter().any(|m| m.contains("no parameters")),
+        "a destructor with parameters must be rejected: {errs:?}"
+    );
+}
+
+#[test]
+fn a_deinit_returns_nothing() {
+    let errs = resolve_errors(
+        "T :: struct { v: int32 }\ndeinit :: proc[self: @T]() -> int32 { return 1; }\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("returns nothing")),
+        "a destructor returning a value must be rejected: {errs:?}"
+    );
+}
+
+#[test]
+fn a_well_formed_deinit_is_accepted() {
+    let errs = resolve_errors("T :: struct { v: int32 }\ndeinit :: proc[self: @T]() { }\n");
+    assert!(
+        errs.is_empty(),
+        "a well formed destructor is fine: {errs:?}"
+    );
+}

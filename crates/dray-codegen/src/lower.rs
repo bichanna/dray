@@ -683,7 +683,7 @@ fn lower_expr(ir: &Ir, e: &Expr) -> Result<tamago::Expr> {
                         .structs
                         .iter()
                         .find(|s| &s.name == name)
-                        .is_some_and(|sd| has_rc_field(ir, sd))
+                        .is_some_and(|sd| needs_drop_fn(ir, sd))
                     {
                         T::new_ident(format!("dray_drop_{name}"))
                     } else {
@@ -1008,7 +1008,7 @@ pub(crate) fn split_globals(ir: &Ir) -> Result<(Vec<GlobalStatement>, Vec<Global
     }
 
     for sd in &ir.structs {
-        if has_rc_field(ir, sd) {
+        if needs_drop_fn(ir, sd) {
             head.push(GlobalStatement::Function(drop_signature(&sd.name).build()));
         }
         head.push(GlobalStatement::Function(
@@ -1039,7 +1039,7 @@ pub(crate) fn split_globals(ir: &Ir) -> Result<(Vec<GlobalStatement>, Vec<Global
         defs.push(GlobalStatement::Function(array_drop_fn(&elem)?));
     }
     for sd in &ir.structs {
-        if has_rc_field(ir, sd) {
+        if needs_drop_fn(ir, sd) {
             defs.push(GlobalStatement::Function(drop_fn(ir, sd)?));
         }
     }
@@ -1732,6 +1732,15 @@ fn drop_signature(type_name: &str) -> FunctionBuilder {
     .param(ParameterBuilder::new_with_str("p", Type::ptr(Type::base(BaseType::Void))).build())
 }
 
+/// The mangled name of a type's user destructor, if it declared one
+fn deinit_fn_name(ir: &Ir, type_name: &str) -> Option<String> {
+    let mangled = format!("dray_m_rc_{type_name}_deinit");
+    ir.items
+        .iter()
+        .any(|it| matches!(it, dray_ir::Item::Proc(p) if p.name == mangled))
+        .then_some(mangled)
+}
+
 fn drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
     let self_ty = Type::ptr(Type::base(BaseType::Struct(sd.name.clone())));
     let mut body = BlockBuilder::new();
@@ -1743,6 +1752,14 @@ fn drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
             ))
             .build(),
     ));
+    // The user's destructor runs first, while every field is still alive, so it
+    // can read them; the compiler-generated field release runs after.
+    if let Some(deinit) = deinit_fn_name(ir, &sd.name) {
+        body = body.statement(tamago::Statement::Expr(tamago::Expr::new_fn_call(
+            tamago::Expr::new_ident(deinit),
+            vec![tamago::Expr::new_ident_with_str("self")],
+        )));
+    }
     for f in &sd.fields {
         match &f.ty {
             Ty::Rc(_) if heap_slice_elem(&f.ty).is_some() => {
@@ -1786,7 +1803,7 @@ fn drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
 fn constructor_fn(ir: &Ir, sd: &dray_ir::StructDef) -> Result<tamago::Function> {
     let struct_ty = Type::base(BaseType::Struct(sd.name.clone()));
     let self_ty = Type::ptr(struct_ty.clone());
-    let drop_arg = if has_rc_field(ir, sd) {
+    let drop_arg = if needs_drop_fn(ir, sd) {
         tamago::Expr::new_ident(format!("dray_drop_{}", sd.name))
     } else {
         tamago::Expr::new_null()
@@ -1831,6 +1848,11 @@ fn constructor_signature(sd: &dray_ir::StructDef) -> Result<FunctionBuilder> {
 /// `(*base).field` — field access through a struct pointer.
 fn self_field(base: &str, field: &str) -> tamago::Expr {
     tamago::Expr::new_ptr_mem_access(tamago::Expr::new_ident_with_str(base), field.to_string())
+}
+
+/// Whether a struct needs a generated `dray_drop_T`
+fn needs_drop_fn(ir: &Ir, sd: &dray_ir::StructDef) -> bool {
+    has_rc_field(ir, sd) || deinit_fn_name(ir, &sd.name).is_some()
 }
 
 fn has_rc_field(ir: &Ir, sd: &dray_ir::StructDef) -> bool {

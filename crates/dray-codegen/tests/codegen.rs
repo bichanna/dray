@@ -1880,3 +1880,94 @@ fn a_for_init_rc_binding_is_released_after_the_loop() {
         );
     }
 }
+
+#[test]
+fn a_struct_with_a_deinit_gets_a_drop_fn_even_without_rc_fields() {
+    let out = c("File :: struct { fd: int32 }\n\
+                 deinit :: proc[self: @File]() { }\n\
+                 main :: proc() -> int32 { f := alloc File{ fd: 1 }; return f.fd; }\n");
+    assert!(out.contains("dray_drop_File"), "needs a drop fn: {out}");
+    assert!(
+        out.contains("dray_m_rc_File_deinit(self)"),
+        "drop fn must call the destructor: {out}"
+    );
+}
+
+#[test]
+fn a_deinit_runs_before_the_generated_field_release() {
+    let out = c("Inner :: struct { v: int32 }\n\
+                 Outer :: struct { inner: @Inner }\n\
+                 deinit :: proc[self: @Outer]() { }\n\
+                 main :: proc() -> int32 {\n\
+                     o := alloc Outer{ inner: alloc Inner{ v: 1 } };\n\
+                     return o.inner.v;\n\
+                 }\n");
+    let drop_body = out
+        .split("void dray_drop_Outer(void *p) {")
+        .nth(1)
+        .unwrap_or_default();
+    let deinit_at = drop_body.find("deinit").unwrap_or(usize::MAX);
+    let release_at = drop_body.find("dray_rc_release").unwrap_or(usize::MAX);
+    assert!(
+        deinit_at < release_at,
+        "deinit must precede field release: {drop_body}"
+    );
+}
+
+#[test]
+fn e2e_a_deinit_runs_exactly_once_at_end_of_life() {
+    let src = "rc_live :: extern \"dray_rc_live\" proc() -> int64;\n\
+               Counter :: struct { v: int32 }\n\
+               Res :: struct { id: int32 }\n\
+               deinit :: proc[self: @Res]() { }\n\
+               main :: proc() -> int32 {\n\
+                   { a := alloc Res{ id: 1 }; b := a; }\n\
+                   return cast(int32) rc_live();\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(code, 0, "aliased object must be freed exactly once");
+    }
+}
+
+#[test]
+fn an_rc_payload_binding_is_retained_and_released() {
+    let out = c("Maybe :: enum(comptime T: type) { Some(T), None }\n\
+                 Node :: struct { v: int32 }\n\
+                 main :: proc() -> int32 {\n\
+                     m := Maybe(@Node).Some(alloc Node{ v: 3 });\n\
+                     switch m { case Maybe.Some(x): return x.v; case Maybe.None: return 0; }\n\
+                 }\n");
+    assert!(
+        out.contains("dray_rc_retain(x)"),
+        "an @T payload binding must own its reference: {out}"
+    );
+}
+
+#[test]
+fn e2e_an_iterated_element_outlives_its_iteration() {
+    let src = "Maybe :: enum(comptime T: type) { Some(T), None }\n\
+               Node :: struct { v: int32 }\n\
+               Bag :: struct { n: int32 }\n\
+               BagIter :: struct { cur: int32, n: int32 }\n\
+               iterator :: proc[b: Bag]() -> @BagIter { return alloc BagIter{ cur: 0, n: b.n }; }\n\
+               next :: proc[it: @BagIter]() -> Maybe(@Node) {\n\
+                   if it.cur < it.n {\n\
+                       node := alloc Node{ v: it.cur + 10 };\n\
+                       it.cur = it.cur + 1;\n\
+                       return Maybe(@Node).Some(node);\n\
+                   }\n\
+                   return Maybe(@Node).None;\n\
+               }\n\
+               main :: proc() -> int32 {\n\
+                   kept := alloc Node{ v: 0 };\n\
+                   b := Bag{ n: 3 };\n\
+                   for x in b { kept = x; }\n\
+                   return kept.v;\n\
+               }\n";
+    if let Some(code) = compile_and_run(&c(src)) {
+        assert_eq!(
+            code, 12,
+            "the last element must still be valid after the loop"
+        );
+    }
+}
